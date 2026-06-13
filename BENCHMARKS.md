@@ -25,7 +25,7 @@ cmake -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build -j8
 | 0. scalar matmul | `bench-0-scalar` | 1531 | 12585 | 22.3 | 40.1 | 49.7 |
 | 1. tensor-core prefill (WMMA) | `bench-1-wmma` | 89 | 1234 | 22.3 | 40.1 | 49.7 |
 | 2. BF16 KV cache | `bench-2-bf16kv` | 89 | 1233 | 22.3 | 40.0 | 49.7 |
-| 3. faster decode attention | `bench-3-attn` | _tbd_ | _tbd_ | _tbd_ | _tbd_ | _tbd_ |
+| 3. warp attention (no barrier) | `bench-3-attn` | 83 | 908 | 22.2 | 39.4 | 49.8 |
 | 4. vectorized GEMV decode | `bench-4-gemv` | _tbd_ | _tbd_ | _tbd_ | _tbd_ | _tbd_ |
 
 ## Stages
@@ -76,4 +76,31 @@ latency-bound (the new kernel then reads half the bytes).
     128      88.6    22.34      44.8       43.4       47.4
     512     420.4    29.93      33.4       30.1       34.9
    1024    1233.4    40.04      25.0       20.1       25.8
+```
+
+### 3. warp attention, no per-key barrier — `bench-3-attn`
+
+Rewrote attention from "one block per (head,query) with a serialized per-key
+`__syncthreads` block reduction" to **one warp per (head,query)**: each lane owns 4 dims
+(head_dim/32), the per-key q·k dot product is a warp-shuffle reduction, online softmax in
+registers — no barriers. Reading the BF16 KV cache from stage 2 now also costs half the
+bytes.
+
+Result: **prefill attention is much faster** (TTFT@1024 1233 → 908 ms ≈ −26 %, @512 420 →
+339). Decode TPOT is roughly flat (40.0 → 39.4): at M=1 there are only 32 work-items (one
+per head), so decode attention is *parallelism*-bound, not per-key-cost-bound — squeezing
+it further needs flash-decoding split-K (split the key range across more blocks + combine),
+which is left as future work.
+
+> Note: a first cut used a runtime-bounded register array (`qreg[dpl]`), which spilled to
+> local memory and *regressed* decode to ~47 ms. Fixing the per-lane dim count to a
+> compile-time constant (4) kept it in registers and recovered the result below.
+
+```
+  input    TTFT      TPOT     decode     output      peak
+  (tok)    (ms)    (ms/tok)  (tok/s)    (tok/s)    (tok/s)
+     16      60.1    20.08      49.8       48.7       53.0
+    128      83.2    22.21      45.0       43.7       47.6
+    512     339.0    29.57      33.8       31.0       35.3
+   1024     908.0    39.35      25.4       21.5       26.2
 ```

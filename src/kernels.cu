@@ -146,53 +146,59 @@ void launch_rope(float* x, const int* pos, int M, int n_heads, int head_dim, flo
 }
 
 // ---------------------------------------------------------------------------------------
-// attention with online (flash-style) softmax: one block per (head, query token).
-// blockDim = head_dim.
+// attention with online softmax — one WARP per (head, query token). Each lane owns
+// head_dim/32 dims; the per-key q.k dot product is a warp-shuffle reduction (no
+// __syncthreads, so no serialized per-key barrier). This keeps the per-key cost tiny, so
+// TPOT no longer balloons as the KV cache grows. blockDim = 32, head_dim a multiple of 32.
 // ---------------------------------------------------------------------------------------
 __global__ void attention_kernel(const float* __restrict__ q, const bf16* __restrict__ cache_k,
                                  const bf16* __restrict__ cache_v, float* __restrict__ out,
                                  int M, int n_heads, int n_kv, int head_dim,
                                  int past_len, float scale) {
+    // DPL = head_dim/32, fixed at compile time (Qwen3 head_dim is 128) so qreg/acc stay in
+    // registers instead of spilling to local memory.
+    constexpr int DPL = 4;
     int h = blockIdx.x;              // query head
     int m = blockIdx.y;              // query token
-    int t = threadIdx.x;             // dim within head
-    int group = n_heads / n_kv;
-    int kvh = h / group;
+    int lane = threadIdx.x;          // 0..31
+    int kvh = h / (n_heads / n_kv);
     int qpos = past_len + m;         // attend keys [0, qpos]
 
     const float* qv = q + ((size_t)m * n_heads + h) * head_dim;
-    float qd = qv[t];
-
-    extern __shared__ float red[];   // size head_dim
-    float m_run = -1e30f, l_run = 0.f, acc = 0.f;
+    float qreg[DPL], acc[DPL];
+    #pragma unroll
+    for (int i = 0; i < DPL; ++i) { qreg[i] = qv[lane + (i << 5)]; acc[i] = 0.f; }
+    float m_run = -1e30f, l_run = 0.f;
 
     for (int j = 0; j <= qpos; ++j) {
-        const bf16* kv = cache_k + ((size_t)j * n_kv + kvh) * head_dim;
-        red[t] = qd * __bfloat162float(kv[t]);
-        __syncthreads();
-        for (int s = head_dim >> 1; s > 0; s >>= 1) {
-            if (t < s) red[t] += red[t + s];
-            __syncthreads();
-        }
-        float score = red[0] * scale;
-        __syncthreads();
+        const bf16* kj = cache_k + ((size_t)j * n_kv + kvh) * head_dim;
+        float partial = 0.f;
+        #pragma unroll
+        for (int i = 0; i < DPL; ++i) partial += qreg[i] * __bfloat162float(kj[lane + (i << 5)]);
+        #pragma unroll
+        for (int o = 16; o > 0; o >>= 1) partial += __shfl_xor_sync(0xffffffff, partial, o);
+        float score = partial * scale;          // identical on all lanes
 
         float m_new = fmaxf(m_run, score);
-        float corr  = expf(m_run - m_new);
-        float p     = expf(score - m_new);
-        const bf16* vv = cache_v + ((size_t)j * n_kv + kvh) * head_dim;
+        float corr  = __expf(m_run - m_new);
+        float p     = __expf(score - m_new);
         l_run = l_run * corr + p;
-        acc   = acc   * corr + p * __bfloat162float(vv[t]);
+        const bf16* vj = cache_v + ((size_t)j * n_kv + kvh) * head_dim;
+        #pragma unroll
+        for (int i = 0; i < DPL; ++i) acc[i] = acc[i] * corr + p * __bfloat162float(vj[lane + (i << 5)]);
         m_run = m_new;
     }
-    out[((size_t)m * n_heads + h) * head_dim + t] = acc / l_run;
+    float inv = 1.0f / l_run;
+    float* o = out + ((size_t)m * n_heads + h) * head_dim;
+    #pragma unroll
+    for (int i = 0; i < DPL; ++i) o[lane + (i << 5)] = acc[i] * inv;
 }
 
 void launch_attention(const float* q, const bf16* cache_k, const bf16* cache_v,
                       float* out, int M, int n_heads, int n_kv, int head_dim,
                       int past_len, float scale, cudaStream_t s) {
     dim3 grid(n_heads, M);
-    attention_kernel<<<grid, head_dim, head_dim * sizeof(float), s>>>(
+    attention_kernel<<<grid, 32, 0, s>>>(
         q, cache_k, cache_v, out, M, n_heads, n_kv, head_dim, past_len, scale);
 }
 
