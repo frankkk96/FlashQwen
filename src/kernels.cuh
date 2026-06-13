@@ -8,6 +8,7 @@
 #include <cuda_bf16.h>
 #include <cstdio>
 #include <cstdlib>
+#include <cstdint>
 
 #define CUDA_CHECK(call) do {                                                   \
     cudaError_t _e = (call);                                                    \
@@ -20,12 +21,12 @@
 
 using bf16 = __nv_bfloat16;
 
-// y[M,OUT] = x[M,IN] @ W[OUT,IN]^T            (W is BF16, x/y are FP32, no bias)
-// Decode (M==1) uses a memory-bound GEMV. Prefill (M>1) converts x to BF16 into the
-// `x_bf16` scratch (>= ceil(M/16)*16 * IN elements) and uses tensor cores (WMMA).
+// y[M,OUT] = x[M,IN] @ W[OUT,IN]^T   — W is INT8 with a per-row `scale[OUT]` (no bias).
+// Decode (M==1): memory-bound INT8 GEMV, dequantized in-kernel. Prefill (M>1): dequantize
+// W to BF16 in `w_dq` (>= OUT*IN elements), convert x to BF16 in `x_bf16`, then WMMA.
 // IN and OUT must be multiples of 16 (true for all Qwen3 layer dims).
-void launch_matmul(const float* x, const bf16* W, float* y, int M, int IN, int OUT,
-                   bf16* x_bf16, cudaStream_t s);
+void launch_matmul(const float* x, const int8_t* W, const float* scale, float* y,
+                   int M, int IN, int OUT, bf16* x_bf16, bf16* w_dq, cudaStream_t s);
 
 // out[M,H] = rmsnorm(x[M,H]) * w[H]           (w is FP32)
 void launch_rmsnorm(const float* x, const float* w, float* out, int M, int H, float eps, cudaStream_t s);

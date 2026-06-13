@@ -2,6 +2,8 @@
 #include <cmath>
 #include <cstring>
 #include <cstdio>
+#include <thread>
+#include <algorithm>
 
 static inline float bf16_to_f32(uint16_t h) {
     uint32_t bits = (uint32_t)h << 16;
@@ -31,29 +33,73 @@ float* Model::upload_norm(const std::string& name) {
     return d;
 }
 
+// Quantize a [OUT, IN] BF16 weight to INT8 with a symmetric per-row (per-output-channel)
+// scale: scale[r] = max|W[r,:]| / 127. Done on the host, parallelized across rows.
+Model::QWeight Model::upload_int8(const std::string& name) {
+    const TensorView& tv = st_.get(name);
+    int OUT = (int)tv.shape[0], IN = (int)tv.shape[1];
+    long n = (long)OUT * IN;
+    const uint16_t* src = (const uint16_t*)tv.data;
+    std::vector<int8_t> q(n);
+    std::vector<float> scale(OUT);
+
+    auto worker = [&](int r0, int r1) {
+        for (int r = r0; r < r1; ++r) {
+            const uint16_t* row = src + (long)r * IN;
+            float maxabs = 0.f;
+            for (int i = 0; i < IN; ++i) maxabs = std::max(maxabs, std::fabs(bf16_to_f32(row[i])));
+            float sc = maxabs / 127.0f; if (sc == 0.f) sc = 1.f;
+            float inv = 1.0f / sc;
+            int8_t* qr = q.data() + (long)r * IN;
+            for (int i = 0; i < IN; ++i) {
+                int v = (int)lrintf(bf16_to_f32(row[i]) * inv);
+                qr[i] = (int8_t)std::max(-127, std::min(127, v));
+            }
+            scale[r] = sc;
+        }
+    };
+    int nt = std::max(1u, std::thread::hardware_concurrency());
+    int chunk = (OUT + nt - 1) / nt;
+    std::vector<std::thread> ts;
+    for (int t = 0; t < nt; ++t) {
+        int a = t * chunk, b = std::min(OUT, a + chunk);
+        if (a < b) ts.emplace_back(worker, a, b);
+    }
+    for (auto& th : ts) th.join();
+
+    QWeight qw;
+    CUDA_CHECK(cudaMalloc(&qw.w, n * sizeof(int8_t)));
+    CUDA_CHECK(cudaMemcpy(qw.w, q.data(), n * sizeof(int8_t), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMalloc(&qw.scale, OUT * sizeof(float)));
+    CUDA_CHECK(cudaMemcpy(qw.scale, scale.data(), OUT * sizeof(float), cudaMemcpyHostToDevice));
+    all_i8_.push_back(qw.w);
+    all_fbufs_.push_back(qw.scale);
+    return qw;
+}
+
 void Model::load(const std::string& dir, int max_ctx) {
     cfg_ = ModelConfig::load(dir + "/config.json");
     max_ctx_ = ((max_ctx + 15) / 16) * 16;   // round up so WMMA tiles never read past buffers
     std::fprintf(stderr, "[model] loading weights from %s ...\n", dir.c_str());
     st_.load_dir(dir);
 
-    embed_   = upload_bf16("model.embed_tokens.weight");
+    embed_   = upload_bf16("model.embed_tokens.weight");   // gather, kept BF16
     fnorm_   = upload_norm("model.norm.weight");
-    lm_head_ = upload_bf16("lm_head.weight");
+    lm_head_ = upload_int8("lm_head.weight");
 
     layers_.resize(cfg_.num_layers);
     for (int l = 0; l < cfg_.num_layers; ++l) {
         std::string p = "model.layers." + std::to_string(l) + ".";
         Layer& L = layers_[l];
-        L.q_proj    = upload_bf16(p + "self_attn.q_proj.weight");
-        L.k_proj    = upload_bf16(p + "self_attn.k_proj.weight");
-        L.v_proj    = upload_bf16(p + "self_attn.v_proj.weight");
-        L.o_proj    = upload_bf16(p + "self_attn.o_proj.weight");
+        L.q_proj    = upload_int8(p + "self_attn.q_proj.weight");
+        L.k_proj    = upload_int8(p + "self_attn.k_proj.weight");
+        L.v_proj    = upload_int8(p + "self_attn.v_proj.weight");
+        L.o_proj    = upload_int8(p + "self_attn.o_proj.weight");
         L.q_norm    = upload_norm(p + "self_attn.q_norm.weight");
         L.k_norm    = upload_norm(p + "self_attn.k_norm.weight");
-        L.gate      = upload_bf16(p + "mlp.gate_proj.weight");
-        L.up        = upload_bf16(p + "mlp.up_proj.weight");
-        L.down      = upload_bf16(p + "mlp.down_proj.weight");
+        L.gate      = upload_int8(p + "mlp.gate_proj.weight");
+        L.up        = upload_int8(p + "mlp.up_proj.weight");
+        L.down      = upload_int8(p + "mlp.down_proj.weight");
         L.in_norm   = upload_norm(p + "input_layernorm.weight");
         L.post_norm = upload_norm(p + "post_attention_layernorm.weight");
         if ((l + 1) % 8 == 0 || l + 1 == cfg_.num_layers)
@@ -85,6 +131,8 @@ void Model::load(const std::string& dir, int max_ctx) {
     fmalloc(&logits_, (size_t)V);
     // BF16 activation scratch for the tensor-core prefill GEMM (largest IN is `I`).
     CUDA_CHECK(cudaMalloc(&xbf_, (size_t)max_ctx_ * I * sizeof(bf16)));
+    // BF16 dequantized-weight scratch for prefill (largest matmul weight is I*H).
+    CUDA_CHECK(cudaMalloc(&w_dq_, (size_t)I * H * sizeof(bf16)));
     CUDA_CHECK(cudaMalloc(&d_ids_, max_ctx_ * sizeof(int)));
     CUDA_CHECK(cudaMalloc(&d_pos_, max_ctx_ * sizeof(int)));
     CUDA_CHECK(cudaMalloc(&d_arg_, sizeof(int)));
@@ -130,9 +178,9 @@ void Model::run_layers(int M) {
 
         // --- attention block ---
         launch_rmsnorm(x_, L.in_norm, xb_, M, H, eps, s);
-        launch_matmul(xb_, L.q_proj, q_, M, H, QD,  xbf_, s);
-        launch_matmul(xb_, L.k_proj, k_, M, H, KVD, xbf_, s);
-        launch_matmul(xb_, L.v_proj, v_, M, H, KVD, xbf_, s);
+        launch_matmul(xb_, L.q_proj.w, L.q_proj.scale, q_, M, H, QD,  xbf_, w_dq_, s);
+        launch_matmul(xb_, L.k_proj.w, L.k_proj.scale, k_, M, H, KVD, xbf_, w_dq_, s);
+        launch_matmul(xb_, L.v_proj.w, L.v_proj.scale, v_, M, H, KVD, xbf_, w_dq_, s);
 
         // per-head QK RMSNorm (Qwen3), then RoPE
         launch_rmsnorm(q_, L.q_norm, q_, M * nH,  hd, eps, s);
@@ -149,22 +197,22 @@ void Model::run_layers(int M) {
                                     scale, part_m_, part_l_, part_acc_, s);
         else          // prefill: one warp per (head, query); plenty of parallelism already
             launch_attention(q_, cache_k_[l], cache_v_[l], attn_, M, nH, nKV, hd, d_past_, scale, s);
-        launch_matmul(attn_, L.o_proj, xb2_, M, QD, H, xbf_, s);
+        launch_matmul(attn_, L.o_proj.w, L.o_proj.scale, xb2_, M, QD, H, xbf_, w_dq_, s);
         launch_add(x_, xb2_, M * H, s);
 
         // --- MLP block (SwiGLU) ---
         launch_rmsnorm(x_, L.post_norm, xb_, M, H, eps, s);
-        launch_matmul(xb_, L.gate, gate_, M, H, I, xbf_, s);
-        launch_matmul(xb_, L.up,   up_,   M, H, I, xbf_, s);
+        launch_matmul(xb_, L.gate.w, L.gate.scale, gate_, M, H, I, xbf_, w_dq_, s);
+        launch_matmul(xb_, L.up.w,   L.up.scale,   up_,   M, H, I, xbf_, w_dq_, s);
         launch_silu_mul(gate_, up_, hmlp_, M * I, s);
-        launch_matmul(hmlp_, L.down, xb2_, M, I, H, xbf_, s);
+        launch_matmul(hmlp_, L.down.w, L.down.scale, xb2_, M, I, H, xbf_, w_dq_, s);
         launch_add(x_, xb2_, M * H, s);
     }
 
     // only the last token's logits are needed
     float* xlast = x_ + (size_t)(M - 1) * H;
     launch_rmsnorm(xlast, fnorm_, xb_, 1, H, eps, s);
-    launch_matmul(xb_, lm_head_, logits_, 1, H, c.vocab_size, xbf_, s);
+    launch_matmul(xb_, lm_head_.w, lm_head_.scale, logits_, 1, H, c.vocab_size, xbf_, w_dq_, s);
 }
 
 void Model::forward(const std::vector<int>& tokens, int past_len) {
@@ -200,11 +248,12 @@ const std::vector<float>& Model::copy_logits() {
 Model::~Model() {
     for (auto p : all_bufs_)  if (p) cudaFree(p);
     for (auto p : all_fbufs_) if (p) cudaFree(p);
+    for (auto p : all_i8_)    if (p) cudaFree(p);
     for (auto p : cache_k_)   if (p) cudaFree(p);
     for (auto p : cache_v_)   if (p) cudaFree(p);
     cudaFree(x_); cudaFree(xb_); cudaFree(xb2_); cudaFree(q_); cudaFree(k_); cudaFree(v_);
     cudaFree(attn_); cudaFree(gate_); cudaFree(up_); cudaFree(hmlp_); cudaFree(logits_);
-    cudaFree(xbf_); cudaFree(part_m_); cudaFree(part_l_); cudaFree(part_acc_);
+    cudaFree(xbf_); cudaFree(w_dq_); cudaFree(part_m_); cudaFree(part_l_); cudaFree(part_acc_);
     cudaFree(d_ids_); cudaFree(d_pos_); cudaFree(d_arg_); cudaFree(d_past_);
     if (graph_exec_) cudaGraphExecDestroy(graph_exec_);
     if (graph_) cudaGraphDestroy(graph_);

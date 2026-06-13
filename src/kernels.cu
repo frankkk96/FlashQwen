@@ -3,34 +3,43 @@
 using namespace nvcuda;
 
 // ---------------------------------------------------------------------------------------
-// GEMV (decode, M==1): one warp computes one output element (dot product over IN).
-// Memory-bound — reading the BF16 weights dominates, so tensor cores would not help here.
+// GEMV (decode, M==1): one warp per output row. Weights are INT8 with a per-row scale; the
+// row is dequantized as it's read (acc * scale at the end). Reading 1-byte weights instead
+// of 2-byte halves the decode memory traffic. Each lane reads 16 INT8 per pass (16-byte
+// load), striding by 32*16. Requires IN % 16 == 0.
 // ---------------------------------------------------------------------------------------
-__global__ void gemv_kernel(const float* __restrict__ x, const bf16* __restrict__ W,
-                            float* __restrict__ y, int IN, int OUT) {
+__global__ void gemv_kernel(const float* __restrict__ x, const int8_t* __restrict__ W,
+                            const float* __restrict__ scale, float* __restrict__ y, int IN, int OUT) {
     int warp = threadIdx.x >> 5;
     int lane = threadIdx.x & 31;
     int row = blockIdx.x * (blockDim.x >> 5) + warp;   // output feature
     if (row >= OUT) return;
 
-    const bf16* wr = W + (size_t)row * IN;
+    const int8_t* wr = W + (size_t)row * IN;
     float acc = 0.f;
-    // Each lane reads 8 contiguous elements per pass (16-byte vectorized loads), striding
-    // by 32*8. Requires IN % 8 == 0 (true for all Qwen3 layer dims).
-    for (int i = lane * 8; i + 8 <= IN; i += 256) {
-        int4 wpack = *reinterpret_cast<const int4*>(wr + i);          // 8 BF16 weights
-        const bf16* wb = reinterpret_cast<const bf16*>(&wpack);
-        float4 xa = *reinterpret_cast<const float4*>(x + i);
-        float4 xb = *reinterpret_cast<const float4*>(x + i + 4);
-        acc += xa.x * __bfloat162float(wb[0]) + xa.y * __bfloat162float(wb[1])
-             + xa.z * __bfloat162float(wb[2]) + xa.w * __bfloat162float(wb[3])
-             + xb.x * __bfloat162float(wb[4]) + xb.y * __bfloat162float(wb[5])
-             + xb.z * __bfloat162float(wb[6]) + xb.w * __bfloat162float(wb[7]);
+    for (int i = lane * 16; i + 16 <= IN; i += 512) {
+        int4 wpack = *reinterpret_cast<const int4*>(wr + i);          // 16 INT8 weights
+        const int8_t* wb = reinterpret_cast<const int8_t*>(&wpack);
+        const float4* xv = reinterpret_cast<const float4*>(x + i);
+        #pragma unroll
+        for (int q = 0; q < 4; ++q) {
+            float4 xx = xv[q];
+            acc += xx.x * (float)wb[q*4+0] + xx.y * (float)wb[q*4+1]
+                 + xx.z * (float)wb[q*4+2] + xx.w * (float)wb[q*4+3];
+        }
     }
     #pragma unroll
     for (int o = 16; o > 0; o >>= 1)
         acc += __shfl_down_sync(0xffffffff, acc, o);
-    if (lane == 0) y[row] = acc;
+    if (lane == 0) y[row] = acc * scale[row];
+}
+
+// Dequantize an INT8 weight matrix (+ per-row scale) to BF16, for the prefill WMMA path.
+__global__ void dequant_kernel(const int8_t* __restrict__ W, const float* __restrict__ scale,
+                               bf16* __restrict__ out, int IN, long n) {
+    long idx = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) return;
+    out[idx] = __float2bfloat16((float)W[idx] * scale[idx / IN]);
 }
 
 // ---------------------------------------------------------------------------------------
@@ -68,22 +77,25 @@ __global__ void wmma_kernel(const bf16* __restrict__ x, const bf16* __restrict__
     wmma::store_matrix_sync(y + (size_t)m0 * OUT + n0, c, OUT, wmma::mem_row_major);
 }
 
-void launch_matmul(const float* x, const bf16* W, float* y, int M, int IN, int OUT,
-                   bf16* x_bf16, cudaStream_t s) {
-    if (M <= 1) {                              // decode: memory-bound GEMV
+void launch_matmul(const float* x, const int8_t* W, const float* scale, float* y,
+                   int M, int IN, int OUT, bf16* x_bf16, bf16* w_dq, cudaStream_t s) {
+    if (M <= 1) {                              // decode: memory-bound INT8 GEMV
         const int warps = 8;
-        gemv_kernel<<<(OUT + warps - 1) / warps, warps * 32, 0, s>>>(x, W, y, IN, OUT);
+        gemv_kernel<<<(OUT + warps - 1) / warps, warps * 32, 0, s>>>(x, W, scale, y, IN, OUT);
         return;
     }
-    // prefill: convert activations to BF16 (zero-padding tail rows to a 16-row multiple),
-    // then run the tensor-core GEMM.
+    // prefill: dequantize the INT8 weights to BF16, convert activations to BF16, then run the
+    // tensor-core GEMM. (Dequant cost is amortized — prefill runs once per request.)
+    long wn = (long)OUT * IN; int blk = 256;
+    dequant_kernel<<<(wn + blk - 1) / blk, blk, 0, s>>>(W, scale, w_dq, IN, wn);
+
     int Mp = ((M + 15) / 16) * 16;
-    int total = Mp * IN, valid = M * IN, blk = 256;
+    int total = Mp * IN, valid = M * IN;
     f32_to_bf16_kernel<<<(total + blk - 1) / blk, blk, 0, s>>>(x, x_bf16, valid, total);
 
     dim3 block(256);                           // 8 warps
     dim3 grid((OUT / 16 + 7) / 8, Mp / 16);
-    wmma_kernel<<<grid, block, 0, s>>>(x_bf16, W, y, IN, OUT);
+    wmma_kernel<<<grid, block, 0, s>>>(x_bf16, w_dq, y, IN, OUT);
 }
 
 // ---------------------------------------------------------------------------------------

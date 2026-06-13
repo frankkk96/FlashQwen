@@ -175,11 +175,12 @@ tokens, swept over input length, median of 3 runs:
 | 4 · vectorized GEMV decode | `bench-4-gemv` | 83 ms | 907 ms | 38.8 ms | 51.1 |
 | 5 · GPU argmax (greedy) | `bench-5-argmax` | 83 ms | 909 ms | 38.5 ms | 51.7 |
 | 6 · CUDA graph (decode) | `bench-6-cudagraph` | 83 ms | 909 ms | 38.1 ms | 52.9 |
-| 7 · flash-decoding split-K | `bench-7-splitk` | 83 ms | 910 ms | **18.9 ms** | 56.9 |
+| 7 · flash-decoding split-K | `bench-7-splitk` | 83 ms | 910 ms | 18.9 ms | 56.9 |
+| 8 · INT8 weight quantization | `bench-8-int8` | 97 ms | 954 ms | 10.9 ms | **104.2** |
 
-vs the baseline: **~14–18× faster prefill**, and decode is now **~flat across context** —
-TPOT@1024 40.1 → 18.9 ms (≈2× at long context), decode@16 49.7 → 56.9 tok/s. Reproduce any
-stage:
+vs the baseline: **~13–16× faster prefill**, and **~2× faster decode** that's nearly flat
+across context — decode@16 49.7 → 104.2 tok/s, TPOT@1024 40.1 → 10.9 ms. (INT8 trades a
+little prefill TTFT for the decode win.) Reproduce any stage:
 
 ```bash
 git checkout bench-1-wmma     # or bench-0-scalar … bench-4-gemv
@@ -234,5 +235,15 @@ collapses 38.1 → 18.9 ms (decode 26.3 → 53.0 tok/s, ~2×)** and decode is no
 across context (~18–19 ms everywhere), i.e. bound by the weight reads (GEMV), not attention.
 Prefill keeps the stage-3 kernel (already parallel enough).
 
-**Still open:** weight quantization (INT8/INT4) to break the decode bandwidth ceiling —
-decode now reads all ~16 GB of weights per token, so ~60 tok/s is the bf16 limit.
+**Stage 8 — INT8 weight quantization, `bench-8-int8`.** Decode was bandwidth-bound at the
+bf16 ceiling (read all ~16 GB of weights per token → ~60 tok/s). The matmul weights
+(attention + MLP projections + lm_head) are quantized to **INT8 with a per-output-row scale**
+(symmetric, computed at load); embedding/norms stay as-is. Decode reads 1-byte weights and
+dequantizes in-kernel → **decode@16 56.9 → 104.2 tok/s (~1.8×), TPOT@1024 18.9 → 10.9 ms**,
+and the weight memory roughly halves (~16 → ~9 GB). Prefill dequantizes each weight to BF16
+before the WMMA GEMM, which costs a little TTFT (e.g. @128 83 → 97 ms) — a fine trade since
+prefill runs once but decode runs every token. Output stays coherent (per-channel INT8 is
+mild for an 8B model).
+
+**Still open:** INT4 / grouped quantization for more decode headroom, activation-INT8 tensor
+cores to also speed prefill, and shared-memory tiling for the prefill WMMA.
