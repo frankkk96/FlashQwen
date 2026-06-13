@@ -87,6 +87,7 @@ void Model::load(const std::string& dir, int max_ctx) {
     CUDA_CHECK(cudaMalloc(&xbf_, (size_t)max_ctx_ * I * sizeof(bf16)));
     CUDA_CHECK(cudaMalloc(&d_ids_, max_ctx_ * sizeof(int)));
     CUDA_CHECK(cudaMalloc(&d_pos_, max_ctx_ * sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&d_arg_, sizeof(int)));
     host_logits_.resize(V);
 
     size_t freeb, totalb;
@@ -95,7 +96,7 @@ void Model::load(const std::string& dir, int max_ctx) {
                  (totalb - freeb) / 1e9, totalb / 1e9);
 }
 
-const std::vector<float>& Model::forward(const std::vector<int>& tokens, int past_len) {
+void Model::forward(const std::vector<int>& tokens, int past_len) {
     int M = (int)tokens.size();
     const ModelConfig& c = cfg_;
     int H = c.hidden_size, QD = c.q_dim(), KVD = c.kv_dim(), I = c.intermediate;
@@ -147,8 +148,18 @@ const std::vector<float>& Model::forward(const std::vector<int>& tokens, int pas
     float* xlast = x_ + (size_t)(M - 1) * H;
     launch_rmsnorm(xlast, fnorm_, xb_, 1, H, eps, s);
     launch_matmul(xb_, lm_head_, logits_, 1, H, c.vocab_size, xbf_, s);
+    // logits_ left on device; caller picks argmax_last() (greedy) or copy_logits() (sampling).
+}
 
-    CUDA_CHECK(cudaMemcpy(host_logits_.data(), logits_, c.vocab_size * sizeof(float), cudaMemcpyDeviceToHost));
+int Model::argmax_last() {
+    launch_argmax(logits_, cfg_.vocab_size, d_arg_, 0);
+    int id = 0;
+    CUDA_CHECK(cudaMemcpy(&id, d_arg_, sizeof(int), cudaMemcpyDeviceToHost));
+    return id;
+}
+
+const std::vector<float>& Model::copy_logits() {
+    CUDA_CHECK(cudaMemcpy(host_logits_.data(), logits_, cfg_.vocab_size * sizeof(float), cudaMemcpyDeviceToHost));
     return host_logits_;
 }
 
@@ -160,5 +171,5 @@ Model::~Model() {
     cudaFree(x_); cudaFree(xb_); cudaFree(xb2_); cudaFree(q_); cudaFree(k_); cudaFree(v_);
     cudaFree(attn_); cudaFree(gate_); cudaFree(up_); cudaFree(hmlp_); cudaFree(logits_);
     cudaFree(xbf_);
-    cudaFree(d_ids_); cudaFree(d_pos_);
+    cudaFree(d_ids_); cudaFree(d_pos_); cudaFree(d_arg_);
 }

@@ -16,11 +16,16 @@ GenStats generate(Model& model, const Tokenizer& tok, const std::vector<int>& ch
     GenStats st;
     Tokenizer::Stream detok;
 
+    // greedy uses a GPU argmax (copies one int); sampling copies the full logits to host.
+    auto pick = [&]() {
+        return sp.temp <= 0.0f ? model.argmax_last() : sample(model.copy_logits(), sp, rng);
+    };
+
     // prefill (TTFT)
     auto t0 = Clock::now();
-    const std::vector<float>& l0 = model.forward(chunk, past);
+    model.forward(chunk, past);
     past += (int)chunk.size();
-    int next = sample(l0, sp, rng);
+    int next = pick();
     st.ttft_ms = ms_since(t0);
 
     // decode: emit the current token, then feed it back to get the next one
@@ -35,9 +40,9 @@ GenStats generate(Model& model, const Tokenizer& tok, const std::vector<int>& ch
         st.n_out++;
 
         auto ts = Clock::now();
-        const std::vector<float>& lg = model.forward({next}, past);
+        model.forward({next}, past);
         past += 1;
-        next = sample(lg, sp, rng);
+        next = pick();
         st.step_ms.push_back(ms_since(ts));
     }
     return st;

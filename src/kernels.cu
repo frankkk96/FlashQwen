@@ -241,3 +241,26 @@ void launch_silu_mul(const float* gate, const float* up, float* h, int N, cudaSt
     int block = 256;
     silu_mul_kernel<<<(N + block - 1) / block, block, 0, s>>>(gate, up, h, N);
 }
+
+// argmax over N logits in a single block (256 threads), result index in *out.
+__global__ void argmax_kernel(const float* __restrict__ logits, int N, int* __restrict__ out) {
+    __shared__ float sval[256];
+    __shared__ int   sidx[256];
+    int tid = threadIdx.x;
+    float best = -1e30f; int bi = 0;
+    for (int i = tid; i < N; i += blockDim.x) {
+        float v = logits[i];
+        if (v > best) { best = v; bi = i; }
+    }
+    sval[tid] = best; sidx[tid] = bi;
+    __syncthreads();
+    for (int s = blockDim.x >> 1; s > 0; s >>= 1) {
+        if (tid < s && sval[tid + s] > sval[tid]) { sval[tid] = sval[tid + s]; sidx[tid] = sidx[tid + s]; }
+        __syncthreads();
+    }
+    if (tid == 0) *out = sidx[0];
+}
+
+void launch_argmax(const float* logits, int N, int* d_out, cudaStream_t s) {
+    argmax_kernel<<<1, 256, 0, s>>>(logits, N, d_out);
+}

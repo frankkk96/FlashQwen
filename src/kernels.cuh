@@ -50,3 +50,6 @@ void launch_add(float* out, const float* in, int N, cudaStream_t s);
 
 // h[i] = silu(gate[i]) * up[i]   for N elements
 void launch_silu_mul(const float* gate, const float* up, float* h, int N, cudaStream_t s);
+
+// argmax over logits[N] -> single index in d_out (greedy decode; avoids copying all logits).
+void launch_argmax(const float* logits, int N, int* d_out, cudaStream_t s);

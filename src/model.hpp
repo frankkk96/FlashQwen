@@ -14,8 +14,13 @@ public:
     ~Model();
 
     // Run M tokens starting at absolute position past_len; KV cache is updated in place.
-    // Returns the logits (size vocab) for the LAST token, copied to host.
-    const std::vector<float>& forward(const std::vector<int>& tokens, int past_len);
+    // Leaves the LAST token's logits on the device (no host copy).
+    void forward(const std::vector<int>& tokens, int past_len);
+
+    // Greedy: argmax of the last logits on the GPU; only the chosen id is copied back.
+    int argmax_last();
+    // Sampling path: copy the full last logits to host.
+    const std::vector<float>& copy_logits();
 
     const ModelConfig& config() const { return cfg_; }
     int max_ctx() const { return max_ctx_; }
@@ -45,7 +50,7 @@ private:
     // activation scratch (sized to max_ctx tokens)
     float *x_, *xb_, *xb2_, *q_, *k_, *v_, *attn_, *gate_, *up_, *hmlp_, *logits_;
     bf16  *xbf_ = nullptr;   // BF16 activation scratch for tensor-core prefill matmul
-    int   *d_ids_, *d_pos_;
+    int   *d_ids_, *d_pos_, *d_arg_;
     std::vector<float> host_logits_;
 
     std::vector<bf16*> all_bufs_;   // for cleanup

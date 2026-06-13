@@ -173,9 +173,10 @@ tokens, swept over input length, median of 3 runs:
 | 2 · BF16 KV cache | `bench-2-bf16kv` | 89 ms | 1233 ms | 40.0 ms | 49.7 |
 | 3 · warp attention (no barrier) | `bench-3-attn` | 83 ms | 908 ms | 39.4 ms | 49.8 |
 | 4 · vectorized GEMV decode | `bench-4-gemv` | 83 ms | 907 ms | 38.8 ms | 51.1 |
+| 5 · GPU argmax (greedy) | `bench-5-argmax` | 83 ms | 909 ms | 38.5 ms | 51.7 |
 
-vs the baseline, stage 4 is **~14–18× faster prefill** and ~3 % faster decode. Reproduce any
-stage:
+vs the baseline, the latest stage is **~14–18× faster prefill** and ~4 % faster decode.
+Reproduce any stage:
 
 ```bash
 git checkout bench-1-wmma     # or bench-0-scalar … bench-4-gemv
@@ -208,6 +209,11 @@ parallelism-bound, not per-key-cost-bound (a real decode win needs flash-decodin
 **Stage 4 — vectorized GEMV decode, `bench-4-gemv`.** The decode GEMV reads 8 elements per
 step with 16-byte vectorized loads instead of one scalar BF16 at a time. A modest gain
 (decode@16 49.8 → 51.1 tok/s) — the scalar version was already ~80 % of memory bandwidth.
+
+**Stage 5 — GPU argmax for greedy, `bench-5-argmax`.** Instead of copying all 151936 logits
+to the host every token and scanning them there, greedy decoding now runs an argmax
+reduction on the GPU and copies back a single int. Saves ~0.2–0.3 ms/token (decode@16
+51.1 → 51.7 tok/s). Sampling (temperature > 0) still copies the full logits.
 
 **Still open:** flash-decoding split-K for decode attention, and weight quantization
 (INT8/INT4) to break the decode bandwidth ceiling (decode reads all ~16 GB of weights per
