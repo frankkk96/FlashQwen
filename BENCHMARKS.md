@@ -23,7 +23,7 @@ cmake -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build -j8
 | stage | tag | TTFT@128 | TTFT@1024 | TPOT@128 | TPOT@1024 | decode@16 |
 |---|---|---:|---:|---:|---:|---:|
 | 0. scalar matmul | `bench-0-scalar` | 1531 | 12585 | 22.3 | 40.1 | 49.7 |
-| 1. tensor-core prefill (WMMA) | `bench-1-wmma` | _tbd_ | _tbd_ | _tbd_ | _tbd_ | _tbd_ |
+| 1. tensor-core prefill (WMMA) | `bench-1-wmma` | 89 | 1234 | 22.3 | 40.1 | 49.7 |
 | 2. BF16 KV cache | `bench-2-bf16kv` | _tbd_ | _tbd_ | _tbd_ | _tbd_ | _tbd_ |
 | 3. faster decode attention | `bench-3-attn` | _tbd_ | _tbd_ | _tbd_ | _tbd_ | _tbd_ |
 | 4. vectorized GEMV decode | `bench-4-gemv` | _tbd_ | _tbd_ | _tbd_ | _tbd_ | _tbd_ |
@@ -42,4 +42,19 @@ and decode. No tensor cores. This is the "before" state of the tensor-core chang
     128    1531.3    22.30      44.8       29.2       47.5
     512    6195.1    29.96      33.4       12.8       34.8
    1024   12584.9    40.09      24.9        7.2       25.7
+```
+
+### 1. tensor-core (WMMA) prefill — `bench-1-wmma`
+
+Prefill (M>1) converts activations to BF16 and runs a tensor-core WMMA GEMM; decode (M=1)
+keeps the scalar GEMV. **Prefill / TTFT drops ~10–17×**; decode is unchanged (it's
+memory-bound, tensor cores don't help).
+
+```
+  input    TTFT      TPOT     decode     output      peak
+  (tok)    (ms)    (ms/tok)  (tok/s)    (tok/s)    (tok/s)
+     16      60.2    20.13      49.7       48.5       53.1
+    128      88.5    22.34      44.8       43.4       47.5
+    512     422.2    29.98      33.4       30.0       34.8
+   1024    1234.4    40.12      24.9       20.1       25.7
 ```
