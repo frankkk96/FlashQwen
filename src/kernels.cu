@@ -226,6 +226,83 @@ void launch_store_kv(const float* src, bf16* cache, const int* d_past, int kv_di
     store_kv_kernel<<<(n + blk - 1) / blk, blk, 0, s>>>(src, cache, d_past, kv_dim, M);
 }
 
+// Flash-decoding phase 1: warp (h, split) does a partial online-softmax over its key chunk.
+// Stores UN-normalized acc plus (m, l) so the combine pass can merge chunks.
+__global__ void attn_decode_split_kernel(const float* __restrict__ q, const bf16* __restrict__ cache_k,
+                                         const bf16* __restrict__ cache_v, float* __restrict__ part_m,
+                                         float* __restrict__ part_l, float* __restrict__ part_acc,
+                                         int n_heads, int n_kv, int head_dim, const int* __restrict__ d_past,
+                                         float scale) {
+    constexpr int DPL = 4;
+    int h = blockIdx.x, sp = blockIdx.y, lane = threadIdx.x;
+    int kvh = h / (n_heads / n_kv);
+    int L = *d_past + 1;                          // keys [0, *d_past]
+    int per = (L + ATTN_SPLITS - 1) / ATTN_SPLITS;
+    int kb = sp * per, ke = min(kb + per, L);
+
+    const float* qv = q + (size_t)h * head_dim;   // M=1
+    float qreg[DPL], acc[DPL];
+    #pragma unroll
+    for (int i = 0; i < DPL; ++i) { qreg[i] = qv[lane + (i << 5)]; acc[i] = 0.f; }
+    float m_run = -1e30f, l_run = 0.f;
+
+    for (int j = kb; j < ke; ++j) {
+        const bf16* kj = cache_k + ((size_t)j * n_kv + kvh) * head_dim;
+        float p = 0.f;
+        #pragma unroll
+        for (int i = 0; i < DPL; ++i) p += qreg[i] * __bfloat162float(kj[lane + (i << 5)]);
+        #pragma unroll
+        for (int o = 16; o > 0; o >>= 1) p += __shfl_xor_sync(0xffffffff, p, o);
+        float score = p * scale;
+        float m_new = fmaxf(m_run, score);
+        float corr = __expf(m_run - m_new), pp = __expf(score - m_new);
+        l_run = l_run * corr + pp;
+        const bf16* vj = cache_v + ((size_t)j * n_kv + kvh) * head_dim;
+        #pragma unroll
+        for (int i = 0; i < DPL; ++i) acc[i] = acc[i] * corr + pp * __bfloat162float(vj[lane + (i << 5)]);
+        m_run = m_new;
+    }
+    int slot = h * ATTN_SPLITS + sp;
+    if (lane == 0) { part_m[slot] = m_run; part_l[slot] = l_run; }
+    #pragma unroll
+    for (int i = 0; i < DPL; ++i) part_acc[(size_t)slot * head_dim + lane + (i << 5)] = acc[i];
+}
+
+// Flash-decoding phase 2: one warp per head merges the ATTN_SPLITS partials.
+__global__ void attn_decode_combine_kernel(const float* __restrict__ part_m, const float* __restrict__ part_l,
+                                           const float* __restrict__ part_acc, float* __restrict__ out,
+                                           int head_dim) {
+    constexpr int DPL = 4;
+    int h = blockIdx.x, lane = threadIdx.x;
+    float gm = -1e30f;
+    #pragma unroll
+    for (int sp = 0; sp < ATTN_SPLITS; ++sp) gm = fmaxf(gm, part_m[h * ATTN_SPLITS + sp]);
+    float gl = 0.f, gacc[DPL];
+    #pragma unroll
+    for (int i = 0; i < DPL; ++i) gacc[i] = 0.f;
+    #pragma unroll
+    for (int sp = 0; sp < ATTN_SPLITS; ++sp) {
+        int slot = h * ATTN_SPLITS + sp;
+        float w = __expf(part_m[slot] - gm);
+        gl += part_l[slot] * w;
+        #pragma unroll
+        for (int i = 0; i < DPL; ++i) gacc[i] += part_acc[(size_t)slot * head_dim + lane + (i << 5)] * w;
+    }
+    float inv = 1.0f / gl;
+    float* o = out + (size_t)h * head_dim;
+    #pragma unroll
+    for (int i = 0; i < DPL; ++i) o[lane + (i << 5)] = gacc[i] * inv;
+}
+
+void launch_attention_decode(const float* q, const bf16* cache_k, const bf16* cache_v,
+                             float* out, int n_heads, int n_kv, int head_dim, const int* d_past,
+                             float scale, float* part_m, float* part_l, float* part_acc,
+                             cudaStream_t s) {
+    attn_decode_split_kernel<<<dim3(n_heads, ATTN_SPLITS), 32, 0, s>>>(
+        q, cache_k, cache_v, part_m, part_l, part_acc, n_heads, n_kv, head_dim, d_past, scale);
+    attn_decode_combine_kernel<<<n_heads, 32, 0, s>>>(part_m, part_l, part_acc, out, head_dim);
+}
+
 // ---------------------------------------------------------------------------------------
 // elementwise helpers
 // ---------------------------------------------------------------------------------------

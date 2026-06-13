@@ -175,9 +175,11 @@ tokens, swept over input length, median of 3 runs:
 | 4 · vectorized GEMV decode | `bench-4-gemv` | 83 ms | 907 ms | 38.8 ms | 51.1 |
 | 5 · GPU argmax (greedy) | `bench-5-argmax` | 83 ms | 909 ms | 38.5 ms | 51.7 |
 | 6 · CUDA graph (decode) | `bench-6-cudagraph` | 83 ms | 909 ms | 38.1 ms | 52.9 |
+| 7 · flash-decoding split-K | `bench-7-splitk` | 83 ms | 910 ms | **18.9 ms** | 56.9 |
 
-vs the baseline, the latest stage is **~14–18× faster prefill** and ~6 % faster decode.
-Reproduce any stage:
+vs the baseline: **~14–18× faster prefill**, and decode is now **~flat across context** —
+TPOT@1024 40.1 → 18.9 ms (≈2× at long context), decode@16 49.7 → 56.9 tok/s. Reproduce any
+stage:
 
 ```bash
 git checkout bench-1-wmma     # or bench-0-scalar … bench-4-gemv
@@ -223,6 +225,14 @@ and replayed each step (token id / position / `past_len` live in device buffers 
 read, so the graph stays valid as context grows). Consistent ~0.4–0.5 ms/token (decode@16
 51.7 → 52.9 tok/s, peak 55.2 → 56.5). Prefill (variable length) stays eager.
 
-**Still open:** flash-decoding split-K for decode attention, and weight quantization
-(INT8/INT4) to break the decode bandwidth ceiling (decode reads all ~16 GB of weights per
-token, so ~60 tok/s is the bf16 limit).
+**Stage 7 — flash-decoding split-K, `bench-7-splitk`.** At M=1 the warp attention (stage 3)
+had only 32 work-items (one per head), so decode attention was parallelism-bound and TPOT
+grew with context (18.9 ms@16 → 38.1 ms@1024). Now each head's key range is split into
+`ATTN_SPLITS` (16) chunks computed by separate blocks — each a partial online-softmax — and a
+combine pass merges them, giving 16× the parallelism over the KV cache. **TPOT@1024
+collapses 38.1 → 18.9 ms (decode 26.3 → 53.0 tok/s, ~2×)** and decode is now nearly flat
+across context (~18–19 ms everywhere), i.e. bound by the weight reads (GEMV), not attention.
+Prefill keeps the stage-3 kernel (already parallel enough).
+
+**Still open:** weight quantization (INT8/INT4) to break the decode bandwidth ceiling —
+decode now reads all ~16 GB of weights per token, so ~60 tok/s is the bf16 limit.

@@ -47,6 +47,16 @@ void launch_attention(const float* q, const bf16* cache_k, const bf16* cache_v,
 //   cache[(*d_past + m) * kv_dim + i] = bf16(src[m*kv_dim + i])
 void launch_store_kv(const float* src, bf16* cache, const int* d_past, int kv_dim, int M, cudaStream_t s);
 
+// Flash-decoding split-K attention for single-token decode (M=1). Splits each head's key
+// range into ATTN_SPLITS chunks computed by separate blocks (partial online-softmax), then
+// a combine pass merges them. part_* are scratch: part_m/l are [n_heads*ATTN_SPLITS],
+// part_acc is [n_heads*ATTN_SPLITS*head_dim].
+#define ATTN_SPLITS 16
+void launch_attention_decode(const float* q, const bf16* cache_k, const bf16* cache_v,
+                             float* out, int n_heads, int n_kv, int head_dim, const int* d_past,
+                             float scale, float* part_m, float* part_l, float* part_acc,
+                             cudaStream_t s);
+
 // out[i] += in[i]   for N elements
 void launch_add(float* out, const float* in, int N, cudaStream_t s);
 

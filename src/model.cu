@@ -89,6 +89,11 @@ void Model::load(const std::string& dir, int max_ctx) {
     CUDA_CHECK(cudaMalloc(&d_pos_, max_ctx_ * sizeof(int)));
     CUDA_CHECK(cudaMalloc(&d_arg_, sizeof(int)));
     CUDA_CHECK(cudaMalloc(&d_past_, sizeof(int)));
+    // flash-decoding split-K scratch
+    int nh = cfg_.num_heads, hd = cfg_.head_dim;
+    CUDA_CHECK(cudaMalloc(&part_m_,   (size_t)nh * ATTN_SPLITS * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&part_l_,   (size_t)nh * ATTN_SPLITS * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&part_acc_, (size_t)nh * ATTN_SPLITS * hd * sizeof(float)));
     CUDA_CHECK(cudaStreamCreate(&stream_));
     host_logits_.resize(V);
 
@@ -139,7 +144,11 @@ void Model::run_layers(int M) {
         launch_store_kv(k_, cache_k_[l], d_past_, KVD, M, s);
         launch_store_kv(v_, cache_v_[l], d_past_, KVD, M, s);
 
-        launch_attention(q_, cache_k_[l], cache_v_[l], attn_, M, nH, nKV, hd, d_past_, scale, s);
+        if (M == 1)   // decode: flash-decoding split-K (more parallelism over the KV cache)
+            launch_attention_decode(q_, cache_k_[l], cache_v_[l], attn_, nH, nKV, hd, d_past_,
+                                    scale, part_m_, part_l_, part_acc_, s);
+        else          // prefill: one warp per (head, query); plenty of parallelism already
+            launch_attention(q_, cache_k_[l], cache_v_[l], attn_, M, nH, nKV, hd, d_past_, scale, s);
         launch_matmul(attn_, L.o_proj, xb2_, M, QD, H, xbf_, s);
         launch_add(x_, xb2_, M * H, s);
 
@@ -195,7 +204,7 @@ Model::~Model() {
     for (auto p : cache_v_)   if (p) cudaFree(p);
     cudaFree(x_); cudaFree(xb_); cudaFree(xb2_); cudaFree(q_); cudaFree(k_); cudaFree(v_);
     cudaFree(attn_); cudaFree(gate_); cudaFree(up_); cudaFree(hmlp_); cudaFree(logits_);
-    cudaFree(xbf_);
+    cudaFree(xbf_); cudaFree(part_m_); cudaFree(part_l_); cudaFree(part_acc_);
     cudaFree(d_ids_); cudaFree(d_pos_); cudaFree(d_arg_); cudaFree(d_past_);
     if (graph_exec_) cudaGraphExecDestroy(graph_exec_);
     if (graph_) cudaGraphDestroy(graph_);

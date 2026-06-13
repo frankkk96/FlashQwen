@@ -52,6 +52,7 @@ private:
     // activation scratch (sized to max_ctx tokens)
     float *x_, *xb_, *xb2_, *q_, *k_, *v_, *attn_, *gate_, *up_, *hmlp_, *logits_;
     bf16  *xbf_ = nullptr;   // BF16 activation scratch for tensor-core prefill matmul
+    float *part_m_, *part_l_, *part_acc_;   // flash-decoding split-K scratch (decode attn)
     int   *d_ids_, *d_pos_, *d_arg_, *d_past_;
     std::vector<float> host_logits_;
 
