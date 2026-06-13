@@ -37,13 +37,15 @@ void launch_embed(const int* ids, const bf16* embed, float* out, int M, int H, c
 void launch_rope(float* x, const int* pos, int M, int n_heads, int head_dim, float theta, cudaStream_t s);
 
 // Grouped-query attention with a KV cache. q[M, n_heads, hd] is FP32; cache_k/v are BF16
-// [max_seq, n_kv, hd]; out[M, n_heads, hd]. Query token m attends keys [0, past_len+m].
+// [max_seq, n_kv, hd]; out[M, n_heads, hd]. Query token m attends keys [0, *d_past + m].
+// past_len is read from device memory (*d_past) so the decode path is CUDA-graph friendly.
 void launch_attention(const float* q, const bf16* cache_k, const bf16* cache_v,
                       float* out, int M, int n_heads, int n_kv, int head_dim,
-                      int past_len, float scale, cudaStream_t s);
+                      const int* d_past, float scale, cudaStream_t s);
 
-// FP32 -> BF16 elementwise convert (n elements). Used to write the BF16 KV cache.
-void launch_to_bf16(const float* in, bf16* out, int n, cudaStream_t s);
+// Append M rows of K (or V) to the BF16 cache at device-resident row offset *d_past:
+//   cache[(*d_past + m) * kv_dim + i] = bf16(src[m*kv_dim + i])
+void launch_store_kv(const float* src, bf16* cache, const int* d_past, int kv_dim, int M, cudaStream_t s);
 
 // out[i] += in[i]   for N elements
 void launch_add(float* out, const float* in, int N, cudaStream_t s);

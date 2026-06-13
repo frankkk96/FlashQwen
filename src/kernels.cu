@@ -164,7 +164,7 @@ void launch_rope(float* x, const int* pos, int M, int n_heads, int head_dim, flo
 __global__ void attention_kernel(const float* __restrict__ q, const bf16* __restrict__ cache_k,
                                  const bf16* __restrict__ cache_v, float* __restrict__ out,
                                  int M, int n_heads, int n_kv, int head_dim,
-                                 int past_len, float scale) {
+                                 const int* __restrict__ d_past, float scale) {
     // DPL = head_dim/32, fixed at compile time (Qwen3 head_dim is 128) so qreg/acc stay in
     // registers instead of spilling to local memory.
     constexpr int DPL = 4;
@@ -172,7 +172,7 @@ __global__ void attention_kernel(const float* __restrict__ q, const bf16* __rest
     int m = blockIdx.y;              // query token
     int lane = threadIdx.x;          // 0..31
     int kvh = h / (n_heads / n_kv);
-    int qpos = past_len + m;         // attend keys [0, qpos]
+    int qpos = *d_past + m;          // attend keys [0, qpos]
 
     const float* qv = q + ((size_t)m * n_heads + h) * head_dim;
     float qreg[DPL], acc[DPL];
@@ -206,16 +206,24 @@ __global__ void attention_kernel(const float* __restrict__ q, const bf16* __rest
 
 void launch_attention(const float* q, const bf16* cache_k, const bf16* cache_v,
                       float* out, int M, int n_heads, int n_kv, int head_dim,
-                      int past_len, float scale, cudaStream_t s) {
+                      const int* d_past, float scale, cudaStream_t s) {
     dim3 grid(n_heads, M);
     attention_kernel<<<grid, 32, 0, s>>>(
-        q, cache_k, cache_v, out, M, n_heads, n_kv, head_dim, past_len, scale);
+        q, cache_k, cache_v, out, M, n_heads, n_kv, head_dim, d_past, scale);
 }
 
-// FP32 -> BF16 (no padding); used to write the KV cache.
-void launch_to_bf16(const float* in, bf16* out, int n, cudaStream_t s) {
-    int blk = 256;
-    f32_to_bf16_kernel<<<(n + blk - 1) / blk, blk, 0, s>>>(in, out, n, n);
+// Append K/V rows to the BF16 cache at device-resident offset *d_past (FP32 -> BF16).
+__global__ void store_kv_kernel(const float* __restrict__ src, bf16* __restrict__ cache,
+                                const int* __restrict__ d_past, int kv_dim, int M) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= M * kv_dim) return;
+    int m = idx / kv_dim, i = idx % kv_dim;
+    cache[((size_t)(*d_past + m)) * kv_dim + i] = __float2bfloat16(src[idx]);
+}
+
+void launch_store_kv(const float* src, bf16* cache, const int* d_past, int kv_dim, int M, cudaStream_t s) {
+    int n = M * kv_dim, blk = 256;
+    store_kv_kernel<<<(n + blk - 1) / blk, blk, 0, s>>>(src, cache, d_past, kv_dim, M);
 }
 
 // ---------------------------------------------------------------------------------------

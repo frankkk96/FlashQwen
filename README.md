@@ -174,8 +174,9 @@ tokens, swept over input length, median of 3 runs:
 | 3 · warp attention (no barrier) | `bench-3-attn` | 83 ms | 908 ms | 39.4 ms | 49.8 |
 | 4 · vectorized GEMV decode | `bench-4-gemv` | 83 ms | 907 ms | 38.8 ms | 51.1 |
 | 5 · GPU argmax (greedy) | `bench-5-argmax` | 83 ms | 909 ms | 38.5 ms | 51.7 |
+| 6 · CUDA graph (decode) | `bench-6-cudagraph` | 83 ms | 909 ms | 38.1 ms | 52.9 |
 
-vs the baseline, the latest stage is **~14–18× faster prefill** and ~4 % faster decode.
+vs the baseline, the latest stage is **~14–18× faster prefill** and ~6 % faster decode.
 Reproduce any stage:
 
 ```bash
@@ -214,6 +215,13 @@ step with 16-byte vectorized loads instead of one scalar BF16 at a time. A modes
 to the host every token and scanning them there, greedy decoding now runs an argmax
 reduction on the GPU and copies back a single int. Saves ~0.2–0.3 ms/token (decode@16
 51.1 → 51.7 tok/s). Sampling (temperature > 0) still copies the full logits.
+
+**Stage 6 — CUDA graph for decode, `bench-6-cudagraph`.** A decode step launches ~430 small
+kernels (36 layers × ~12); some are so short they're launch-overhead-bound rather than
+hidden behind GPU work. The fixed single-token sequence is captured once into a CUDA graph
+and replayed each step (token id / position / `past_len` live in device buffers the kernels
+read, so the graph stays valid as context grows). Consistent ~0.4–0.5 ms/token (decode@16
+51.7 → 52.9 tok/s, peak 55.2 → 56.5). Prefill (variable length) stays eager.
 
 **Still open:** flash-decoding split-K for decode attention, and weight quantization
 (INT8/INT4) to break the decode bandwidth ceiling (decode reads all ~16 GB of weights per

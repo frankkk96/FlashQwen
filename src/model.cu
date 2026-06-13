@@ -88,6 +88,8 @@ void Model::load(const std::string& dir, int max_ctx) {
     CUDA_CHECK(cudaMalloc(&d_ids_, max_ctx_ * sizeof(int)));
     CUDA_CHECK(cudaMalloc(&d_pos_, max_ctx_ * sizeof(int)));
     CUDA_CHECK(cudaMalloc(&d_arg_, sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&d_past_, sizeof(int)));
+    CUDA_CHECK(cudaStreamCreate(&stream_));
     host_logits_.resize(V);
 
     size_t freeb, totalb;
@@ -96,19 +98,25 @@ void Model::load(const std::string& dir, int max_ctx) {
                  (totalb - freeb) / 1e9, totalb / 1e9);
 }
 
-void Model::forward(const std::vector<int>& tokens, int past_len) {
+// Host -> device: token ids, positions, and past_len (read by the kernels). Synchronous, so
+// the buffers are in place before the (graph or eager) kernel sequence runs.
+void Model::set_inputs(const std::vector<int>& tokens, int past_len) {
     int M = (int)tokens.size();
-    const ModelConfig& c = cfg_;
-    int H = c.hidden_size, QD = c.q_dim(), KVD = c.kv_dim(), I = c.intermediate;
-    int nH = c.num_heads, nKV = c.num_kv_heads, hd = c.head_dim;
-    float eps = c.rms_eps, scale = 1.0f / std::sqrt((float)hd);
-    cudaStream_t s = 0;
-
-    // upload ids + positions
     CUDA_CHECK(cudaMemcpy(d_ids_, tokens.data(), M * sizeof(int), cudaMemcpyHostToDevice));
     std::vector<int> pos(M);
     for (int i = 0; i < M; ++i) pos[i] = past_len + i;
     CUDA_CHECK(cudaMemcpy(d_pos_, pos.data(), M * sizeof(int), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_past_, &past_len, sizeof(int), cudaMemcpyHostToDevice));
+}
+
+// The kernel sequence for M tokens. Pure async launches on stream_ (no syncs), so it can be
+// captured into a CUDA graph. Reads d_ids_/d_pos_/d_past_; leaves logits_ on the device.
+void Model::run_layers(int M) {
+    const ModelConfig& c = cfg_;
+    int H = c.hidden_size, QD = c.q_dim(), KVD = c.kv_dim(), I = c.intermediate;
+    int nH = c.num_heads, nKV = c.num_kv_heads, hd = c.head_dim;
+    float eps = c.rms_eps, scale = 1.0f / std::sqrt((float)hd);
+    cudaStream_t s = stream_;
 
     launch_embed(d_ids_, embed_, x_, M, H, s);
 
@@ -127,11 +135,11 @@ void Model::forward(const std::vector<int>& tokens, int past_len) {
         launch_rope(q_, d_pos_, M, nH,  hd, c.rope_theta, s);
         launch_rope(k_, d_pos_, M, nKV, hd, c.rope_theta, s);
 
-        // append K/V to cache (rows are contiguous [M, kv_dim]); FP32 -> BF16
-        launch_to_bf16(k_, cache_k_[l] + (size_t)past_len * KVD, M * KVD, s);
-        launch_to_bf16(v_, cache_v_[l] + (size_t)past_len * KVD, M * KVD, s);
+        // append K/V to cache at device offset *d_past_ (FP32 -> BF16)
+        launch_store_kv(k_, cache_k_[l], d_past_, KVD, M, s);
+        launch_store_kv(v_, cache_v_[l], d_past_, KVD, M, s);
 
-        launch_attention(q_, cache_k_[l], cache_v_[l], attn_, M, nH, nKV, hd, past_len, scale, s);
+        launch_attention(q_, cache_k_[l], cache_v_[l], attn_, M, nH, nKV, hd, d_past_, scale, s);
         launch_matmul(attn_, L.o_proj, xb2_, M, QD, H, xbf_, s);
         launch_add(x_, xb2_, M * H, s);
 
@@ -148,7 +156,24 @@ void Model::forward(const std::vector<int>& tokens, int past_len) {
     float* xlast = x_ + (size_t)(M - 1) * H;
     launch_rmsnorm(xlast, fnorm_, xb_, 1, H, eps, s);
     launch_matmul(xb_, lm_head_, logits_, 1, H, c.vocab_size, xbf_, s);
-    // logits_ left on device; caller picks argmax_last() (greedy) or copy_logits() (sampling).
+}
+
+void Model::forward(const std::vector<int>& tokens, int past_len) {
+    set_inputs(tokens, past_len);
+    if ((int)tokens.size() == 1) {
+        // single-token decode: fixed shape -> capture once, replay every step.
+        if (!graph_ready_) {
+            CUDA_CHECK(cudaStreamBeginCapture(stream_, cudaStreamCaptureModeThreadLocal));
+            run_layers(1);
+            CUDA_CHECK(cudaStreamEndCapture(stream_, &graph_));
+            CUDA_CHECK(cudaGraphInstantiate(&graph_exec_, graph_, 0));
+            graph_ready_ = true;
+        }
+        CUDA_CHECK(cudaGraphLaunch(graph_exec_, stream_));
+    } else {
+        run_layers((int)tokens.size());          // prefill: variable shape, run eagerly
+    }
+    CUDA_CHECK(cudaStreamSynchronize(stream_));   // logits_ ready for argmax_last/copy_logits
 }
 
 int Model::argmax_last() {
@@ -171,5 +196,8 @@ Model::~Model() {
     cudaFree(x_); cudaFree(xb_); cudaFree(xb2_); cudaFree(q_); cudaFree(k_); cudaFree(v_);
     cudaFree(attn_); cudaFree(gate_); cudaFree(up_); cudaFree(hmlp_); cudaFree(logits_);
     cudaFree(xbf_);
-    cudaFree(d_ids_); cudaFree(d_pos_); cudaFree(d_arg_);
+    cudaFree(d_ids_); cudaFree(d_pos_); cudaFree(d_arg_); cudaFree(d_past_);
+    if (graph_exec_) cudaGraphExecDestroy(graph_exec_);
+    if (graph_) cudaGraphDestroy(graph_);
+    if (stream_) cudaStreamDestroy(stream_);
 }

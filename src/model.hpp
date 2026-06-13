@@ -34,6 +34,8 @@ private:
 
     bf16*  upload_bf16(const std::string& name);
     float* upload_norm(const std::string& name);   // bf16 -> fp32
+    void   set_inputs(const std::vector<int>& tokens, int past_len);  // host -> device buffers
+    void   run_layers(int M);                                         // kernel sequence on stream_
 
     ModelConfig cfg_;
     SafeTensors st_;
@@ -50,8 +52,14 @@ private:
     // activation scratch (sized to max_ctx tokens)
     float *x_, *xb_, *xb2_, *q_, *k_, *v_, *attn_, *gate_, *up_, *hmlp_, *logits_;
     bf16  *xbf_ = nullptr;   // BF16 activation scratch for tensor-core prefill matmul
-    int   *d_ids_, *d_pos_, *d_arg_;
+    int   *d_ids_, *d_pos_, *d_arg_, *d_past_;
     std::vector<float> host_logits_;
+
+    // single stream + a captured CUDA graph for the fixed single-token decode path
+    cudaStream_t   stream_ = nullptr;
+    cudaGraph_t    graph_ = nullptr;
+    cudaGraphExec_t graph_exec_ = nullptr;
+    bool           graph_ready_ = false;
 
     std::vector<bf16*> all_bufs_;   // for cleanup
     std::vector<float*> all_fbufs_;
