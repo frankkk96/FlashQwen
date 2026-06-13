@@ -123,21 +123,21 @@ disk at runtime, so they are not part of the binary.
 
 - C++ stdlib: `<vector> <string> <unordered_map> <chrono> <random> <cmath> <fstream>` …
 - CUDA: `<cuda_runtime.h>`, `<cuda_bf16.h>` — **no** cuBLAS / cuDNN / cuRAND / Thrust.
-- POSIX: `<sys/mman.h>` (mmap), `<fcntl.h>`, `<unistd.h>`, `<dirent.h>`.
+- POSIX: `<sys/mman.h>` (mmap), `<fcntl.h>`, `<unistd.h>`.
 
 ### Code structure & line count
 
 Each file has one job; `main.cpp` is a thin entry point that just parses arguments and
-dispatches. Roughly 1720 lines total.
+dispatches. Roughly 1690 lines total.
 
 **Application layer**
 
 | file | role | lines |
 |---|---|---:|
-| `src/main.cpp` | entry point: argument parsing + dispatch | 73 |
-| `src/cli.cpp` / `.hpp` | model-dir resolution, arch check, `--help` | 117 |
+| `src/main.cpp` | entry point: argument parsing + dispatch | 69 |
+| `src/cli.cpp` / `.hpp` | architecture check + `--help` | 63 |
 | `src/chat.cpp` / `.hpp` | interactive multi-turn chat | 55 |
-| `src/benchmark.cpp` / `.hpp` | benchmark mode | 52 |
+| `src/benchmark.cpp` / `.hpp` | benchmark mode (input-length sweep) | 92 |
 | `src/generate.cpp` / `.hpp` | shared prefill + decode loop | 66 |
 | `src/sampler.cpp` / `.hpp` | token sampling (greedy / temp / top-k / top-p) | 50 |
 
@@ -145,8 +145,8 @@ dispatches. Roughly 1720 lines total.
 
 | file | role | lines |
 |---|---|---:|
-| `src/model.cu` / `.hpp` | weight loading + forward pass + KV cache | 219 |
-| `src/kernels.cu` / `.cuh` | CUDA kernels (WMMA/GEMV matmul, rmsnorm, rope, attention, …) | 270 |
+| `src/model.cu` / `.hpp` | weight loading + forward pass + KV cache | 217 |
+| `src/kernels.cu` / `.cuh` | CUDA kernels (WMMA/GEMV matmul, rmsnorm, rope, attention, …) | 295 |
 | `src/tokenizer.cpp` / `.hpp` | byte-level BPE encode/decode | 394 |
 | `src/safetensors.cpp` / `.hpp` | mmap + `.safetensors` header parse | 105 |
 | `src/json.hpp` | minimal JSON parser | 203 |
@@ -154,5 +154,61 @@ dispatches. Roughly 1720 lines total.
 | `CMakeLists.txt` | build | 35 |
 
 Notably, the "usually-a-library" plumbing — tokenizer (394) + JSON (203) — is ~600 lines,
-nearly half the project. The actual neural network — CUDA kernels (270) + forward (219) —
-is ~490 lines, because Qwen3 is a clean, regular dense transformer.
+nearly half the project. The actual neural network — CUDA kernels (295) + forward (217) —
+is ~510 lines, because Qwen3 is a clean, regular dense transformer.
+
+## Optimization study
+
+The matmul/decode path was optimized in stages. Each stage is a **tagged commit on the
+`optimization-study` branch**, so any version can be checked out and re-measured. **Stage 0
+(scalar matmul) is the baseline** that everything below is compared against.
+
+Measured on RTX 4090 (Qwen3-8B, BF16) — single stream, batch 1, greedy, output fixed at 128
+tokens, swept over input length, median of 3 runs:
+
+| stage | branch tag | TTFT@128 | TTFT@1024 | TPOT@1024 | decode@16 (tok/s) |
+|---|---|---:|---:|---:|---:|
+| **0 · scalar matmul (baseline)** | `bench-0-scalar` | 1531 ms | 12585 ms | 40.1 ms | 49.7 |
+| 1 · tensor-core (WMMA) prefill | `bench-1-wmma` | 89 ms | 1234 ms | 40.1 ms | 49.7 |
+| 2 · BF16 KV cache | `bench-2-bf16kv` | 89 ms | 1233 ms | 40.0 ms | 49.7 |
+| 3 · warp attention (no barrier) | `bench-3-attn` | 83 ms | 908 ms | 39.4 ms | 49.8 |
+| 4 · vectorized GEMV decode | `bench-4-gemv` | 83 ms | 907 ms | 38.8 ms | 51.1 |
+
+vs the baseline, stage 4 is **~14–18× faster prefill** and ~3 % faster decode. Reproduce any
+stage:
+
+```bash
+git checkout bench-1-wmma     # or bench-0-scalar … bench-4-gemv
+cmake -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build -j8
+./build/flashqwen benchmark --model models/qwen3-8b
+```
+
+**Stage 0 — scalar matmul (baseline), `bench-0-scalar`.** One warp computes one output
+element (a dot product) for every matmul, prefill and decode alike. No tensor cores. Prefill
+is brutal: a 1024-token prompt takes ~12.6 s to first token, because the prefill GEMMs are
+compute-bound and run with no tensor cores.
+
+**Stage 1 — tensor-core (WMMA) prefill, `bench-1-wmma`.** Prefill (many tokens) converts
+activations to BF16 and runs the matmul on tensor cores via WMMA (16×16×16, FP32 accumulate);
+decode (one token) keeps the GEMV. **Prefill collapses ~14× (TTFT@1024 12585 → 1234 ms).**
+Decode is untouched — it's memory-bound, tensor cores don't help.
+
+**Stage 2 — BF16 KV cache, `bench-2-bf16kv`.** The KV cache is stored BF16 instead of FP32.
+Speed is unchanged *here* — the attention kernel at this point is latency-bound (a serialized
+per-key `__syncthreads` reduction), not bandwidth-bound — but the cache halves (~1.2 GB →
+~0.6 GB at 4096 ctx), i.e. ~2× the max context. The byte savings only pay off in stage 3.
+
+**Stage 3 — warp attention, `bench-3-attn`.** Attention is rewritten from "one block per
+(head,query) with a per-key block reduction" to **one warp per (head,query)**: each lane owns
+4 dims, the per-key q·k is a warp-shuffle reduction, online softmax in registers — no
+barriers. **Prefill attention drops ~26 % (TTFT@1024 1233 → 908 ms).** Decode TPOT is roughly
+flat: at batch 1 there are only 32 work-items (one per head), so decode attention is
+parallelism-bound, not per-key-cost-bound (a real decode win needs flash-decoding split-K).
+
+**Stage 4 — vectorized GEMV decode, `bench-4-gemv`.** The decode GEMV reads 8 elements per
+step with 16-byte vectorized loads instead of one scalar BF16 at a time. A modest gain
+(decode@16 49.8 → 51.1 tok/s) — the scalar version was already ~80 % of memory bandwidth.
+
+**Still open:** flash-decoding split-K for decode attention, and weight quantization
+(INT8/INT4) to break the decode bandwidth ceiling (decode reads all ~16 GB of weights per
+token, so ~60 tok/s is the bf16 limit).
