@@ -36,11 +36,14 @@ void launch_embed(const int* ids, const bf16* embed, float* out, int M, int H, c
 // In-place rotary position embedding on x[M, n_heads, head_dim], positions pos[M].
 void launch_rope(float* x, const int* pos, int M, int n_heads, int head_dim, float theta, cudaStream_t s);
 
-// Grouped-query attention with a KV cache. q[M, n_heads, hd]; cache_k/v are
+// Grouped-query attention with a KV cache. q[M, n_heads, hd] is FP32; cache_k/v are BF16
 // [max_seq, n_kv, hd]; out[M, n_heads, hd]. Query token m attends keys [0, past_len+m].
-void launch_attention(const float* q, const float* cache_k, const float* cache_v,
+void launch_attention(const float* q, const bf16* cache_k, const bf16* cache_v,
                       float* out, int M, int n_heads, int n_kv, int head_dim,
                       int past_len, float scale, cudaStream_t s);
+
+// FP32 -> BF16 elementwise convert (n elements). Used to write the BF16 KV cache.
+void launch_to_bf16(const float* in, bf16* out, int n, cudaStream_t s);
 
 // out[i] += in[i]   for N elements
 void launch_add(float* out, const float* in, int N, cudaStream_t s);

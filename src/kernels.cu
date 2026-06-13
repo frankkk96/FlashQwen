@@ -149,8 +149,8 @@ void launch_rope(float* x, const int* pos, int M, int n_heads, int head_dim, flo
 // attention with online (flash-style) softmax: one block per (head, query token).
 // blockDim = head_dim.
 // ---------------------------------------------------------------------------------------
-__global__ void attention_kernel(const float* __restrict__ q, const float* __restrict__ cache_k,
-                                 const float* __restrict__ cache_v, float* __restrict__ out,
+__global__ void attention_kernel(const float* __restrict__ q, const bf16* __restrict__ cache_k,
+                                 const bf16* __restrict__ cache_v, float* __restrict__ out,
                                  int M, int n_heads, int n_kv, int head_dim,
                                  int past_len, float scale) {
     int h = blockIdx.x;              // query head
@@ -167,8 +167,8 @@ __global__ void attention_kernel(const float* __restrict__ q, const float* __res
     float m_run = -1e30f, l_run = 0.f, acc = 0.f;
 
     for (int j = 0; j <= qpos; ++j) {
-        const float* kv = cache_k + ((size_t)j * n_kv + kvh) * head_dim;
-        red[t] = qd * kv[t];
+        const bf16* kv = cache_k + ((size_t)j * n_kv + kvh) * head_dim;
+        red[t] = qd * __bfloat162float(kv[t]);
         __syncthreads();
         for (int s = head_dim >> 1; s > 0; s >>= 1) {
             if (t < s) red[t] += red[t + s];
@@ -180,20 +180,26 @@ __global__ void attention_kernel(const float* __restrict__ q, const float* __res
         float m_new = fmaxf(m_run, score);
         float corr  = expf(m_run - m_new);
         float p     = expf(score - m_new);
-        const float* vv = cache_v + ((size_t)j * n_kv + kvh) * head_dim;
+        const bf16* vv = cache_v + ((size_t)j * n_kv + kvh) * head_dim;
         l_run = l_run * corr + p;
-        acc   = acc   * corr + p * vv[t];
+        acc   = acc   * corr + p * __bfloat162float(vv[t]);
         m_run = m_new;
     }
     out[((size_t)m * n_heads + h) * head_dim + t] = acc / l_run;
 }
 
-void launch_attention(const float* q, const float* cache_k, const float* cache_v,
+void launch_attention(const float* q, const bf16* cache_k, const bf16* cache_v,
                       float* out, int M, int n_heads, int n_kv, int head_dim,
                       int past_len, float scale, cudaStream_t s) {
     dim3 grid(n_heads, M);
     attention_kernel<<<grid, head_dim, head_dim * sizeof(float), s>>>(
         q, cache_k, cache_v, out, M, n_heads, n_kv, head_dim, past_len, scale);
+}
+
+// FP32 -> BF16 (no padding); used to write the KV cache.
+void launch_to_bf16(const float* in, bf16* out, int n, cudaStream_t s) {
+    int blk = 256;
+    f32_to_bf16_kernel<<<(n + blk - 1) / blk, blk, 0, s>>>(in, out, n, n);
 }
 
 // ---------------------------------------------------------------------------------------

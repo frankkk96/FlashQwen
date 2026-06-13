@@ -65,8 +65,8 @@ void Model::load(const std::string& dir, int max_ctx) {
     cache_k_.resize(cfg_.num_layers);
     cache_v_.resize(cfg_.num_layers);
     for (int l = 0; l < cfg_.num_layers; ++l) {
-        CUDA_CHECK(cudaMalloc(&cache_k_[l], (size_t)max_ctx_ * kvd * sizeof(float)));
-        CUDA_CHECK(cudaMalloc(&cache_v_[l], (size_t)max_ctx_ * kvd * sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&cache_k_[l], (size_t)max_ctx_ * kvd * sizeof(bf16)));
+        CUDA_CHECK(cudaMalloc(&cache_v_[l], (size_t)max_ctx_ * kvd * sizeof(bf16)));
     }
 
     // activation scratch
@@ -126,11 +126,9 @@ const std::vector<float>& Model::forward(const std::vector<int>& tokens, int pas
         launch_rope(q_, d_pos_, M, nH,  hd, c.rope_theta, s);
         launch_rope(k_, d_pos_, M, nKV, hd, c.rope_theta, s);
 
-        // append K/V to cache (rows are contiguous [M, kv_dim])
-        CUDA_CHECK(cudaMemcpyAsync(cache_k_[l] + (size_t)past_len * KVD, k_,
-                                   (size_t)M * KVD * sizeof(float), cudaMemcpyDeviceToDevice, s));
-        CUDA_CHECK(cudaMemcpyAsync(cache_v_[l] + (size_t)past_len * KVD, v_,
-                                   (size_t)M * KVD * sizeof(float), cudaMemcpyDeviceToDevice, s));
+        // append K/V to cache (rows are contiguous [M, kv_dim]); FP32 -> BF16
+        launch_to_bf16(k_, cache_k_[l] + (size_t)past_len * KVD, M * KVD, s);
+        launch_to_bf16(v_, cache_v_[l] + (size_t)past_len * KVD, M * KVD, s);
 
         launch_attention(q_, cache_k_[l], cache_v_[l], attn_, M, nH, nKV, hd, past_len, scale, s);
         launch_matmul(attn_, L.o_proj, xb2_, M, QD, H, xbf_, s);

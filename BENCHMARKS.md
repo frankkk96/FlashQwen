@@ -24,7 +24,7 @@ cmake -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build -j8
 |---|---|---:|---:|---:|---:|---:|
 | 0. scalar matmul | `bench-0-scalar` | 1531 | 12585 | 22.3 | 40.1 | 49.7 |
 | 1. tensor-core prefill (WMMA) | `bench-1-wmma` | 89 | 1234 | 22.3 | 40.1 | 49.7 |
-| 2. BF16 KV cache | `bench-2-bf16kv` | _tbd_ | _tbd_ | _tbd_ | _tbd_ | _tbd_ |
+| 2. BF16 KV cache | `bench-2-bf16kv` | 89 | 1233 | 22.3 | 40.0 | 49.7 |
 | 3. faster decode attention | `bench-3-attn` | _tbd_ | _tbd_ | _tbd_ | _tbd_ | _tbd_ |
 | 4. vectorized GEMV decode | `bench-4-gemv` | _tbd_ | _tbd_ | _tbd_ | _tbd_ | _tbd_ |
 
@@ -57,4 +57,23 @@ memory-bound, tensor cores don't help).
     128      88.5    22.34      44.8       43.4       47.5
     512     422.2    29.98      33.4       30.0       34.8
    1024    1234.4    40.12      24.9       20.1       25.7
+```
+
+### 2. BF16 KV cache — `bench-2-bf16kv`
+
+KV cache stored as BF16 instead of FP32 (K/V converted on write, read back as float in
+attention). **Speed is unchanged** vs stage 1 — and that's the expected result: the current
+attention kernel is *latency-bound* (a serialized per-key `__syncthreads` block reduction),
+not bandwidth-bound, so halving the K/V bytes doesn't move TPOT yet. The immediate win is
+**memory**: the KV cache halves (~1.2 GB → ~0.6 GB at 4096 ctx), i.e. ~2× the max context
+for the same VRAM. The *speed* payoff arrives in stage 3, once attention stops being
+latency-bound (the new kernel then reads half the bytes).
+
+```
+  input    TTFT      TPOT     decode     output      peak
+  (tok)    (ms)    (ms/tok)  (tok/s)    (tok/s)    (tok/s)
+     16      60.2    20.14      49.7       48.5       52.9
+    128      88.6    22.34      44.8       43.4       47.4
+    512     420.4    29.93      33.4       30.1       34.9
+   1024    1233.4    40.04      25.0       20.1       25.8
 ```

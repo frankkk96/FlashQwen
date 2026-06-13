@@ -39,8 +39,8 @@ private:
     bf16*  lm_head_= nullptr;
     std::vector<Layer> layers_;
 
-    // KV cache: per layer [max_ctx, kv_dim]
-    std::vector<float*> cache_k_, cache_v_;
+    // KV cache: per layer [max_ctx, kv_dim], stored BF16
+    std::vector<bf16*> cache_k_, cache_v_;
 
     // activation scratch (sized to max_ctx tokens)
     float *x_, *xb_, *xb2_, *q_, *k_, *v_, *attn_, *gate_, *up_, *hmlp_, *logits_;
