@@ -15,8 +15,18 @@ __global__ void gemv_kernel(const float* __restrict__ x, const bf16* __restrict_
 
     const bf16* wr = W + (size_t)row * IN;
     float acc = 0.f;
-    for (int i = lane; i < IN; i += 32)
-        acc += x[i] * __bfloat162float(wr[i]);
+    // Each lane reads 8 contiguous elements per pass (16-byte vectorized loads), striding
+    // by 32*8. Requires IN % 8 == 0 (true for all Qwen3 layer dims).
+    for (int i = lane * 8; i + 8 <= IN; i += 256) {
+        int4 wpack = *reinterpret_cast<const int4*>(wr + i);          // 8 BF16 weights
+        const bf16* wb = reinterpret_cast<const bf16*>(&wpack);
+        float4 xa = *reinterpret_cast<const float4*>(x + i);
+        float4 xb = *reinterpret_cast<const float4*>(x + i + 4);
+        acc += xa.x * __bfloat162float(wb[0]) + xa.y * __bfloat162float(wb[1])
+             + xa.z * __bfloat162float(wb[2]) + xa.w * __bfloat162float(wb[3])
+             + xb.x * __bfloat162float(wb[4]) + xb.y * __bfloat162float(wb[5])
+             + xb.z * __bfloat162float(wb[6]) + xb.w * __bfloat162float(wb[7]);
+    }
     #pragma unroll
     for (int o = 16; o > 0; o >>= 1)
         acc += __shfl_down_sync(0xffffffff, acc, o);

@@ -26,7 +26,7 @@ cmake -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build -j8
 | 1. tensor-core prefill (WMMA) | `bench-1-wmma` | 89 | 1234 | 22.3 | 40.1 | 49.7 |
 | 2. BF16 KV cache | `bench-2-bf16kv` | 89 | 1233 | 22.3 | 40.0 | 49.7 |
 | 3. warp attention (no barrier) | `bench-3-attn` | 83 | 908 | 22.2 | 39.4 | 49.8 |
-| 4. vectorized GEMV decode | `bench-4-gemv` | _tbd_ | _tbd_ | _tbd_ | _tbd_ | _tbd_ |
+| 4. vectorized GEMV decode | `bench-4-gemv` | 83 | 907 | 21.7 | 38.8 | 51.1 |
 
 ## Stages
 
@@ -104,3 +104,36 @@ which is left as future work.
     512     339.0    29.57      33.8       31.0       35.3
    1024     908.0    39.35      25.4       21.5       26.2
 ```
+
+### 4. vectorized GEMV decode — `bench-4-gemv`
+
+The decode GEMV now reads 8 elements per step with 16-byte vectorized loads (`int4` for 8
+BF16 weights, two `float4` for 8 activations) instead of one scalar BF16 at a time. A
+**modest** gain (decode@16 49.8 → 51.1 tok/s, peak 53.0 → 54.5) — the scalar kernel was
+already ~80 % of memory bandwidth, so there isn't much headroom. Breaking the ~60 tok/s
+decode ceiling fundamentally requires reading fewer weight bytes per token, i.e.
+quantization (INT8/INT4) — out of scope here.
+
+```
+  input    TTFT      TPOT     decode     output      peak
+  (tok)    (ms)    (ms/tok)  (tok/s)    (tok/s)    (tok/s)
+     16      60.0    19.56      51.1       49.9       54.5
+    128      83.1    21.69      46.1       44.8       48.9
+    512     337.2    29.03      34.5       31.6       36.0
+   1024     907.3    38.77      25.8       21.8       26.6
+```
+
+## Takeaways
+
+From the scalar baseline (stage 0) to stage 4, at the same RTX 4090:
+
+- **Prefill / TTFT collapsed ~14×** — TTFT@1024 went 12585 → 907 ms. Almost all of it is the
+  tensor-core (WMMA) matmul (stage 1); the warp attention (stage 3) trimmed the remaining
+  prefill-attention cost a further ~26 %.
+- **Decode improved modestly** — decode@16 49.7 → 51.1 tok/s, TPOT@1024 40.1 → 38.8 ms.
+  Decode is memory-bound (reads all ~16 GB of weights per token), so it was already near the
+  hardware limit; vectorized GEMV (stage 4) added a few %.
+- **BF16 KV cache (stage 2)** didn't change speed on its own but halved KV memory (≈2× max
+  context); its byte savings only help once attention is bandwidth-relevant (stage 3).
+- **Still on the table:** flash-decoding split-K for decode attention (parallelism-bound at
+  batch 1), and weight quantization to break the decode bandwidth ceiling.
