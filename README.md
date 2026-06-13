@@ -20,8 +20,9 @@ git clone https://huggingface.co/Qwen/Qwen3-8B models/qwen3-8b
 ```
 
 The directory needs `config.json`, the `*.safetensors` shards,
-`model.safetensors.index.json`, `vocab.json`, and `merges.txt`. Weights are used as-is
-(BF16, no conversion or quantization).
+`model.safetensors.index.json`, `vocab.json`, and `merges.txt`. No offline conversion or
+repacking — FlashQwen reads the BF16 files directly and quantizes the matmul weights to
+INT8 in memory at load.
 
 ### Build
 
@@ -72,7 +73,9 @@ hub cache for what's available.
 ## Local benchmark
 
 **Hardware:** NVIDIA GeForce RTX 4090 (24 GB) · driver 580.76.05 (CUDA 13.0) · built with CUDA 12.8 (native sm_89)
-**Model:** Qwen3-8B, BF16 weights, FP32 activations (the prefill matmul runs on tensor cores in BF16).
+**Model:** Qwen3-8B — matmul weights quantized to INT8 (per-row scale), BF16 embeddings,
+FP32 activations; prefill on tensor cores (WMMA), decode attention via flash-decoding
+split-K, single-token decode replayed from a CUDA graph.
 **Method:** single stream (batch 1), greedy, fixed 128-token output (ignores EOS), 1 warmup
 run + median of 3 measured runs. The sweep is built in — just `flashqwen benchmark --model <DIR>`.
 
@@ -80,10 +83,10 @@ Swept over input length (synthetic prompts), output fixed at 128 tokens:
 
 | input tok | TTFT | TPOT | decode tok/s | output tok/s | peak tok/s |
 |---:|---:|---:|---:|---:|---:|
-| 16   | 60 ms  | 20.2 ms | 49.6 | 48.5 | 52.9 |
-| 128  | 89 ms  | 22.4 ms | 44.7 | 43.4 | 47.4 |
-| 512  | 0.42 s | 30.0 ms | 33.3 | 30.1 | 34.8 |
-| 1024 | 1.23 s | 40.1 ms | 24.9 | 20.1 | 25.7 |
+| 16   | 69 ms  | 9.6 ms  | 104.2 | 98.7 | 105.1 |
+| 128  | 97 ms  | 9.7 ms  | 102.6 | 95.3 | 103.5 |
+| 512  | 0.40 s | 10.2 ms |  97.8 | 74.8 |  98.5 |
+| 1024 | 0.95 s | 10.9 ms |  91.9 | 54.6 |  92.6 |
 
 **Metric definitions:**
 - **TTFT** — time to first token = prefill of the whole prompt + sampling token #1.
@@ -92,13 +95,13 @@ Swept over input length (synthetic prompts), output fixed at 128 tokens:
 - **output throughput** — tokens/s including prefill (`n_out / total_time`).
 - **peak output throughput** — `1 / fastest single-token latency`.
 
-**Reading the numbers.** Decode is memory-bound: each token reads all ~16 GB of weights
-once, so TPOT ≈ 20 ms ≈ 50 tok/s ≈ 16 GB × 50 ≈ 800 GB/s — close to the 4090's ~1 TB/s
-bandwidth, i.e. near the hardware limit for single-sequence decode. Prefill runs on a
-**tensor-core (WMMA) GEMM**, so TTFT stays low even for long inputs (~1.2 s for 1024
-tokens, vs ~13 s for the earlier scalar kernel). TPOT still creeps up with context
-(20 → 40 ms) because the attention kernel rescans a longer KV cache every step — that, not
-prefill, is now the main thing left to optimize.
+**Reading the numbers.** Decode is memory-bound — each token reads the whole model — so the
+INT8 weights (~9 GB vs ~16 GB in BF16) put it around **~100 tok/s**, and flash-decoding
+split-K keeps it nearly flat as context grows (TPOT 9.6 → 10.9 ms from 16 → 1024 tokens).
+Prefill runs on tensor cores (WMMA); the INT8 weights are dequantized to BF16 first, which is
+why TTFT is a touch higher than a pure-BF16 build. These are the numbers *after* the
+optimization study below — which starts from a 49.7 tok/s scalar baseline and shows where
+each gain came from.
 
 ---
 
@@ -128,7 +131,7 @@ disk at runtime, so they are not part of the binary.
 ### Code structure & line count
 
 Each file has one job; `main.cpp` is a thin entry point that just parses arguments and
-dispatches. Roughly 1690 lines total.
+dispatches. Roughly 1940 lines total.
 
 **Application layer**
 
@@ -145,8 +148,8 @@ dispatches. Roughly 1690 lines total.
 
 | file | role | lines |
 |---|---|---:|
-| `src/model.cu` / `.hpp` | weight loading + forward pass + KV cache | 217 |
-| `src/kernels.cu` / `.cuh` | CUDA kernels (WMMA/GEMV matmul, rmsnorm, rope, attention, …) | 295 |
+| `src/model.cu` / `.hpp` | weight loading (INT8 quant) + forward + KV cache + CUDA graph | 331 |
+| `src/kernels.cu` / `.cuh` | CUDA kernels (INT8 GEMV / WMMA matmul, attention, split-K, …) | 431 |
 | `src/tokenizer.cpp` / `.hpp` | byte-level BPE encode/decode | 394 |
 | `src/safetensors.cpp` / `.hpp` | mmap + `.safetensors` header parse | 105 |
 | `src/json.hpp` | minimal JSON parser | 203 |
@@ -154,8 +157,9 @@ dispatches. Roughly 1690 lines total.
 | `CMakeLists.txt` | build | 35 |
 
 Notably, the "usually-a-library" plumbing — tokenizer (394) + JSON (203) — is ~600 lines,
-nearly half the project. The actual neural network — CUDA kernels (295) + forward (217) —
-is ~510 lines, because Qwen3 is a clean, regular dense transformer.
+nearly half the project. The actual neural network — CUDA kernels (431) + forward (331) —
+is ~760 lines, with the growth coming from the optimization stages below (INT8, split-K,
+CUDA graph) rather than the base Qwen3 transformer, which is small and regular.
 
 ## Optimization study
 
