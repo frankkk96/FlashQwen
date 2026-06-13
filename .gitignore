@@ -3,6 +3,9 @@ build/
 *.o
 *.obj
 
+# local model files / symlinks (machine-specific)
+models/
+
 # IDE / tooling
 .claude/
 compile_commands.json

@@ -12,17 +12,16 @@ Chinese / 中文文档: [README.zh-CN.md](README.zh-CN.md)
 
 ### Get the model
 
-The weights are used **directly as downloaded from HuggingFace** — no conversion,
-quantization, or repacking step. Download Qwen3-8B with the official tooling:
+`git clone` the model repo into a directory, then point `--model` at it:
 
 ```bash
-pip install -U huggingface_hub
-huggingface-cli download Qwen/Qwen3-8B
+git lfs install
+git clone https://huggingface.co/Qwen/Qwen3-8B models/qwen3-8b
 ```
 
-This fills an HF hub cache dir (default `~/.cache/huggingface/hub/models--Qwen--Qwen3-8B`);
-pass that path to `--model`. FlashQwen reads `config.json`, the `*.safetensors` shards,
-`vocab.json`, and `merges.txt` straight from it.
+The directory needs `config.json`, the `*.safetensors` shards,
+`model.safetensors.index.json`, `vocab.json`, and `merges.txt`. Weights are used as-is
+(BF16, no conversion or quantization).
 
 ### Build
 
@@ -37,19 +36,19 @@ targets `sm_89` (RTX 4090 / Ada) by default; for a different GPU pass
 
 ### Run
 
-`--model` is **required** — either an HF snapshot dir containing `config.json`, or an HF
-hub cache dir like `.../models--Qwen--Qwen3-8B`. `--help` lists supported models and
-scans the local hub cache for what's available.
+`--model` is **required** and points at the model directory (e.g. `models/qwen3-8b` from
+above; an HF hub cache dir also works). `--help` lists supported models and scans the local
+hub cache for what's available.
 
 ```bash
 # interactive multi-turn chat (default mode). KV cache persists across turns.
-./build/flashqwen --model /path/to/models--Qwen--Qwen3-8B
+./build/flashqwen --model models/qwen3-8b
 
 # chat with Qwen's recommended sampling
-./build/flashqwen --model <DIR> --temperature 0.6 --top-p 0.95 --top-k 20
+./build/flashqwen --model models/qwen3-8b --temperature 0.6 --top-p 0.95 --top-k 20
 
 # benchmark (built-in fixed sweep over input lengths)
-./build/flashqwen benchmark --model <DIR>
+./build/flashqwen benchmark --model models/qwen3-8b
 
 ./build/flashqwen --help
 ```

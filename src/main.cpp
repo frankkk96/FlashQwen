@@ -45,20 +45,20 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    std::string dir = resolve_model_dir(model_dir);
-    std::string arch = read_arch(dir);
+    std::string arch = read_arch(model_dir);
     if (!arch_supported(arch)) {
         std::fprintf(stderr,
-            "error: model architecture '%s' is not supported.\n"
-            "       FlashQwen only supports dense Qwen3 (Qwen3ForCausalLM). Run --help for details.\n",
-            arch.empty() ? "unknown" : arch.c_str());
+            "error: '%s' has no readable config.json / unsupported architecture '%s'.\n"
+            "       --model must point at a plain dir with config.json + *.safetensors +\n"
+            "       vocab.json + merges.txt; FlashQwen supports dense Qwen3 (Qwen3ForCausalLM).\n",
+            model_dir.c_str(), arch.empty() ? "unknown" : arch.c_str());
         return 1;
     }
 
     Tokenizer tok;
-    tok.load(dir);
+    tok.load(model_dir);
     Model model;
-    model.load(dir, max_ctx);
+    model.load(model_dir, max_ctx);
 
     SampleParams sp{temp, top_p, top_k};
     std::mt19937 rng(seed);

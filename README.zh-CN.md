@@ -11,17 +11,15 @@ English: [README.md](README.md)
 
 ### 获取模型
 
-权重**直接用从 HuggingFace 拉下来的原始文件**,不做任何转换、量化或重打包。用官方工具下载
-Qwen3-8B:
+用 `git clone` 把模型仓库拉到一个目录,然后把 `--model` 指向它:
 
 ```bash
-pip install -U huggingface_hub
-huggingface-cli download Qwen/Qwen3-8B
+git lfs install
+git clone https://huggingface.co/Qwen/Qwen3-8B models/qwen3-8b
 ```
 
-下载后会得到一个 HF hub 缓存目录(默认 `~/.cache/huggingface/hub/models--Qwen--Qwen3-8B`),
-把这个路径传给 `--model` 即可。FlashQwen 直接从里面读取 `config.json`、`*.safetensors`
-分片、`vocab.json` 和 `merges.txt`。
+这个目录需要包含 `config.json`、`*.safetensors` 分片、`model.safetensors.index.json`、
+`vocab.json` 和 `merges.txt`。权重按原样使用(BF16,不转换、不量化)。
 
 ### 编译
 
@@ -35,19 +33,18 @@ Ada)编译;其他显卡用 `-DCMAKE_CUDA_ARCHITECTURES=<arch>` 覆盖(如 Hopper
 
 ### 运行
 
-`--model` 是**必填项**——可以是带 `config.json` 的 HF snapshot 目录,或像
-`.../models--Qwen--Qwen3-8B` 这样的 HF hub 缓存目录。`--help` 会列出支持的模型,并扫描
-本地 hub 缓存看有哪些可用。
+`--model` 是**必填项**,指向模型目录(比如上面建好的 `models/qwen3-8b`;直接传 HF hub
+缓存目录也可以)。`--help` 会列出支持的模型,并扫描本地 hub 缓存看有哪些可用。
 
 ```bash
 # 交互式多轮对话(默认模式),KV cache 跨轮保留
-./build/flashqwen --model /path/to/models--Qwen--Qwen3-8B
+./build/flashqwen --model models/qwen3-8b
 
 # 用 Qwen 推荐的采样参数对话
-./build/flashqwen --model <DIR> --temperature 0.6 --top-p 0.95 --top-k 20
+./build/flashqwen --model models/qwen3-8b --temperature 0.6 --top-p 0.95 --top-k 20
 
 # benchmark(内置的固定输入长度扫描)
-./build/flashqwen benchmark --model <DIR>
+./build/flashqwen benchmark --model models/qwen3-8b
 
 ./build/flashqwen --help
 ```
