@@ -1,0 +1,45 @@
+# FlashQwen optimization study
+
+A replayable, stage-by-stage benchmark of the matmul/decode optimizations. Each stage is a
+**tagged commit** on the `optimization-study` branch, so any state can be checked out, built,
+and re-measured.
+
+**Setup:** RTX 4090 (24 GB) · CUDA 12.8 (native sm_89) · Qwen3-8B, BF16 weights.
+**Benchmark:** single stream (batch 1), greedy, output fixed at 128 tokens, sweep over input
+length, 1 warmup + median of 3 runs. All numbers from `flashqwen benchmark`.
+
+**Reproduce any stage:**
+
+```bash
+git checkout <tag>                 # e.g. bench-0-scalar
+cmake -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build -j8
+./build/flashqwen benchmark --model models/qwen3-8b
+```
+
+(`models/qwen3-8b` = a plain dir from `git clone https://huggingface.co/Qwen/Qwen3-8B`.)
+
+## Summary (TTFT and TPOT in ms; decode in tok/s)
+
+| stage | tag | TTFT@128 | TTFT@1024 | TPOT@128 | TPOT@1024 | decode@16 |
+|---|---|---:|---:|---:|---:|---:|
+| 0. scalar matmul | `bench-0-scalar` | 1531 | 12585 | 22.3 | 40.1 | 49.7 |
+| 1. tensor-core prefill (WMMA) | `bench-1-wmma` | _tbd_ | _tbd_ | _tbd_ | _tbd_ | _tbd_ |
+| 2. BF16 KV cache | `bench-2-bf16kv` | _tbd_ | _tbd_ | _tbd_ | _tbd_ | _tbd_ |
+| 3. faster decode attention | `bench-3-attn` | _tbd_ | _tbd_ | _tbd_ | _tbd_ | _tbd_ |
+| 4. vectorized GEMV decode | `bench-4-gemv` | _tbd_ | _tbd_ | _tbd_ | _tbd_ | _tbd_ |
+
+## Stages
+
+### 0. scalar matmul (baseline) — `bench-0-scalar`
+
+Plain warp-per-output-element matmul (one warp does one dot product) for **both** prefill
+and decode. No tensor cores. This is the "before" state of the tensor-core change.
+
+```
+  input    TTFT      TPOT     decode     output      peak
+  (tok)    (ms)    (ms/tok)  (tok/s)    (tok/s)    (tok/s)
+     16     192.4    20.11      49.7       46.3       53.1
+    128    1531.3    22.30      44.8       29.2       47.5
+    512    6195.1    29.96      33.4       12.8       34.8
+   1024   12584.9    40.09      24.9        7.2       25.7
+```

@@ -1,79 +1,36 @@
 #include "kernels.cuh"
-#include <mma.h>
-using namespace nvcuda;
 
 // ---------------------------------------------------------------------------------------
-// GEMV (decode, M==1): one warp computes one output element (dot product over IN).
-// Memory-bound — reading the BF16 weights dominates, so tensor cores would not help here.
+// matmul (scalar baseline): one warp computes one output element (dot product over IN).
+// grid.x tiles OUT in groups of 8 warps; grid.y = M (tokens). Used for both prefill and
+// decode. No tensor cores. (`x_bf16` scratch is unused in this baseline.)
 // ---------------------------------------------------------------------------------------
-__global__ void gemv_kernel(const float* __restrict__ x, const bf16* __restrict__ W,
-                            float* __restrict__ y, int IN, int OUT) {
+__global__ void matmul_kernel(const float* __restrict__ x, const bf16* __restrict__ W,
+                              float* __restrict__ y, int M, int IN, int OUT) {
     int warp = threadIdx.x >> 5;
     int lane = threadIdx.x & 31;
     int row = blockIdx.x * (blockDim.x >> 5) + warp;   // output feature
+    int m   = blockIdx.y;                              // token
     if (row >= OUT) return;
 
-    const bf16* wr = W + (size_t)row * IN;
+    const float* xr = x + (size_t)m * IN;
+    const bf16*  wr = W + (size_t)row * IN;
     float acc = 0.f;
     for (int i = lane; i < IN; i += 32)
-        acc += x[i] * __bfloat162float(wr[i]);
+        acc += xr[i] * __bfloat162float(wr[i]);
     #pragma unroll
     for (int o = 16; o > 0; o >>= 1)
         acc += __shfl_down_sync(0xffffffff, acc, o);
-    if (lane == 0) y[row] = acc;
-}
-
-// ---------------------------------------------------------------------------------------
-// FP32 -> BF16 convert with zero-padding of the tail rows (so the last WMMA tile is clean).
-// ---------------------------------------------------------------------------------------
-__global__ void f32_to_bf16_kernel(const float* __restrict__ in, bf16* __restrict__ out,
-                                   int valid, int total) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < total) out[i] = __float2bfloat16(i < valid ? in[i] : 0.0f);
-}
-
-// ---------------------------------------------------------------------------------------
-// Tensor-core GEMM (prefill, M>1): y[M,OUT] = x[M,IN] @ W[OUT,IN]^T, BF16 in / FP32 acc.
-// One warp computes a 16x16 output tile; 8 warps per block. W (row-major [OUT,IN]) is fed
-// as the matrix_b operand in col_major with leading dim IN, which is exactly W^T.
-// ---------------------------------------------------------------------------------------
-__global__ void wmma_kernel(const bf16* __restrict__ x, const bf16* __restrict__ W,
-                            float* __restrict__ y, int IN, int OUT) {
-    int warp = threadIdx.x >> 5;
-    int tile_n = blockIdx.x * 8 + warp;        // output-feature tile (16 wide)
-    int tile_m = blockIdx.y;                   // token tile (16 tall)
-    if (tile_n * 16 >= OUT) return;
-
-    wmma::fragment<wmma::matrix_a, 16, 16, 16, __nv_bfloat16, wmma::row_major> a;
-    wmma::fragment<wmma::matrix_b, 16, 16, 16, __nv_bfloat16, wmma::col_major> b;
-    wmma::fragment<wmma::accumulator, 16, 16, 16, float> c;
-    wmma::fill_fragment(c, 0.0f);
-
-    int m0 = tile_m * 16, n0 = tile_n * 16;
-    for (int k0 = 0; k0 < IN; k0 += 16) {
-        wmma::load_matrix_sync(a, x + (size_t)m0 * IN + k0, IN);
-        wmma::load_matrix_sync(b, W + (size_t)n0 * IN + k0, IN);   // col_major load == W^T
-        wmma::mma_sync(c, a, b, c);
-    }
-    wmma::store_matrix_sync(y + (size_t)m0 * OUT + n0, c, OUT, wmma::mem_row_major);
+    if (lane == 0) y[(size_t)m * OUT + row] = acc;
 }
 
 void launch_matmul(const float* x, const bf16* W, float* y, int M, int IN, int OUT,
                    bf16* x_bf16, cudaStream_t s) {
-    if (M <= 1) {                              // decode: memory-bound GEMV
-        const int warps = 8;
-        gemv_kernel<<<(OUT + warps - 1) / warps, warps * 32, 0, s>>>(x, W, y, IN, OUT);
-        return;
-    }
-    // prefill: convert activations to BF16 (zero-padding tail rows to a 16-row multiple),
-    // then run the tensor-core GEMM.
-    int Mp = ((M + 15) / 16) * 16;
-    int total = Mp * IN, valid = M * IN, blk = 256;
-    f32_to_bf16_kernel<<<(total + blk - 1) / blk, blk, 0, s>>>(x, x_bf16, valid, total);
-
-    dim3 block(256);                           // 8 warps
-    dim3 grid((OUT / 16 + 7) / 8, Mp / 16);
-    wmma_kernel<<<grid, block, 0, s>>>(x_bf16, W, y, IN, OUT);
+    (void)x_bf16;
+    const int warps = 8;
+    dim3 block(warps * 32);
+    dim3 grid((OUT + warps - 1) / warps, M);
+    matmul_kernel<<<grid, block, 0, s>>>(x, W, y, M, IN, OUT);
 }
 
 // ---------------------------------------------------------------------------------------
