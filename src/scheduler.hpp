@@ -7,11 +7,14 @@
 // batching, where a whole batch is held until its longest sequence finishes.
 #pragma once
 #include "model.hpp"
+#include "sampler.hpp"
 #include <vector>
+#include <random>
 
 struct Request {
     std::vector<int> prompt;        // input: prompt token ids
     int max_new = 0;                // input: number of tokens to generate
+    SampleParams sp{0.0f, 1.0f, 0}; // input: per-request sampling (temp<=0 => greedy)
     std::vector<int> output;        // result: generated token ids
 
     // scheduler-internal state
@@ -20,6 +23,8 @@ struct Request {
     int  cur  = 0;                  // token to feed on the next decode step
 };
 
-// Serve all requests to completion (greedy) using up to n_slots concurrent sequences, admitting
-// waiting requests as slots free up. If stop_on_eos, a sequence also ends on an EOS token.
-void run_continuous(Model& model, std::vector<Request>& reqs, int n_slots, bool stop_on_eos);
+// Serve all requests to completion using up to n_slots concurrent sequences, admitting waiting
+// requests as slots free up. Each request samples with its own SampleParams (greedy when
+// temp<=0). If stop_on_eos, a sequence also ends on an EOS token.
+void run_continuous(Model& model, std::vector<Request>& reqs, int n_slots, bool stop_on_eos,
+                    std::mt19937& rng);

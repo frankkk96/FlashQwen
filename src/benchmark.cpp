@@ -159,7 +159,7 @@ static void continuous_sweep(Model& model, int max_ctx, int vocab) {
     auto time_slots = [&](int ns) {
         std::vector<Request> w = base;                       // fresh copy (base.output stays empty)
         auto t0 = Clock::now();
-        run_continuous(model, w, ns, /*stop_on_eos=*/false);
+        run_continuous(model, w, ns, /*stop_on_eos=*/false, rng);
         return ms_since(t0);
     };
 

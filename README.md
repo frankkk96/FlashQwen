@@ -270,8 +270,8 @@ at `max_ctx=2048` on a 24 GB 4090. The decode path is rewritten to run a batch i
 - a **templated INT8 GEMV** where each warp reads a weight row once and computes all `B` dot
   products (`B` is compile-time so the accumulators stay in registers),
 - per-slot `store_kv`, split-K decode attention with a batch dimension and per-sequence slot /
-  `past_len`, and a batched argmax; `lm_head` runs in ≤4-sequence chunks to bound the
-  `[B, vocab]` logits buffer.
+  `past_len`, and a batched argmax; `lm_head` is a single batched GEMV into `[B, vocab]` logits
+  (~0.6 MB/sequence), then a batched argmax for greedy or a per-sequence host sample.
 
 Prefill stays single-sequence (it writes into a sequence's slot; prefill batching is a later
 stage). The CUDA graph is dropped — batch shapes vary — so chat now runs as `B=1` through the
@@ -293,8 +293,7 @@ GEMV computes one output row per warp and re-reads all `B` activation vectors fo
 so activation traffic scales as `B × params` (~400 GB of L2 reads at B=16) — which is why the
 step time grows ~linearly with `B`. The fix is activation *reuse* (shared-memory / tiled GEMV),
 not tensor cores: a tried dequant→BF16 WMMA path was **slower** because the per-step INT8→BF16
-weight dequant write (~14 GB, batch-independent) dominated. Left as future work. (`lm_head` is
-fused with its argmax so its weight is read once per step.)
+weight dequant write (~14 GB, batch-independent) dominated. Left as future work.
 
 **Stage B — continuous batching.** There is only one execution primitive — the batched
 `decode`, which takes an arbitrary running set (per-sequence KV slot + `past_len`). So "static"
@@ -303,8 +302,10 @@ batching holds a fixed group's slots until its *slowest* sequence finishes, leav
 requests idle behind long ones (head-of-line blocking). Continuous batching (`src/scheduler.*`)
 instead keeps `n_slots` busy: admit a waiting request the instant a slot frees, and decode the
 whole running set each step. On a varied-length workload it measured ~1.4× faster than the
-static baseline, so continuous batching is the only serving path kept. Admission still prefills
-one sequence at a time (interleaved chunked prefill is deferred).
+static baseline, so continuous batching is the only serving path kept. Each request carries its
+own sampling params (temperature / top-k / top-p, or greedy); an all-greedy batch takes the GPU
+argmax, while any batch with a sampling request copies the `[B, vocab]` logits back and samples
+per row. Admission still prefills one sequence at a time (interleaved chunked prefill is deferred).
 
 Continuous-batching throughput on 32 requests (input 128, output 16–128 random), varying the
 number of KV slots — `slots=1` is sequential serving (one request at a time):

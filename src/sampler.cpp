@@ -2,16 +2,19 @@
 #include <algorithm>
 #include <cmath>
 
-static int argmax(const std::vector<float>& v) {
+static int argmax(const float* v, int V) {
     int best = 0; float bv = v[0];
-    for (int i = 1; i < (int)v.size(); ++i) if (v[i] > bv) { bv = v[i]; best = i; }
+    for (int i = 1; i < V; ++i) if (v[i] > bv) { bv = v[i]; best = i; }
     return best;
 }
 
 int sample(const std::vector<float>& logits, const SampleParams& sp, std::mt19937& rng) {
-    if (sp.temp <= 0.0f) return argmax(logits);
+    return sample(logits.data(), (int)logits.size(), sp, rng);
+}
 
-    int V = (int)logits.size();
+int sample(const float* logits, int V, const SampleParams& sp, std::mt19937& rng) {
+    if (sp.temp <= 0.0f) return argmax(logits, V);
+
     std::vector<int> idx(V);
     for (int i = 0; i < V; ++i) idx[i] = i;
 

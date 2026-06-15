@@ -120,7 +120,7 @@ void Model::load(const std::string& dir, int max_ctx, float gpu_mem_fraction) {
     fmalloc(&gate_, (size_t)max_ctx_ * I);
     fmalloc(&up_,   (size_t)max_ctx_ * I);
     fmalloc(&hmlp_, (size_t)max_ctx_ * I);
-    fmalloc(&logits_, (size_t)LM_CHUNK * V);   // lm_head runs <= LM_CHUNK sequences at a time
+    fmalloc(&logits_, (size_t)MAX_DECODE_B * V);   // [B, vocab] logits for the whole decode batch
     // BF16 activation scratch for the tensor-core prefill GEMM (largest IN is `I`).
     CUDA_CHECK(cudaMalloc(&xbf_, (size_t)max_ctx_ * I * sizeof(bf16)));
     // BF16 dequantized-weight scratch for prefill (largest matmul weight is I*H).
@@ -134,10 +134,8 @@ void Model::load(const std::string& dir, int max_ctx, float gpu_mem_fraction) {
     CUDA_CHECK(cudaMalloc(&part_m_,   (size_t)MAX_DECODE_B * nh * ATTN_SPLITS * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&part_l_,   (size_t)MAX_DECODE_B * nh * ATTN_SPLITS * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&part_acc_, (size_t)MAX_DECODE_B * nh * ATTN_SPLITS * hd * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&lm_part_val_, (size_t)MAX_DECODE_B * LM_ARGMAX_BLOCKS * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&lm_part_idx_, (size_t)MAX_DECODE_B * LM_ARGMAX_BLOCKS * sizeof(int)));
     CUDA_CHECK(cudaStreamCreate(&stream_));
-    host_logits_.resize(V);
+    host_logits_.resize((size_t)MAX_DECODE_B * V);
 
     // Everything except the KV pool is now allocated. Give the pool whatever VRAM is left under
     // the gpu_mem_fraction cap; that fixes how many sequence slots we can serve.
@@ -272,8 +270,11 @@ void Model::run_layers_decode(int B) {
     }
 }
 
-void Model::decode(const std::vector<int>& in_tokens, const std::vector<int>& past_len,
-                   const std::vector<int>& slots, std::vector<int>& out_tokens) {
+// Shared forward for a decode batch: H2D inputs, the layer stack, final norm, and the lm_head
+// GEMV — one pass reads the lm_head weight once for the whole batch and leaves the [B, vocab]
+// logits in logits_ on the device. Async on stream_ (caller syncs).
+void Model::decode_forward(const std::vector<int>& in_tokens, const std::vector<int>& past_len,
+                           const std::vector<int>& slots) {
     int B = (int)in_tokens.size();
     int V = cfg_.vocab_size, H = cfg_.hidden_size;
     CUDA_CHECK(cudaMemcpy(d_ids_,  in_tokens.data(), B * sizeof(int), cudaMemcpyHostToDevice));
@@ -281,23 +282,29 @@ void Model::decode(const std::vector<int>& in_tokens, const std::vector<int>& pa
     CUDA_CHECK(cudaMemcpy(d_slot_, slots.data(),     B * sizeof(int), cudaMemcpyHostToDevice));
 
     run_layers_decode(B);
-    launch_rmsnorm(x_, fnorm_, xb_, B, H, cfg_.rms_eps, stream_);   // final norm, all B rows
+    launch_rmsnorm(x_, fnorm_, xb_, B, H, cfg_.rms_eps, stream_);          // final norm, all B rows
+    launch_matmul_decode(xb_, lm_head_.w, lm_head_.scale, logits_, B, H, V, stream_);
+}
 
+void Model::decode(const std::vector<int>& in_tokens, const std::vector<int>& past_len,
+                   const std::vector<int>& slots, std::vector<int>& out_tokens) {
+    int B = (int)in_tokens.size();
+    decode_forward(in_tokens, past_len, slots);
+    launch_argmax_batch(logits_, B, cfg_.vocab_size, d_arg_, stream_);     // greedy, on the GPU
     out_tokens.resize(B);
-    if (B <= LM_CHUNK) {
-        // Small batch (incl. chat B=1): one lm_head GEMV materializes the [B, vocab] logits, so
-        // copy_logits()/sampling still work. B <= LM_CHUNK reads the weight just once.
-        launch_matmul_decode(xb_, lm_head_.w, lm_head_.scale, logits_, B, H, V, stream_);
-        launch_argmax_batch(logits_, B, V, d_arg_, stream_);
-    } else {
-        // Large batch: fused lm_head + argmax reads the weight once for the whole batch and
-        // never materializes [B, vocab] logits (greedy only).
-        launch_lm_head_argmax(xb_, lm_head_.w, lm_head_.scale, B, H, V,
-                              lm_part_val_, lm_part_idx_, d_arg_, stream_);
-    }
     CUDA_CHECK(cudaMemcpyAsync(out_tokens.data(), d_arg_, B * sizeof(int),
                                cudaMemcpyDeviceToHost, stream_));
     CUDA_CHECK(cudaStreamSynchronize(stream_));
+}
+
+const float* Model::decode_logits_host(const std::vector<int>& in_tokens,
+                                       const std::vector<int>& past_len, const std::vector<int>& slots) {
+    int B = (int)in_tokens.size();
+    decode_forward(in_tokens, past_len, slots);
+    CUDA_CHECK(cudaMemcpyAsync(host_logits_.data(), logits_, (size_t)B * cfg_.vocab_size * sizeof(float),
+                               cudaMemcpyDeviceToHost, stream_));
+    CUDA_CHECK(cudaStreamSynchronize(stream_));
+    return host_logits_.data();
 }
 
 int Model::argmax_last() {
@@ -322,7 +329,6 @@ Model::~Model() {
     cudaFree(x_); cudaFree(xb_); cudaFree(xb2_); cudaFree(q_); cudaFree(k_); cudaFree(v_);
     cudaFree(attn_); cudaFree(gate_); cudaFree(up_); cudaFree(hmlp_); cudaFree(logits_);
     cudaFree(xbf_); cudaFree(w_dq_); cudaFree(part_m_); cudaFree(part_l_); cudaFree(part_acc_);
-    cudaFree(lm_part_val_); cudaFree(lm_part_idx_);
     cudaFree(d_ids_); cudaFree(d_pos_); cudaFree(d_arg_); cudaFree(d_past_); cudaFree(d_slot_);
     if (stream_) cudaStreamDestroy(stream_);
 }

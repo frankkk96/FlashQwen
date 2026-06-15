@@ -9,5 +9,8 @@ struct SampleParams {
     int   top_k;
 };
 
-// Pick the next token id from a logits vector.
+// Pick the next token id from a logits row (pointer + length, e.g. one row of a [B,vocab] buffer).
+int sample(const float* logits, int V, const SampleParams& sp, std::mt19937& rng);
+
+// Convenience overload for a whole-vector logits row.
 int sample(const std::vector<float>& logits, const SampleParams& sp, std::mt19937& rng);

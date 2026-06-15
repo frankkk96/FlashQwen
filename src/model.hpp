@@ -25,10 +25,14 @@ public:
 
     // --- batched decode ------------------------------------------------------------------
     // One token per sequence for B sequences: sequence b feeds in_tokens[b], lives in slot
-    // slots[b] with past_len[b] tokens already cached. Returns the greedy next token for each
-    // sequence in out_tokens. For B==1 the row-0 logits are also left for optional sampling.
+    // slots[b] with past_len[b] tokens already cached. decode() returns the greedy next token
+    // per sequence (argmax on the GPU). decode_logits_host() instead runs the same forward and
+    // copies the full [B, vocab] logits to the host (row-major) for per-sequence sampling; the
+    // returned pointer is valid until the next decode/prefill call.
     void decode(const std::vector<int>& in_tokens, const std::vector<int>& past_len,
                 const std::vector<int>& slots, std::vector<int>& out_tokens);
+    const float* decode_logits_host(const std::vector<int>& in_tokens, const std::vector<int>& past_len,
+                                    const std::vector<int>& slots);
 
     const ModelConfig& config() const { return cfg_; }
     int max_ctx() const { return max_ctx_; }
@@ -36,9 +40,6 @@ public:
     int max_batch() const { return b_max_ < MAX_DECODE_B ? b_max_ : MAX_DECODE_B; }
 
 private:
-    static const int LM_CHUNK = 4;   // lm_head is run for at most this many sequences at a time
-                                     // (bounds the [chunk, vocab] logits buffer)
-
     struct QWeight { int8_t* w = nullptr; float* scale = nullptr; };  // INT8 + per-row scale
     struct Layer {
         QWeight q_proj, k_proj, v_proj, o_proj, gate, up, down;
@@ -51,6 +52,8 @@ private:
 
     void run_layers_prefill(int M, int slot);        // single-seq prefill into a KV slot
     void run_layers_decode(int B);                   // batched single-token decode
+    void decode_forward(const std::vector<int>& in_tokens, const std::vector<int>& past_len,
+                        const std::vector<int>& slots);   // -> logits_ [B, vocab] on device
 
     ModelConfig cfg_;
     SafeTensors st_;
@@ -70,8 +73,6 @@ private:
     bf16  *xbf_ = nullptr;   // BF16 activation scratch for tensor-core prefill matmul
     bf16  *w_dq_ = nullptr;  // BF16 dequantized-weight scratch for prefill matmul
     float *part_m_, *part_l_, *part_acc_;   // flash-decoding split-K scratch (x MAX_DECODE_B)
-    float *lm_part_val_ = nullptr;          // fused lm_head+argmax partials [MAX_DECODE_B, blocks]
-    int   *lm_part_idx_ = nullptr;
     int   *d_ids_, *d_pos_, *d_arg_, *d_past_, *d_slot_;
     std::vector<float> host_logits_;
 
