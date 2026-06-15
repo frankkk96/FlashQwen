@@ -138,14 +138,13 @@ static void batch_sweep(Model& model, int max_ctx, int vocab, std::mt19937& rng)
     }
 }
 
-// Section 3: continuous vs static batching on a workload with VARIED output lengths — the case
-// continuous batching is built for. Same total work both ways; continuous wins by reusing a
-// slot the moment a sequence finishes instead of holding the whole group for its slowest member.
+// Section 3: continuous-batching throughput on a workload with VARIED output lengths. Slots=1
+// is sequential serving (one request at a time); more slots let the scheduler keep the GPU busy
+// by admitting a new request the instant one finishes, so aggregate throughput climbs.
 static void continuous_sweep(Model& model, int max_ctx, int vocab) {
-    const int R = 48, INPUT = 128, LEN_MIN = 16, LEN_MAX = 128;
-    int B = std::min(16, model.max_batch());
+    const int R = 32, INPUT = 128, LEN_MIN = 16, LEN_MAX = 128;
     if (INPUT + LEN_MAX >= max_ctx) {
-        std::fprintf(stderr, "\n[3] continuous vs static batching (skipped: input+output exceeds max-ctx)\n");
+        std::fprintf(stderr, "\n[3] continuous batching (skipped: input+output exceeds max-ctx)\n");
         return;
     }
 
@@ -157,23 +156,21 @@ static void continuous_sweep(Model& model, int max_ctx, int vocab) {
     long total_tok = 0;
     for (auto& r : base) { r.prompt = make_prompt(INPUT, vocab, rng); r.max_new = len(rng); total_tok += r.max_new; }
 
-    auto time_run = [&](bool continuous) {
+    auto time_slots = [&](int ns) {
         std::vector<Request> w = base;                       // fresh copy (base.output stays empty)
         auto t0 = Clock::now();
-        if (continuous) run_continuous(model, w, B, /*stop_on_eos=*/false);
-        else            run_static(model, w, B, /*stop_on_eos=*/false);
+        run_continuous(model, w, ns, /*stop_on_eos=*/false);
         return ms_since(t0);
     };
 
-    time_run(true);                                          // warmup
-    double st = time_run(false), co = time_run(true);
-
-    std::fprintf(stderr, "\n[3] continuous vs static batching (%d requests, input %d, output %d-%d "
-                 "random, %d slots)\n\n", R, INPUT, LEN_MIN, LEN_MAX, B);
-    std::fprintf(stderr, "  method         wall (s)   aggregate tok/s\n");
-    std::fprintf(stderr, "  static         %7.2f      %9.1f\n", st / 1000.0, total_tok / (st / 1000.0));
-    std::fprintf(stderr, "  continuous     %7.2f      %9.1f\n", co / 1000.0, total_tok / (co / 1000.0));
-    std::fprintf(stderr, "  speedup: %.2fx\n", st / co);
+    std::fprintf(stderr, "\n[3] continuous-batching throughput (%d requests, input %d, output %d-%d "
+                 "random)\n\n", R, INPUT, LEN_MIN, LEN_MAX);
+    std::fprintf(stderr, "  slots    wall (s)   aggregate tok/s\n");
+    for (int ns : {1, 8, 16}) {
+        if (ns > model.max_batch()) continue;
+        double ms = time_slots(ns);
+        std::fprintf(stderr, "  %5d   %7.2f      %9.1f\n", ns, ms / 1000.0, total_tok / (ms / 1000.0));
+    }
 }
 
 int run_benchmark(Model& model, const Tokenizer& tok, int max_ctx) {

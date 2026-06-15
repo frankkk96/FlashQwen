@@ -290,20 +290,24 @@ sublinear for now: `lm_head` is read once per 4-sequence chunk (≈`B/4`× its w
 and the batched GEMV loses efficiency at high `B`. A fused batched `lm_head`-argmax and a
 better GEMV tiling are the next throughput items, alongside stage C.
 
-**Stage B — continuous batching.** Static batching processes a fixed group and holds all its
-slots until the group's *slowest* sequence finishes — short requests sit idle behind long ones
-(head-of-line blocking). Because the decode kernels already take an arbitrary running set
-(per-sequence slot + `past_len`), continuous batching is a host-side scheduler (`src/scheduler.*`):
-keep `n_slots` busy, admit a waiting request the instant a slot frees, and decode the whole
-running set each step. On a workload of 48 requests whose output lengths are spread over 16–128
-tokens (16 slots), it is **~1.4× faster than static** (aggregate **151 → 209 tok/s**); the gap
-widens with more length variance. Admission still prefills one sequence at a time (interleaved
-chunked prefill is deferred to a later stage).
+**Stage B — continuous batching.** There is only one execution primitive — the batched
+`decode`, which takes an arbitrary running set (per-sequence KV slot + `past_len`). So "static"
+vs "continuous" is a host-side *scheduling policy*, not a separate engine mode. Naive (static)
+batching holds a fixed group's slots until its *slowest* sequence finishes, leaving short
+requests idle behind long ones (head-of-line blocking). Continuous batching (`src/scheduler.*`)
+instead keeps `n_slots` busy: admit a waiting request the instant a slot frees, and decode the
+whole running set each step. On a varied-length workload it measured ~1.4× faster than the
+static baseline, so continuous batching is the only serving path kept. Admission still prefills
+one sequence at a time (interleaved chunked prefill is deferred).
 
-| 48 reqs, input 128, output 16–128, 16 slots | wall | aggregate tok/s |
-|---|---:|---:|
-| static batching | 21.5 s | 151 |
-| continuous batching | 15.6 s | **209** |
+Continuous-batching throughput on 32 requests (input 128, output 16–128 random), varying the
+number of KV slots — `slots=1` is sequential serving (one request at a time):
+
+| slots | wall | aggregate tok/s |
+|---:|---:|---:|
+| 1  | 22.4 s | 86  |
+| 8  | 10.3 s | 187 |
+| 16 |  9.8 s | **197** |
 
 `feature/batching` is managed as a branch (no per-stage tags). To try it:
 

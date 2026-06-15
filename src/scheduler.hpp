@@ -23,7 +23,3 @@ struct Request {
 // Serve all requests to completion (greedy) using up to n_slots concurrent sequences, admitting
 // waiting requests as slots free up. If stop_on_eos, a sequence also ends on an EOS token.
 void run_continuous(Model& model, std::vector<Request>& reqs, int n_slots, bool stop_on_eos);
-
-// Static-batching baseline for comparison: process requests in fixed groups of `batch`; the
-// group's slots are not reused until every sequence in it has finished (head-of-line blocking).
-void run_static(Model& model, std::vector<Request>& reqs, int batch, bool stop_on_eos);

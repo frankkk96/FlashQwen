@@ -52,38 +52,3 @@ void run_continuous(Model& model, std::vector<Request>& reqs, int n_slots, bool 
         running.swap(still);
     }
 }
-
-void run_static(Model& model, std::vector<Request>& reqs, int batch, bool stop_on_eos) {
-    batch = std::min(batch, model.max_batch());
-
-    for (int start = 0; start < (int)reqs.size(); start += batch) {
-        int B = std::min(batch, (int)reqs.size() - start);
-        std::vector<int> in_tok(B), past(B), slots(B), out;
-        std::vector<char> done(B, 0);
-
-        for (int b = 0; b < B; ++b) {
-            Request& r = reqs[start + b];
-            model.prefill(r.prompt, b, 0);
-            r.cur = model.argmax_last(); r.past = (int)r.prompt.size(); r.slot = b;
-            r.output.push_back(r.cur);
-            in_tok[b] = r.cur; past[b] = r.past; slots[b] = b;
-            done[b] = finished(r, stop_on_eos);
-        }
-
-        // The group keeps its full width B until every sequence in it has finished — sequences
-        // that finish early still occupy a slot (head-of-line blocking). Slots are only reused
-        // for the next group.
-        auto any_active = [&]() { for (char d : done) if (!d) return true; return false; };
-        while (any_active()) {
-            model.decode(in_tok, past, slots, out);
-            for (int b = 0; b < B; ++b) {
-                Request& r = reqs[start + b];
-                in_tok[b] = out[b]; past[b] += 1;
-                if (!done[b]) {
-                    r.cur = out[b]; r.output.push_back(r.cur);
-                    done[b] = finished(r, stop_on_eos);
-                }
-            }
-        }
-    }
-}
