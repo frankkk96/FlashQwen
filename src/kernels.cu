@@ -227,22 +227,47 @@ void launch_rope(float* x, const int* pos, int M, int n_heads, int head_dim, flo
 }
 
 // ---------------------------------------------------------------------------------------
-// attention with online softmax — one WARP per (head, query token). Each lane owns
-// head_dim/32 dims; the per-key q.k dot product is a warp-shuffle reduction (no
-// __syncthreads, so no serialized per-key barrier). This keeps the per-key cost tiny, so
-// TPOT no longer balloons as the KV cache grows. blockDim = 32, head_dim a multiple of 32.
+// Paged KV cache: a layer's pool is [num_blocks, BLOCK, kv_dim]; a sequence's KV is a list of
+// block ids (its block table). Logical position p -> physical row bt[p/BLOCK]*BLOCK + p%BLOCK,
+// addressed as cache + row*kv_dim. The math below is identical to the contiguous version; only
+// the per-token / per-key row lookup now goes through the block table.
 // ---------------------------------------------------------------------------------------
-__global__ void attention_kernel(const float* __restrict__ q, const bf16* __restrict__ cache_k,
-                                 const bf16* __restrict__ cache_v, float* __restrict__ out,
-                                 int M, int n_heads, int n_kv, int head_dim,
-                                 const int* __restrict__ d_past, float scale) {
-    // DPL = head_dim/32, fixed at compile time (Qwen3 head_dim is 128) so qreg/acc stay in
-    // registers instead of spilling to local memory.
+
+// Store M new K (or V) rows into the paged pool. Token m -> block-table row bt_row[m], logical
+// position pos[m].
+__global__ void store_kv_paged_kernel(const float* __restrict__ src, bf16* __restrict__ cache,
+                                      const int* __restrict__ bt, int max_blocks, int block_size,
+                                      int kv_dim, const int* __restrict__ bt_row,
+                                      const int* __restrict__ pos, int M) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= M * kv_dim) return;
+    int m = idx / kv_dim, i = idx % kv_dim;
+    int p = pos[m], g = p / block_size, off = p - g * block_size;
+    size_t phys = (size_t)bt[(size_t)bt_row[m] * max_blocks + g] * block_size + off;
+    cache[phys * kv_dim + i] = __float2bfloat16(src[idx]);
+}
+
+void launch_store_kv_paged(const float* src, bf16* cache, const int* bt, int max_blocks,
+                           int block_size, int kv_dim, const int* bt_row, const int* pos,
+                           int M, cudaStream_t s) {
+    int n = M * kv_dim, blk = 256;
+    store_kv_paged_kernel<<<(n + blk - 1) / blk, blk, 0, s>>>(
+        src, cache, bt, max_blocks, block_size, kv_dim, bt_row, pos, M);
+}
+
+// Prefill attention — one WARP per (head, query token), online softmax over the paged KV. Each
+// lane owns head_dim/32 dims; the per-key q.k dot is a warp-shuffle reduction (no __syncthreads).
+__global__ void attention_paged_kernel(const float* __restrict__ q, const bf16* __restrict__ cache_k,
+                                       const bf16* __restrict__ cache_v, float* __restrict__ out,
+                                       int M, int n_heads, int n_kv, int head_dim,
+                                       const int* __restrict__ d_past, float scale,
+                                       const int* __restrict__ bt, int max_blocks, int block_size) {
     constexpr int DPL = 4;
     int h = blockIdx.x;              // query head
     int m = blockIdx.y;              // query token
     int lane = threadIdx.x;          // 0..31
     int kvh = h / (n_heads / n_kv);
+    int kv_dim = n_kv * head_dim;
     int qpos = *d_past + m;          // attend keys [0, qpos]
 
     const float* qv = q + ((size_t)m * n_heads + h) * head_dim;
@@ -252,7 +277,9 @@ __global__ void attention_kernel(const float* __restrict__ q, const bf16* __rest
     float m_run = -1e30f, l_run = 0.f;
 
     for (int j = 0; j <= qpos; ++j) {
-        const bf16* kj = cache_k + ((size_t)j * n_kv + kvh) * head_dim;
+        int g = j / block_size, off = j - g * block_size;
+        size_t phys = (size_t)bt[g] * block_size + off;          // block table row 0
+        const bf16* kj = cache_k + phys * kv_dim + kvh * head_dim;
         float partial = 0.f;
         #pragma unroll
         for (int i = 0; i < DPL; ++i) partial += qreg[i] * __bfloat162float(kj[lane + (i << 5)]);
@@ -264,7 +291,7 @@ __global__ void attention_kernel(const float* __restrict__ q, const bf16* __rest
         float corr  = __expf(m_run - m_new);
         float p     = __expf(score - m_new);
         l_run = l_run * corr + p;
-        const bf16* vj = cache_v + ((size_t)j * n_kv + kvh) * head_dim;
+        const bf16* vj = cache_v + phys * kv_dim + kvh * head_dim;
         #pragma unroll
         for (int i = 0; i < DPL; ++i) acc[i] = acc[i] * corr + p * __bfloat162float(vj[lane + (i << 5)]);
         m_run = m_new;
@@ -275,139 +302,30 @@ __global__ void attention_kernel(const float* __restrict__ q, const bf16* __rest
     for (int i = 0; i < DPL; ++i) o[lane + (i << 5)] = acc[i] * inv;
 }
 
-void launch_attention(const float* q, const bf16* cache_k, const bf16* cache_v,
-                      float* out, int M, int n_heads, int n_kv, int head_dim,
-                      const int* d_past, float scale, cudaStream_t s) {
-    dim3 grid(n_heads, M);
-    attention_kernel<<<grid, 32, 0, s>>>(
-        q, cache_k, cache_v, out, M, n_heads, n_kv, head_dim, d_past, scale);
+void launch_attention_paged(const float* q, const bf16* cache_k, const bf16* cache_v, float* out,
+                            int M, int n_heads, int n_kv, int head_dim, const int* d_past,
+                            float scale, const int* bt, int max_blocks, int block_size,
+                            cudaStream_t s) {
+    attention_paged_kernel<<<dim3(n_heads, M), 32, 0, s>>>(
+        q, cache_k, cache_v, out, M, n_heads, n_kv, head_dim, d_past, scale, bt, max_blocks, block_size);
 }
 
-// Append K/V rows to the BF16 cache at device-resident offset *d_past (FP32 -> BF16).
-__global__ void store_kv_kernel(const float* __restrict__ src, bf16* __restrict__ cache,
-                                const int* __restrict__ d_past, int kv_dim, int M) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= M * kv_dim) return;
-    int m = idx / kv_dim, i = idx % kv_dim;
-    cache[((size_t)(*d_past + m)) * kv_dim + i] = __float2bfloat16(src[idx]);
-}
-
-void launch_store_kv(const float* src, bf16* cache, const int* d_past, int kv_dim, int M, cudaStream_t s) {
-    int n = M * kv_dim, blk = 256;
-    store_kv_kernel<<<(n + blk - 1) / blk, blk, 0, s>>>(src, cache, d_past, kv_dim, M);
-}
-
-// Batched store into the [B_max, max_ctx, kv_dim] pool: token m -> slot[m], row rowpos[m].
-__global__ void store_kv_batch_kernel(const float* __restrict__ src, bf16* __restrict__ cache,
-                                      const int* __restrict__ slot, const int* __restrict__ rowpos,
-                                      int kv_dim, int max_ctx, int M) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= M * kv_dim) return;
-    int m = idx / kv_dim, i = idx % kv_dim;
-    size_t row = (size_t)slot[m] * max_ctx + rowpos[m];
-    cache[row * kv_dim + i] = __float2bfloat16(src[idx]);
-}
-
-void launch_store_kv_batch(const float* src, bf16* cache, const int* slot, const int* rowpos,
-                           int kv_dim, int max_ctx, int M, cudaStream_t s) {
-    int n = M * kv_dim, blk = 256;
-    store_kv_batch_kernel<<<(n + blk - 1) / blk, blk, 0, s>>>(src, cache, slot, rowpos, kv_dim, max_ctx, M);
-}
-
-// Flash-decoding phase 1: warp (h, split) does a partial online-softmax over its key chunk.
-// Stores UN-normalized acc plus (m, l) so the combine pass can merge chunks.
-__global__ void attn_decode_split_kernel(const float* __restrict__ q, const bf16* __restrict__ cache_k,
-                                         const bf16* __restrict__ cache_v, float* __restrict__ part_m,
-                                         float* __restrict__ part_l, float* __restrict__ part_acc,
-                                         int n_heads, int n_kv, int head_dim, const int* __restrict__ d_past,
-                                         float scale) {
-    constexpr int DPL = 4;
-    int h = blockIdx.x, sp = blockIdx.y, lane = threadIdx.x;
-    int kvh = h / (n_heads / n_kv);
-    int L = *d_past + 1;                          // keys [0, *d_past]
-    int per = (L + ATTN_SPLITS - 1) / ATTN_SPLITS;
-    int kb = sp * per, ke = min(kb + per, L);
-
-    const float* qv = q + (size_t)h * head_dim;   // M=1
-    float qreg[DPL], acc[DPL];
-    #pragma unroll
-    for (int i = 0; i < DPL; ++i) { qreg[i] = qv[lane + (i << 5)]; acc[i] = 0.f; }
-    float m_run = -1e30f, l_run = 0.f;
-
-    for (int j = kb; j < ke; ++j) {
-        const bf16* kj = cache_k + ((size_t)j * n_kv + kvh) * head_dim;
-        float p = 0.f;
-        #pragma unroll
-        for (int i = 0; i < DPL; ++i) p += qreg[i] * __bfloat162float(kj[lane + (i << 5)]);
-        #pragma unroll
-        for (int o = 16; o > 0; o >>= 1) p += __shfl_xor_sync(0xffffffff, p, o);
-        float score = p * scale;
-        float m_new = fmaxf(m_run, score);
-        float corr = __expf(m_run - m_new), pp = __expf(score - m_new);
-        l_run = l_run * corr + pp;
-        const bf16* vj = cache_v + ((size_t)j * n_kv + kvh) * head_dim;
-        #pragma unroll
-        for (int i = 0; i < DPL; ++i) acc[i] = acc[i] * corr + pp * __bfloat162float(vj[lane + (i << 5)]);
-        m_run = m_new;
-    }
-    int slot = h * ATTN_SPLITS + sp;
-    if (lane == 0) { part_m[slot] = m_run; part_l[slot] = l_run; }
-    #pragma unroll
-    for (int i = 0; i < DPL; ++i) part_acc[(size_t)slot * head_dim + lane + (i << 5)] = acc[i];
-}
-
-// Flash-decoding phase 2: one warp per head merges the ATTN_SPLITS partials.
-__global__ void attn_decode_combine_kernel(const float* __restrict__ part_m, const float* __restrict__ part_l,
-                                           const float* __restrict__ part_acc, float* __restrict__ out,
-                                           int head_dim) {
-    constexpr int DPL = 4;
-    int h = blockIdx.x, lane = threadIdx.x;
-    float gm = -1e30f;
-    #pragma unroll
-    for (int sp = 0; sp < ATTN_SPLITS; ++sp) gm = fmaxf(gm, part_m[h * ATTN_SPLITS + sp]);
-    float gl = 0.f, gacc[DPL];
-    #pragma unroll
-    for (int i = 0; i < DPL; ++i) gacc[i] = 0.f;
-    #pragma unroll
-    for (int sp = 0; sp < ATTN_SPLITS; ++sp) {
-        int slot = h * ATTN_SPLITS + sp;
-        float w = __expf(part_m[slot] - gm);
-        gl += part_l[slot] * w;
-        #pragma unroll
-        for (int i = 0; i < DPL; ++i) gacc[i] += part_acc[(size_t)slot * head_dim + lane + (i << 5)] * w;
-    }
-    float inv = 1.0f / gl;
-    float* o = out + (size_t)h * head_dim;
-    #pragma unroll
-    for (int i = 0; i < DPL; ++i) o[lane + (i << 5)] = gacc[i] * inv;
-}
-
-void launch_attention_decode(const float* q, const bf16* cache_k, const bf16* cache_v,
-                             float* out, int n_heads, int n_kv, int head_dim, const int* d_past,
-                             float scale, float* part_m, float* part_l, float* part_acc,
-                             cudaStream_t s) {
-    attn_decode_split_kernel<<<dim3(n_heads, ATTN_SPLITS), 32, 0, s>>>(
-        q, cache_k, cache_v, part_m, part_l, part_acc, n_heads, n_kv, head_dim, d_past, scale);
-    attn_decode_combine_kernel<<<n_heads, 32, 0, s>>>(part_m, part_l, part_acc, out, head_dim);
-}
-
-// Batched flash-decoding phase 1: block (h, split, b) does a partial online-softmax over its
-// key chunk of sequence b (slot[b]), attending keys [0, past_len[b]].
-__global__ void attn_decode_split_batch_kernel(
+// Batched flash-decoding phase 1: block (h, split, b) does a partial online-softmax over its key
+// chunk of sequence b (block-table row b), attending keys [0, past_len[b]].
+__global__ void attn_decode_split_paged_kernel(
         const float* __restrict__ q, const bf16* __restrict__ cache_k, const bf16* __restrict__ cache_v,
         float* __restrict__ part_m, float* __restrict__ part_l, float* __restrict__ part_acc,
-        int n_heads, int n_kv, int head_dim, const int* __restrict__ slot,
-        const int* __restrict__ past_len, int max_ctx, float scale) {
+        int n_heads, int n_kv, int head_dim, const int* __restrict__ past_len,
+        const int* __restrict__ bt, int max_blocks, int block_size, float scale) {
     constexpr int DPL = 4;
     int h = blockIdx.x, sp = blockIdx.y, b = blockIdx.z, lane = threadIdx.x;
     int kvh = h / (n_heads / n_kv);
     int kv_dim = n_kv * head_dim;
-    int L = past_len[b] + 1;                       // keys [0, past_len[b]]
+    int L = past_len[b] + 1;                        // keys [0, past_len[b]]
     int per = (L + ATTN_SPLITS - 1) / ATTN_SPLITS;
     int kb = sp * per, ke = min(kb + per, L);
 
-    const bf16* ck = cache_k + (size_t)slot[b] * max_ctx * kv_dim;
-    const bf16* cv = cache_v + (size_t)slot[b] * max_ctx * kv_dim;
+    const int* btb = bt + (size_t)b * max_blocks;   // this sequence's block table
     const float* qv = q + ((size_t)b * n_heads + h) * head_dim;
     float qreg[DPL], acc[DPL];
     #pragma unroll
@@ -415,7 +333,9 @@ __global__ void attn_decode_split_batch_kernel(
     float m_run = -1e30f, l_run = 0.f;
 
     for (int j = kb; j < ke; ++j) {
-        const bf16* kj = ck + ((size_t)j * n_kv + kvh) * head_dim;
+        int g = j / block_size, off = j - g * block_size;
+        size_t phys = (size_t)btb[g] * block_size + off;
+        const bf16* kj = cache_k + phys * kv_dim + kvh * head_dim;
         float p = 0.f;
         #pragma unroll
         for (int i = 0; i < DPL; ++i) p += qreg[i] * __bfloat162float(kj[lane + (i << 5)]);
@@ -425,7 +345,7 @@ __global__ void attn_decode_split_batch_kernel(
         float m_new = fmaxf(m_run, score);
         float corr = __expf(m_run - m_new), pp = __expf(score - m_new);
         l_run = l_run * corr + pp;
-        const bf16* vj = cv + ((size_t)j * n_kv + kvh) * head_dim;
+        const bf16* vj = cache_v + phys * kv_dim + kvh * head_dim;
         #pragma unroll
         for (int i = 0; i < DPL; ++i) acc[i] = acc[i] * corr + pp * __bfloat162float(vj[lane + (i << 5)]);
         m_run = m_new;
@@ -437,7 +357,7 @@ __global__ void attn_decode_split_batch_kernel(
 }
 
 // Batched flash-decoding phase 2: one warp per (b, head) merges the ATTN_SPLITS partials.
-__global__ void attn_decode_combine_batch_kernel(
+__global__ void attn_decode_combine_paged_kernel(
         const float* __restrict__ part_m, const float* __restrict__ part_l,
         const float* __restrict__ part_acc, float* __restrict__ out, int n_heads, int head_dim) {
     constexpr int DPL = 4;
@@ -463,13 +383,15 @@ __global__ void attn_decode_combine_batch_kernel(
     for (int i = 0; i < DPL; ++i) o[lane + (i << 5)] = gacc[i] * inv;
 }
 
-void launch_attention_decode_batch(const float* q, const bf16* cache_k, const bf16* cache_v,
+void launch_attention_decode_paged(const float* q, const bf16* cache_k, const bf16* cache_v,
                                    float* out, int B, int n_heads, int n_kv, int head_dim,
-                                   const int* slot, const int* past_len, int max_ctx, float scale,
-                                   float* part_m, float* part_l, float* part_acc, cudaStream_t s) {
-    attn_decode_split_batch_kernel<<<dim3(n_heads, ATTN_SPLITS, B), 32, 0, s>>>(
-        q, cache_k, cache_v, part_m, part_l, part_acc, n_heads, n_kv, head_dim, slot, past_len, max_ctx, scale);
-    attn_decode_combine_batch_kernel<<<dim3(n_heads, B), 32, 0, s>>>(
+                                   const int* past_len, const int* bt, int max_blocks, int block_size,
+                                   float scale, float* part_m, float* part_l, float* part_acc,
+                                   cudaStream_t s) {
+    attn_decode_split_paged_kernel<<<dim3(n_heads, ATTN_SPLITS, B), 32, 0, s>>>(
+        q, cache_k, cache_v, part_m, part_l, part_acc, n_heads, n_kv, head_dim,
+        past_len, bt, max_blocks, block_size, scale);
+    attn_decode_combine_paged_kernel<<<dim3(n_heads, B), 32, 0, s>>>(
         part_m, part_l, part_acc, out, n_heads, head_dim);
 }
 

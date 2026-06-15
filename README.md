@@ -260,7 +260,7 @@ decode is bound by reading the whole model per token, so serving `B` sequences i
 that one weight read be **amortized across `B` tokens** instead of paid per token.
 
 This is staged: **A — batched decode + static batching** (done), **B — continuous batching**
-(dynamic scheduler, done), **C — PagedAttention** (paged KV, planned).
+(dynamic scheduler, done), **C — PagedAttention** (paged KV + preemption, done).
 
 **Stage A — slot-based KV cache + batched decode.** The KV cache becomes a
 `[B_max, max_ctx, kv_dim]` pool; `B_max` (the number of concurrent sequence slots) is whatever
@@ -315,8 +315,31 @@ number of KV slots — `slots=1` is sequential serving (one request at a time):
 | slots | wall | aggregate tok/s |
 |---:|---:|---:|
 | 1  | 22.4 s | 86  |
-| 8  | 10.3 s | 187 |
-| 16 |  9.8 s | **197** |
+| 8  | 10.4 s | 185 |
+| 16 | 10.0 s | **193** |
+
+**Stage C — PagedAttention.** Stage A/B back every sequence slot with a *contiguous* `max_ctx`
+region of KV, so a slot reserves the full context length up front whether or not the sequence
+uses it — at `max_ctx=4096` that is ~600 MB/sequence, which caps how many sequences fit. Stage C
+replaces that with a **paged** pool: per layer the KV is `[num_blocks, BLOCK, kv_dim]` (BLOCK = 16
+tokens), and a sequence holds a **block table** — a list of physical block ids. Logical position
+`p` lives at physical row `block_table[p/BLOCK]*BLOCK + p%BLOCK`. Blocks are handed out **on
+demand** as a sequence grows, so memory tracks *actual* length and the number of concurrent
+sequences is decoupled from `max_ctx`. On the 4090 the same VRAM becomes a **5207-block ×
+16-token = ~83 k-token pool** shared across all sequences, instead of a fixed ~20×4096 reservation.
+
+The three KV kernels are reworked to address through the block table (the arithmetic is otherwise
+identical to the contiguous version): `store_kv_paged` (shared by prefill and decode),
+`attention_paged` (prefill), and the split-K `attention_decode_paged`. The scheduler
+(`src/scheduler.*`) owns a free-block list and grows each running sequence's block table across
+BLOCK boundaries. When the pool is exhausted it **preempts** the youngest running sequence —
+frees its blocks and requeues it — and **recomputes** its KV from `prompt + output` when it is
+later resumed (the same recomputation policy vLLM uses). This keeps the engine correct under
+memory pressure instead of dead-locking; throughput is unchanged from Stage B (paging is a
+memory-efficiency change, and the per-step block-table upload is negligible). Verified
+bit-identical to single-sequence greedy decode — batched (disjoint block tables), continuous,
+and even a stress run that forced **125 preemptions** through a deliberately undersized pool all
+reproduce the reference output exactly. Chat runs as `B=1` over an identity block table.
 
 `feature/batching` is managed as a branch (no per-stage tags). To try it:
 

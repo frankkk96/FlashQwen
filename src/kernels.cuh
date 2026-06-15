@@ -48,40 +48,34 @@ void launch_embed(const int* ids, const bf16* embed, float* out, int M, int H, c
 // In-place rotary position embedding on x[M, n_heads, head_dim], positions pos[M].
 void launch_rope(float* x, const int* pos, int M, int n_heads, int head_dim, float theta, cudaStream_t s);
 
-// Grouped-query attention with a KV cache. q[M, n_heads, hd] is FP32; cache_k/v are BF16
-// [max_seq, n_kv, hd]; out[M, n_heads, hd]. Query token m attends keys [0, *d_past + m].
-// past_len is read from device memory (*d_past) so the decode path is CUDA-graph friendly.
-void launch_attention(const float* q, const bf16* cache_k, const bf16* cache_v,
-                      float* out, int M, int n_heads, int n_kv, int head_dim,
-                      const int* d_past, float scale, cudaStream_t s);
+// ---- Paged KV cache ---------------------------------------------------------------------
+// The KV pool for a layer is [num_blocks, BLOCK, kv_dim] BF16. A sequence's KV is a list of
+// physical block ids — its "block table". Logical position p of a sequence lives at physical
+// row  block_table[p / BLOCK] * BLOCK + (p % BLOCK),  addressed as cache + row*kv_dim.
+// `bt` holds one block table per row (stride `max_blocks`); a sequence is identified by its row.
 
-// Append M rows of K (or V) to the BF16 cache at device-resident row offset *d_past:
-//   cache[(*d_past + m) * kv_dim + i] = bf16(src[m*kv_dim + i])
-void launch_store_kv(const float* src, bf16* cache, const int* d_past, int kv_dim, int M, cudaStream_t s);
+// Store M new K (or V) rows into the paged pool. Token m belongs to the sequence whose block
+// table is row bt_row[m] of `bt`, at logical position pos[m].
+void launch_store_kv_paged(const float* src, bf16* cache, const int* bt, int max_blocks,
+                           int block_size, int kv_dim, const int* bt_row, const int* pos,
+                           int M, cudaStream_t s);
 
-// Batched store: cache is the whole [B_max, max_ctx, kv_dim] pool. Token m goes to sequence
-// slot[m], cache row rowpos[m]:
-//   cache[(slot[m]*max_ctx + rowpos[m]) * kv_dim + i] = bf16(src[m*kv_dim + i])
-void launch_store_kv_batch(const float* src, bf16* cache, const int* slot, const int* rowpos,
-                           int kv_dim, int max_ctx, int M, cudaStream_t s);
+// Prefill attention (M query rows of ONE sequence, block table = row 0 of `bt`) over the paged
+// pool. q[M, n_heads, hd] FP32; out[M, n_heads, hd]. Query token m attends keys [0, *d_past + m].
+void launch_attention_paged(const float* q, const bf16* cache_k, const bf16* cache_v, float* out,
+                            int M, int n_heads, int n_kv, int head_dim, const int* d_past,
+                            float scale, const int* bt, int max_blocks, int block_size,
+                            cudaStream_t s);
 
-// Flash-decoding split-K attention for single-token decode (M=1). Splits each head's key
-// range into ATTN_SPLITS chunks computed by separate blocks (partial online-softmax), then
-// a combine pass merges them. part_* are scratch: part_m/l are [n_heads*ATTN_SPLITS],
-// part_acc is [n_heads*ATTN_SPLITS*head_dim].
+// Batched flash-decoding split-K over the paged pool. Sequence b uses block-table row b of `bt`,
+// attending keys [0, past_len[b]]. q/out are [B, n_heads, head_dim]. part_* are scratch sized for
+// B*n_heads*ATTN_SPLITS (m/l) and *head_dim (acc).
 #define ATTN_SPLITS 16
-void launch_attention_decode(const float* q, const bf16* cache_k, const bf16* cache_v,
-                             float* out, int n_heads, int n_kv, int head_dim, const int* d_past,
-                             float scale, float* part_m, float* part_l, float* part_acc,
-                             cudaStream_t s);
-
-// Batched flash-decoding for B single-token queries. cache_k/v is the whole pool; sequence b
-// reads slot `slot[b]`, attending keys [0, past_len[b]]. q/out are [B, n_heads, head_dim].
-// part_* are scratch sized for B*n_heads*ATTN_SPLITS (m/l) and *head_dim (acc).
-void launch_attention_decode_batch(const float* q, const bf16* cache_k, const bf16* cache_v,
+void launch_attention_decode_paged(const float* q, const bf16* cache_k, const bf16* cache_v,
                                    float* out, int B, int n_heads, int n_kv, int head_dim,
-                                   const int* slot, const int* past_len, int max_ctx, float scale,
-                                   float* part_m, float* part_l, float* part_acc, cudaStream_t s);
+                                   const int* past_len, const int* bt, int max_blocks, int block_size,
+                                   float scale, float* part_m, float* part_l, float* part_acc,
+                                   cudaStream_t s);
 
 // out[i] += in[i]   for N elements
 void launch_add(float* out, const float* in, int N, cudaStream_t s);

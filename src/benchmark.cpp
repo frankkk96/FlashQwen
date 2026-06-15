@@ -57,18 +57,21 @@ static std::vector<int> make_prompt(int n, int vocab, std::mt19937& rng) {
 // decode all B in lock-step for `steps` tokens. Returns total decode wall time (ms).
 static double batch_decode_ms(Model& model, int input_len, int B, int steps,
                               int vocab, std::mt19937& rng) {
-    std::vector<std::vector<int>> prompts(B);
-    std::vector<int> cur(B), past(B), slots(B), out;
+    int bsz = model.block_size();
+    int nb = (input_len + steps + bsz - 1) / bsz;     // KV blocks each sequence needs
+    std::vector<std::vector<int>> prompts(B), bts(B);
+    std::vector<int> cur(B), past(B), out;
     for (int b = 0; b < B; ++b) {
+        bts[b].resize(nb);                             // give each sequence a disjoint block range
+        for (int g = 0; g < nb; ++g) bts[b][g] = b * nb + g;
         prompts[b] = make_prompt(input_len, vocab, rng);
-        model.prefill(prompts[b], /*slot=*/b, /*past_len=*/0);
+        model.prefill(prompts[b], bts[b], /*past_len=*/0);
         cur[b]  = model.argmax_last();   // first generated token for sequence b
         past[b] = input_len;
-        slots[b] = b;
     }
     auto t0 = Clock::now();
     for (int s = 0; s < steps; ++s) {
-        model.decode(cur, past, slots, out);
+        model.decode(cur, past, bts, out);
         for (int b = 0; b < B; ++b) past[b] += 1;
         cur = out;
     }
@@ -164,7 +167,10 @@ static void continuous_sweep(Model& model, int max_ctx, int vocab) {
     };
 
     std::fprintf(stderr, "\n[3] continuous-batching throughput (%d requests, input %d, output %d-%d "
-                 "random)\n\n", R, INPUT, LEN_MIN, LEN_MAX);
+                 "random)\n", R, INPUT, LEN_MIN, LEN_MAX);
+    std::fprintf(stderr, "    paged KV: %d blocks x %d tok = %d-token pool (vs %d-token reservation "
+                 "per slot if unpaged)\n\n", model.num_blocks(), model.block_size(),
+                 model.num_blocks() * model.block_size(), max_ctx);
     std::fprintf(stderr, "  slots    wall (s)   aggregate tok/s\n");
     for (int ns : {1, 8, 16}) {
         if (ns > model.max_batch()) continue;
