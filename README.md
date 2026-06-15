@@ -45,8 +45,8 @@ hub cache for what's available.
 # interactive multi-turn chat (default mode). KV cache persists across turns.
 ./build/flashqwen --model models/qwen3-8b
 
-# chat with Qwen's recommended sampling
-./build/flashqwen --model models/qwen3-8b --temperature 0.6 --top-p 0.95 --top-k 20
+# chat with temperature + nucleus sampling
+./build/flashqwen --model models/qwen3-8b --temperature 0.6 --top-p 0.95
 
 # benchmark (built-in fixed sweep over input lengths)
 ./build/flashqwen benchmark --model models/qwen3-8b
@@ -59,7 +59,7 @@ hub cache for what's available.
 **In-chat commands:** `/exit`  `/quit`  `/reset` (clear history)  `/think on|off`.
 
 **Common flags:** `--max-ctx N` (KV-cache size, default 4096), `--temperature`,
-`--top-p`, `--top-k`, `--seed`, `--think` (enable Qwen3 thinking mode).
+`--top-p`, `--seed`, `--think` (enable Qwen3 thinking mode).
 
 **Supported models:** any dense Qwen3 model (architecture `Qwen3ForCausalLM`): Qwen3-0.6B
 / 1.7B / 4B / 8B / 14B / 32B — dims are read from `config.json`. **Not supported:** Qwen3.5
@@ -142,7 +142,7 @@ dispatches. Roughly 1940 lines total.
 | `src/chat.cpp` / `.hpp` | interactive multi-turn chat | 55 |
 | `src/benchmark.cpp` / `.hpp` | benchmark mode (input-length sweep) | 92 |
 | `src/generate.cpp` / `.hpp` | shared prefill + decode loop | 66 |
-| `src/sampler.cpp` / `.hpp` | token sampling (greedy / temp / top-k / top-p) | 50 |
+| `src/sampler.cpp` / `.hpp` | token sampling (greedy / temp / top-p) | 50 |
 
 **Core engine**
 
@@ -303,7 +303,7 @@ requests idle behind long ones (head-of-line blocking). Continuous batching (`sr
 instead keeps `n_slots` busy: admit a waiting request the instant a slot frees, and decode the
 whole running set each step. On a varied-length workload it measured ~1.4× faster than the
 static baseline, so continuous batching is the only serving path kept. Each request carries its
-own sampling params (temperature / top-k / top-p, or greedy); an all-greedy batch takes the GPU
+own sampling params (temperature / top-p, or greedy); an all-greedy batch takes the GPU
 argmax, while any batch with a sampling request copies the `[B, vocab]` logits back and samples
 per row. Admission prefills one prompt at a time but in fixed-size chunks (256 tokens) interleaved
 with decode, so a long prompt no longer stalls the running sequences for its whole prefill — they

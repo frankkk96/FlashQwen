@@ -180,7 +180,7 @@ static void continuous_sweep(Model& model, int max_ctx, int vocab) {
 }
 
 int run_benchmark(Model& model, const Tokenizer& tok, int max_ctx) {
-    SampleParams sp{0.0f, 1.0f, 0};   // greedy: timing shouldn't depend on sampling
+    SampleParams sp{0.0f, 1.0f};   // greedy: timing shouldn't depend on sampling
     std::mt19937 rng(1234);
     int vocab = model.config().vocab_size;
 

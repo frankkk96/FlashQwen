@@ -41,8 +41,8 @@ Ada)编译;其他显卡用 `-DCMAKE_CUDA_ARCHITECTURES=<arch>` 覆盖(如 Hopper
 # 交互式多轮对话(默认模式),KV cache 跨轮保留
 ./build/flashqwen --model models/qwen3-8b
 
-# 用 Qwen 推荐的采样参数对话
-./build/flashqwen --model models/qwen3-8b --temperature 0.6 --top-p 0.95 --top-k 20
+# 用 temperature + nucleus 采样对话
+./build/flashqwen --model models/qwen3-8b --temperature 0.6 --top-p 0.95
 
 # benchmark(内置的固定输入长度扫描)
 ./build/flashqwen benchmark --model models/qwen3-8b
@@ -55,7 +55,7 @@ Ada)编译;其他显卡用 `-DCMAKE_CUDA_ARCHITECTURES=<arch>` 覆盖(如 Hopper
 **对话内命令:** `/exit`  `/quit`  `/reset`(清空上下文)  `/think on|off`。
 
 **常用参数:** `--max-ctx N`(KV cache 大小,默认 4096)、`--temperature`、`--top-p`、
-`--top-k`、`--seed`、`--think`(开启 Qwen3 思考模式)。
+`--seed`、`--think`(开启 Qwen3 思考模式)。
 
 **支持的模型:** 任意 dense 的 Qwen3 模型(架构为 `Qwen3ForCausalLM`):Qwen3-0.6B / 1.7B /
 4B / 8B / 14B / 32B,各维度从 `config.json` 读取。**不支持:** Qwen3.5(混合线性注意力 +
@@ -133,7 +133,7 @@ INT8 权重要先反量化成 BF16,所以 TTFT 比纯 BF16 版略高。这些是
 | `src/chat.cpp` / `.hpp` | 交互式多轮对话 | 55 |
 | `src/benchmark.cpp` / `.hpp` | benchmark 模式(扫描输入长度) | 92 |
 | `src/generate.cpp` / `.hpp` | 共用的 prefill + decode 循环 | 66 |
-| `src/sampler.cpp` / `.hpp` | 采样(greedy / temp / top-k / top-p) | 50 |
+| `src/sampler.cpp` / `.hpp` | 采样(greedy / temp / top-p) | 50 |
 
 **核心引擎**
 
@@ -276,7 +276,7 @@ INT8 权重反量化成 BF16 写回(~14 GB、与 batch 无关)的开销占了主
 批处理一次处理固定一组,要等组里**最慢**的序列结束才释放槽位,短请求被长请求堵在后面(队头阻塞)。
 连续批处理(`src/scheduler.*`)则让 `n_slots` 一直满载:一有槽位空出就立刻接纳等待中的请求,每步把
 整个运行集合一起 decode。在一个变长工作负载上,它比静态基线快约 1.4×,因此只保留连续批处理这一条
-服务路径。每个请求带自己的采样参数(temperature / top-k / top-p,或 greedy):全 greedy 的批走 GPU
+服务路径。每个请求带自己的采样参数(temperature / top-p,或 greedy):全 greedy 的批走 GPU
 argmax,只要批里有一个要采样就把 `[B, vocab]` logits 拷回主机逐行采样。接纳时一次只 prefill 一个
 prompt,但按固定大小(256 token)分块、与 decode 交错进行,所以一个长 prompt 不会在整段 prefill 期间
 卡住正在运行的序列——它们在分块之间持续 decode。

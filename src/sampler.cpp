@@ -15,23 +15,21 @@ int sample(const std::vector<float>& logits, const SampleParams& sp, std::mt1993
 int sample(const float* logits, int V, const SampleParams& sp, std::mt19937& rng) {
     if (sp.temp <= 0.0f) return argmax(logits, V);
 
+    // sort the whole vocab by logit, descending
     std::vector<int> idx(V);
     for (int i = 0; i < V; ++i) idx[i] = i;
+    std::sort(idx.begin(), idx.end(), [&](int a, int b){ return logits[a] > logits[b]; });
 
-    int k = (sp.top_k <= 0 || sp.top_k > V) ? V : sp.top_k;
-    std::partial_sort(idx.begin(), idx.begin() + k, idx.end(),
-                      [&](int a, int b){ return logits[a] > logits[b]; });
-    idx.resize(k);
-
+    // temperature softmax over the sorted logits
     float maxl = logits[idx[0]];
-    std::vector<float> probs(k);
+    std::vector<float> probs(V);
     float sum = 0.f;
-    for (int i = 0; i < k; ++i) { probs[i] = std::exp((logits[idx[i]] - maxl) / sp.temp); sum += probs[i]; }
+    for (int i = 0; i < V; ++i) { probs[i] = std::exp((logits[idx[i]] - maxl) / sp.temp); sum += probs[i]; }
     for (auto& p : probs) p /= sum;
 
-    // nucleus (top-p) truncation on the already-descending list
-    float cum = 0.f; int keep = k;
-    for (int i = 0; i < k; ++i) { cum += probs[i]; if (cum >= sp.top_p) { keep = i + 1; break; } }
+    // nucleus (top-p) truncation on the descending list
+    float cum = 0.f; int keep = V;
+    for (int i = 0; i < V; ++i) { cum += probs[i]; if (cum >= sp.top_p) { keep = i + 1; break; } }
 
     std::uniform_real_distribution<float> dist(0.f, cum);
     float r = dist(rng), acc = 0.f;

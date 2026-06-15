@@ -19,7 +19,6 @@ int main(int argc, char** argv) {
     std::string model_dir;
     int   max_ctx   = 4096;
     float temp      = 0.0f, top_p = 0.95f;
-    int   top_k     = 20;
     unsigned seed   = 1234;
     bool  think     = false;
     float gpu_mem_fraction = 0.9f;   // VRAM cap; the KV pool gets whatever is left under it
@@ -35,7 +34,6 @@ int main(int argc, char** argv) {
         else if (a == "--gpu-mem-fraction") gpu_mem_fraction = std::stof(next());
         else if (a == "--temperature") temp = std::stof(next());
         else if (a == "--top-p")       top_p = std::stof(next());
-        else if (a == "--top-k")       top_k = std::stoi(next());
         else if (a == "--seed")        seed = (unsigned)std::stoul(next());
         else if (a == "--think")       think = true;
         else { std::fprintf(stderr, "unknown argument: %s  (try --help)\n", a.c_str()); return 1; }
@@ -62,7 +60,7 @@ int main(int argc, char** argv) {
     Model model;
     model.load(model_dir, max_ctx, gpu_mem_fraction);
 
-    SampleParams sp{temp, top_p, top_k};
+    SampleParams sp{temp, top_p};
     std::mt19937 rng(seed);
 
     if (mode == BENCHMARK)

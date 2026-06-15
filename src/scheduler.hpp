@@ -16,7 +16,7 @@
 struct Request {
     std::vector<int> prompt;        // input: prompt token ids
     int max_new = 0;                // input: number of tokens to generate
-    SampleParams sp{0.0f, 1.0f, 0}; // input: per-request sampling (temp<=0 => greedy)
+    SampleParams sp{0.0f, 1.0f};    // input: per-request sampling (temp<=0 => greedy)
     std::vector<int> output;        // result: generated token ids
 
     // scheduler-internal state

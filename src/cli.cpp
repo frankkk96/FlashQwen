@@ -36,7 +36,6 @@ void print_help() {
 "                        under it (more blocks => more concurrency)  (default 0.9)\n"
 "  --temperature T       0 = greedy            (chat only)   (default 0.0)\n"
 "  --top-p P             nucleus sampling      (chat only)   (default 0.95)\n"
-"  --top-k K             top-k sampling        (chat only)   (default 20)\n"
 "  --seed S              RNG seed              (chat only)   (default 1234)\n"
 "  --think               enable Qwen3 thinking (chat only)   (default off)\n\n"
 "CHAT\n"
