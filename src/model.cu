@@ -134,6 +134,8 @@ void Model::load(const std::string& dir, int max_ctx, float gpu_mem_fraction) {
     CUDA_CHECK(cudaMalloc(&part_m_,   (size_t)MAX_DECODE_B * nh * ATTN_SPLITS * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&part_l_,   (size_t)MAX_DECODE_B * nh * ATTN_SPLITS * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&part_acc_, (size_t)MAX_DECODE_B * nh * ATTN_SPLITS * hd * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&lm_part_val_, (size_t)MAX_DECODE_B * LM_ARGMAX_BLOCKS * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&lm_part_idx_, (size_t)MAX_DECODE_B * LM_ARGMAX_BLOCKS * sizeof(int)));
     CUDA_CHECK(cudaStreamCreate(&stream_));
     host_logits_.resize(V);
 
@@ -152,6 +154,9 @@ void Model::load(const std::string& dir, int max_ctx, float gpu_mem_fraction) {
                      max_ctx_, per_seq / 1e9, kv_avail / 1e9, gpu_mem_fraction * 100);
         std::exit(1);
     }
+    // A single decode step handles at most MAX_DECODE_B sequences, and every running sequence
+    // decodes each step, so more slots than that can never be used — don't allocate them.
+    if (b_max_ > MAX_DECODE_B) b_max_ = MAX_DECODE_B;
 
     cache_k_.resize(cfg_.num_layers);
     cache_v_.resize(cfg_.num_layers);
@@ -278,15 +283,20 @@ void Model::decode(const std::vector<int>& in_tokens, const std::vector<int>& pa
     run_layers_decode(B);
     launch_rmsnorm(x_, fnorm_, xb_, B, H, cfg_.rms_eps, stream_);   // final norm, all B rows
 
-    // lm_head + argmax in chunks of <= LM_CHUNK so the [chunk, vocab] logits buffer stays small.
     out_tokens.resize(B);
-    for (int c0 = 0; c0 < B; c0 += LM_CHUNK) {
-        int cb = std::min(LM_CHUNK, B - c0);
-        launch_matmul_decode(xb_ + (size_t)c0 * H, lm_head_.w, lm_head_.scale, logits_, cb, H, V, stream_);
-        launch_argmax_batch(logits_, cb, V, d_arg_, stream_);
-        CUDA_CHECK(cudaMemcpyAsync(out_tokens.data() + c0, d_arg_, cb * sizeof(int),
-                                   cudaMemcpyDeviceToHost, stream_));
+    if (B <= LM_CHUNK) {
+        // Small batch (incl. chat B=1): one lm_head GEMV materializes the [B, vocab] logits, so
+        // copy_logits()/sampling still work. B <= LM_CHUNK reads the weight just once.
+        launch_matmul_decode(xb_, lm_head_.w, lm_head_.scale, logits_, B, H, V, stream_);
+        launch_argmax_batch(logits_, B, V, d_arg_, stream_);
+    } else {
+        // Large batch: fused lm_head + argmax reads the weight once for the whole batch and
+        // never materializes [B, vocab] logits (greedy only).
+        launch_lm_head_argmax(xb_, lm_head_.w, lm_head_.scale, B, H, V,
+                              lm_part_val_, lm_part_idx_, d_arg_, stream_);
     }
+    CUDA_CHECK(cudaMemcpyAsync(out_tokens.data(), d_arg_, B * sizeof(int),
+                               cudaMemcpyDeviceToHost, stream_));
     CUDA_CHECK(cudaStreamSynchronize(stream_));
 }
 
@@ -312,6 +322,7 @@ Model::~Model() {
     cudaFree(x_); cudaFree(xb_); cudaFree(xb2_); cudaFree(q_); cudaFree(k_); cudaFree(v_);
     cudaFree(attn_); cudaFree(gate_); cudaFree(up_); cudaFree(hmlp_); cudaFree(logits_);
     cudaFree(xbf_); cudaFree(w_dq_); cudaFree(part_m_); cudaFree(part_l_); cudaFree(part_acc_);
+    cudaFree(lm_part_val_); cudaFree(lm_part_idx_);
     cudaFree(d_ids_); cudaFree(d_pos_); cudaFree(d_arg_); cudaFree(d_past_); cudaFree(d_slot_);
     if (stream_) cudaStreamDestroy(stream_);
 }

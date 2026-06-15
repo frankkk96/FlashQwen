@@ -70,6 +70,8 @@ private:
     bf16  *xbf_ = nullptr;   // BF16 activation scratch for tensor-core prefill matmul
     bf16  *w_dq_ = nullptr;  // BF16 dequantized-weight scratch for prefill matmul
     float *part_m_, *part_l_, *part_acc_;   // flash-decoding split-K scratch (x MAX_DECODE_B)
+    float *lm_part_val_ = nullptr;          // fused lm_head+argmax partials [MAX_DECODE_B, blocks]
+    int   *lm_part_idx_ = nullptr;
     int   *d_ids_, *d_pos_, *d_arg_, *d_past_, *d_slot_;
     std::vector<float> host_logits_;
 

@@ -282,13 +282,17 @@ Static-batch decode throughput (RTX 4090, Qwen3-8B INT8, greedy, 128 tok/seq, `i
 | batch | per-seq TPOT | aggregate decode tok/s |
 |---:|---:|---:|
 | 1  | 10.2 ms | 98  |
-| 8  | 28.2 ms | 284 |
-| 16 | 50.4 ms | **318** |
+| 8  | 28.3 ms | 283 |
+| 16 | 49.7 ms | **322** |
 
-So aggregate decode goes **~98 → ~318 tok/s (~3.2×)** at batch 16. It's deliberately
-sublinear for now: `lm_head` is read once per 4-sequence chunk (≈`B/4`× its weight traffic),
-and the batched GEMV loses efficiency at high `B`. A fused batched `lm_head`-argmax and a
-better GEMV tiling are the next throughput items, alongside stage C.
+So aggregate decode goes **~98 → ~322 tok/s (~3.3×)** at batch 16 — sublinear, and the reason
+is instructive. A batch-16 step moves ~9 GB of weights in ~50 ms ≈ 190 GB/s, far under the
+4090's ~1 TB/s, so batched decode is **not** weight-bandwidth-bound: it's **compute/occupancy-
+bound in the batched INT8 GEMV** (the per-token FMA work grows with `B` and stops hiding behind
+the weight reads). The real lever is therefore the decode GEMV itself — an INT8 tensor-core
+(IMMA/DP4A) decode GEMM or better register tiling — not memory traffic. (`lm_head` is already
+fused with its argmax so its weight is read once per step, but that only trims traffic, which
+confirms the limiter is compute, not bandwidth.)
 
 **Stage B — continuous batching.** There is only one execution primitive — the batched
 `decode`, which takes an arbitrary running set (per-sequence KV slot + `past_len`). So "static"

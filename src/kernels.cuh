@@ -94,3 +94,12 @@ void launch_argmax(const float* logits, int N, int* d_out, cudaStream_t s);
 
 // Batched argmax: logits is [B, N]; d_out[b] = argmax over row b. One block per row.
 void launch_argmax_batch(const float* logits, int B, int N, int* d_out, cudaStream_t s);
+
+// Fused lm_head + greedy argmax for a decode batch. Logically y[B,OUT] = x[B,IN] @ W[OUT,IN]^T
+// (INT8 W + per-row scale), but instead of materializing the huge [B,OUT] logits it reads each
+// weight row ONCE, accumulates all B logits for it, and reduces to a per-sequence argmax — so
+// lm_head weight traffic is paid once for the whole batch, not once per logits chunk.
+// part_val/part_idx are scratch of size >= MAX_DECODE_B*LM_ARGMAX_BLOCKS; out[b] = argmax row.
+#define LM_ARGMAX_BLOCKS 512
+void launch_lm_head_argmax(const float* x, const int8_t* W, const float* scale, int B, int IN, int OUT,
+                           float* part_val, int* part_idx, int* out, cudaStream_t s);
