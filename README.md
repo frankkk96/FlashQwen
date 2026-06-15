@@ -251,3 +251,49 @@ mild for an 8B model).
 
 **Still open:** INT4 / grouped quantization for more decode headroom, activation-INT8 tensor
 cores to also speed prefill, and shared-memory tiling for the prefill WMMA.
+
+## Batching (separate track, `feature/batching`)
+
+The optimization study above is all **single-stream (batch 1)**. A separate track turns the
+engine into a small serving backend that runs **many sequences at once**. The win is in decode:
+decode is bound by reading the whole model per token, so serving `B` sequences in one step lets
+that one weight read be **amortized across `B` tokens** instead of paid per token.
+
+This is staged: **A — batched decode + static batching** (done), **B — continuous batching**
+(dynamic scheduler, in progress), **C — PagedAttention** (paged KV, planned).
+
+**Stage A — slot-based KV cache + batched decode.** The KV cache becomes a
+`[B_max, max_ctx, kv_dim]` pool; `B_max` (the number of concurrent sequence slots) is whatever
+fits under `--gpu-mem-fraction` (default 0.9) after weights and activations — e.g. **42 slots**
+at `max_ctx=2048` on a 24 GB 4090. The decode path is rewritten to run a batch in one step:
+
+- a **templated INT8 GEMV** where each warp reads a weight row once and computes all `B` dot
+  products (`B` is compile-time so the accumulators stay in registers),
+- per-slot `store_kv`, split-K decode attention with a batch dimension and per-sequence slot /
+  `past_len`, and a batched argmax; `lm_head` runs in ≤4-sequence chunks to bound the
+  `[B, vocab]` logits buffer.
+
+Prefill stays single-sequence (it writes into a sequence's slot; prefill batching is a later
+stage). The CUDA graph is dropped — batch shapes vary — so chat now runs as `B=1` through the
+same decode path (a small, expected loss of the stage-6 graph win at batch 1).
+
+Static-batch decode throughput (RTX 4090, Qwen3-8B INT8, greedy, 128 tok/seq, `input=128`):
+
+| batch | per-seq TPOT | aggregate decode tok/s |
+|---:|---:|---:|
+| 1  | 10.2 ms | 98  |
+| 8  | 28.2 ms | 284 |
+| 16 | 50.4 ms | **318** |
+
+So aggregate decode goes **~98 → ~318 tok/s (~3.2×)** at batch 16. It's deliberately
+sublinear for now: `lm_head` is read once per 4-sequence chunk (≈`B/4`× its weight traffic),
+and the batched GEMV loses efficiency at high `B`. A fused batched `lm_head`-argmax and a
+better GEMV tiling are the next throughput items, alongside stages B and C.
+
+`feature/batching` is managed as a branch (no per-stage tags). To try it:
+
+```bash
+git checkout feature/batching
+cmake -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build -j8
+./build/flashqwen benchmark --model models/qwen3-8b   # adds a static-batch sweep section
+```

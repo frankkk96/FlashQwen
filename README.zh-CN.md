@@ -231,3 +231,45 @@ prefill 仍用阶段 3 的 kernel(并行度本来就够)。
 
 **仍待优化:** INT4 / 分组量化拿更多 decode 余量、激活也量化用 INT8 tensor core 加速 prefill、
 以及给 prefill WMMA 加 shared-memory tiling。
+
+## 批处理(独立分支 `feature/batching`)
+
+上面的优化历程全是**单流(batch 1)**。另一条分支把引擎做成一个小型服务后端,能**同时跑多个序列**。
+收益在 decode:decode 的瓶颈是每个 token 都要把整个模型读一遍,而一步同时服务 `B` 个序列,可以把
+**这一次权重读取摊薄到 `B` 个 token 上**,而不是每 token 各读一次。
+
+分三个阶段:**A——批处理 decode + 静态批处理**(已完成),**B——连续批处理**(动态调度器,进行中),
+**C——PagedAttention**(分页 KV,计划中)。
+
+**阶段 A——槽位式 KV cache + 批处理 decode。** KV cache 改成 `[B_max, max_ctx, kv_dim]` 池;
+`B_max`(并发序列槽数)由权重和激活之后、`--gpu-mem-fraction`(默认 0.9)以内剩余的显存决定——
+例如 24GB 4090 上 `max_ctx=2048` 得到 **42 个槽**。decode 路径重写成一步跑一整批:
+
+- **模板化 INT8 GEMV**:每个 warp 把一行权重读一次,算出全部 `B` 个点积(`B` 是编译期常量,
+  累加器留在寄存器里);
+- 按槽位的 `store_kv`、带 batch 维 + 每序列槽位 / `past_len` 的 split-K decode attention、
+  批处理 argmax;`lm_head` 按 ≤4 序列分块跑以限制 `[B, vocab]` 的 logits 显存。
+
+prefill 仍是单序列(写入对应序列的槽位;prefill 批处理留到后续阶段)。CUDA graph 去掉——批处理
+形状会变——所以 chat 现在作为 `B=1` 走同一条 decode 路径(在 batch 1 下损失了阶段 6 graph 的那点
+收益,符合预期)。
+
+静态批处理 decode 吞吐(RTX 4090,Qwen3-8B INT8,greedy,128 tok/序列,`input=128`):
+
+| batch | 每序列 TPOT | 聚合 decode tok/s |
+|---:|---:|---:|
+| 1  | 10.2 ms | 98  |
+| 8  | 28.2 ms | 284 |
+| 16 | 50.4 ms | **318** |
+
+聚合 decode 吞吐 **~98 → ~318 tok/s(~3.2×)**(batch 16)。目前刻意是次线性的:`lm_head` 每 4 序列
+一块、各读一遍权重(约 `B/4`× 的权重流量),且批处理 GEMV 在高 `B` 时效率下降。下一步的吞吐项是
+融合的批处理 `lm_head`-argmax 和更好的 GEMV tiling,与阶段 B、C 一起推进。
+
+`feature/batching` 用分支管理(不打每阶段的 tag)。试用:
+
+```bash
+git checkout feature/batching
+cmake -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build -j8
+./build/flashqwen benchmark --model models/qwen3-8b   # benchmark 多出一段静态批处理 sweep
+```
