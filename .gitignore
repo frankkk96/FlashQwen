@@ -12,5 +12,7 @@ compile_commands.json
 .vscode/
 .cache/
 
-# Go gateway build artifact
-api/flashqwen-api
+# Go build artifacts
+/flashqwen
+# Embedded engine binary (produced by `make`, copied here for //go:embed)
+internal/supervisor/bin/flashqwen-engine

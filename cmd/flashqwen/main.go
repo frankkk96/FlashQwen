@@ -1,65 +1,45 @@
 // flashqwen — the entry point. Owns the model-text layer (tokenizer, ChatML template, tool-call
-// detection) and the OpenAI HTTP API; drives the C++ token engine over gRPC.
+// detection) and the user-facing modes; embeds and drives the C++ token engine over gRPC.
 //
-// Phase 2: connects to a manually-started engine (flashqwen-engine --address ...). The embedded
-// engine supervisor and the chat/benchmark subcommands arrive in phase 3.
+//	flashqwen serve     --model DIR [--addr :8000] [--slots N] [--max-ctx N]
+//	flashqwen chat      --model DIR [--max-ctx N]
+//	flashqwen benchmark --model DIR [--slots N] [--max-ctx N]
 package main
 
 import (
-	"context"
-	"flag"
-	"log"
-	"time"
-
-	"flashqwen/internal/chat"
-	"flashqwen/internal/engine"
-	"flashqwen/internal/openai"
-	"flashqwen/internal/tokenizer"
-
-	"github.com/gin-gonic/gin"
+	"fmt"
+	"os"
 )
 
+func usage() {
+	fmt.Fprint(os.Stderr, `flashqwen — OpenAI-compatible server + CLI for a Qwen3 token engine
+
+usage:
+  flashqwen serve     --model DIR [--addr :8000] [--slots N] [--max-ctx N]
+  flashqwen chat      --model DIR [--max-ctx N]
+  flashqwen benchmark --model DIR [--slots N] [--max-ctx N]
+
+All modes embed and launch the C++ engine themselves; no separate process to start.
+`)
+}
+
 func main() {
-	addr := flag.String("addr", ":8000", "HTTP listen address")
-	engineAddr := flag.String("engine", "127.0.0.1:50051", "C++ token engine gRPC address")
-	modelDir := flag.String("model", "", "model directory (tokenizer.json, config.json, ...)")
-	flag.Parse()
-	if *modelDir == "" {
-		log.Fatal("--model is required")
+	if len(os.Args) < 2 {
+		usage()
+		os.Exit(2)
 	}
-
-	tok, err := tokenizer.Load(*modelDir)
-	if err != nil {
-		log.Fatalf("load tokenizer: %v", err)
-	}
-	cm := chat.Load(*modelDir, tok)
-
-	eng, err := engine.Dial(*engineAddr)
-	if err != nil {
-		log.Fatalf("dial engine %s: %v", *engineAddr, err)
-	}
-
-	// Authoritative id + context window from the engine.
-	modelID, maxCtx := "flashqwen", 4096
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	if info, err := eng.GetModel(ctx); err == nil {
-		if info.Id != "" {
-			modelID = info.Id
-		}
-		if info.MaxCtx > 0 {
-			maxCtx = int(info.MaxCtx)
-		}
-	} else {
-		log.Printf("warning: GetModel failed (%v); using defaults", err)
-	}
-	cancel()
-
-	gin.SetMode(gin.ReleaseMode)
-	r := gin.Default()
-	openai.NewServer(eng, cm, tok, modelID, maxCtx).Routes(r)
-
-	log.Printf("flashqwen on %s -> engine %s (model %q, max_ctx %d)", *addr, *engineAddr, modelID, maxCtx)
-	if err := r.Run(*addr); err != nil {
-		log.Fatal(err)
+	switch os.Args[1] {
+	case "serve":
+		runServe(os.Args[2:])
+	case "chat":
+		runChat(os.Args[2:])
+	case "benchmark", "bench":
+		runBench(os.Args[2:])
+	case "-h", "--help", "help":
+		usage()
+	default:
+		fmt.Fprintf(os.Stderr, "unknown command %q\n\n", os.Args[1])
+		usage()
+		os.Exit(2)
 	}
 }
