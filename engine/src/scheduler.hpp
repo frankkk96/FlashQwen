@@ -13,7 +13,7 @@
 // exact same logic: add() enqueues, step() advances one iteration and reports tokens / finishes
 // through callbacks.
 #pragma once
-#include "model.hpp"
+#include "model/model.hpp"
 #include "sampler.hpp"
 #include <vector>
 #include <deque>

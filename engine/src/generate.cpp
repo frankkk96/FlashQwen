@@ -1,5 +1,5 @@
 #include "generate.hpp"
-#include "special_tokens.hpp"
+#include "model/special_tokens.hpp"
 #include <chrono>
 #include <cstdio>
 #include <string>

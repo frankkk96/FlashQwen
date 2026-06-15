@@ -66,12 +66,12 @@ add_executable(flashqwen
   src/chat.cpp
   src/benchmark.cpp
   src/scheduler.cpp
-  src/prompt.cpp
   src/grpc_server.cpp
   src/safetensors.cpp
-  src/tokenizer.cpp
-  src/model.cu
   src/kernels.cu
+  src/model/model.cu
+  src/model/tokenizer.cpp
+  src/model/prompt.cpp
   ${PROTO_SRCS}
 )
 target_include_directories(flashqwen PRIVATE src third_party ${GEN_DIR})  # third_party: RapidJSON + CLI11

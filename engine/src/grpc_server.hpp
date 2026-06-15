@@ -3,8 +3,8 @@
 // tokenises, runs continuous-batched generation, detects tool calls at the token level, and
 // streams typed events (text deltas / tool calls / done) back over a server-streaming RPC.
 #pragma once
-#include "model.hpp"
-#include "tokenizer.hpp"
+#include "model/model.hpp"
+#include "model/tokenizer.hpp"
 #include <string>
 #include <random>
 

@@ -1,7 +1,7 @@
 // Interactive multi-turn chat loop (default mode).
 #pragma once
-#include "model.hpp"
-#include "tokenizer.hpp"
+#include "model/model.hpp"
+#include "model/tokenizer.hpp"
 #include "sampler.hpp"
 #include <random>
 

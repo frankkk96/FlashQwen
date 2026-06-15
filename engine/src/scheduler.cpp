@@ -1,5 +1,5 @@
 #include "scheduler.hpp"
-#include "special_tokens.hpp"
+#include "model/special_tokens.hpp"
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>

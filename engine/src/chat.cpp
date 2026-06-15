@@ -1,6 +1,6 @@
 #include "chat.hpp"
 #include "generate.hpp"
-#include "prompt.hpp"
+#include "model/prompt.hpp"
 #include <cstdio>
 #include <iostream>
 #include <string>

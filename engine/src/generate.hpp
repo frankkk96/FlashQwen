@@ -5,8 +5,8 @@
 // token is fed back through the model, the cache always holds the full prefix (which is
 // what makes multi-turn chat work).
 #pragma once
-#include "model.hpp"
-#include "tokenizer.hpp"
+#include "model/model.hpp"
+#include "model/tokenizer.hpp"
 #include "sampler.hpp"
 #include <vector>
 #include <random>

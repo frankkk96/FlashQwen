@@ -4,8 +4,8 @@
 //   ./flashqwen benchmark --model DIR       # benchmark (TTFT / TPOT / tok/s)
 //   ./flashqwen --help                      # usage + supported models
 //
-#include "model.hpp"
-#include "tokenizer.hpp"
+#include "model/model.hpp"
+#include "model/tokenizer.hpp"
 #include "sampler.hpp"
 #include "cli.hpp"
 #include "chat.hpp"
