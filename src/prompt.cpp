@@ -1,6 +1,17 @@
-#include "chat_template.hpp"
+#include "prompt.hpp"
 #include "rapidjson/stringbuffer.h"
 #include "rapidjson/writer.h"
+
+void append_user_turn(std::string& out, const std::string& content) {
+    out += "<|im_start|>user\n";
+    out += content;
+    out += "<|im_end|>\n";
+}
+
+void append_assistant_header(std::string& out, bool enable_thinking) {
+    out += "<|im_start|>assistant\n";
+    if (!enable_thinking) out += "<think>\n\n</think>\n\n";
+}
 
 // Serialize one tool as the OpenAI tool object Qwen3 expects inside <tools>:
 //   {"type":"function","function":{"name":..,"description":..,"parameters":<schema>}}
@@ -22,7 +33,7 @@ static std::string tool_json(const ChatToolDef& t) {
     return std::string(sb.GetString(), sb.GetSize());
 }
 
-std::string render_chatml(const std::vector<ChatMessage>& msgs,
+std::string render_prompt(const std::vector<ChatMessage>& msgs,
                           const std::vector<ChatToolDef>& tools, bool enable_thinking) {
     std::string b;
     bool has_system = !msgs.empty() && msgs[0].role == "system";
@@ -44,7 +55,7 @@ std::string render_chatml(const std::vector<ChatMessage>& msgs,
     for (size_t i = start; i < msgs.size(); ++i) {
         const ChatMessage& m = msgs[i];
         if (m.role == "user") {
-            b += "<|im_start|>user\n"; b += m.content; b += "<|im_end|>\n";
+            append_user_turn(b, m.content);
         } else if (m.role == "assistant") {
             b += "<|im_start|>assistant\n"; b += m.content;
             for (const auto& tc : m.tool_calls) {
@@ -63,7 +74,6 @@ std::string render_chatml(const std::vector<ChatMessage>& msgs,
         }
     }
 
-    b += "<|im_start|>assistant\n";
-    if (!enable_thinking) b += "<think>\n\n</think>\n\n";
+    append_assistant_header(b, enable_thinking);
     return b;
 }

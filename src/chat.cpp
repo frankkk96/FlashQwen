@@ -1,17 +1,20 @@
 #include "chat.hpp"
 #include "generate.hpp"
+#include "prompt.hpp"
 #include <cstdio>
 #include <iostream>
 #include <string>
 #include <vector>
 
-// Build the ChatML text to append for one user turn. For turns after the first, a leading
-// <|im_end|> closes the previous assistant reply.
+// Build the ChatML text to append for one user turn (incremental: only the new turn is encoded,
+// since the KV cache persists across turns). For turns after the first, a leading <|im_end|>
+// closes the previous, streamed assistant reply. The turn/header markers come from prompt.* so
+// the format lives in one place.
 static std::string user_chunk(const std::string& msg, bool first, bool think) {
     std::string s;
-    if (!first) s += "<|im_end|>\n";
-    s += "<|im_start|>user\n" + msg + "<|im_end|>\n<|im_start|>assistant\n";
-    if (!think) s += "<think>\n\n</think>\n\n";
+    if (!first) s += "<|im_end|>\n";        // close the previous (streamed) assistant reply
+    append_user_turn(s, msg);
+    append_assistant_header(s, think);
     return s;
 }
 

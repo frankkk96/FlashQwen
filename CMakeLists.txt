@@ -64,7 +64,7 @@ add_executable(flashqwen
   src/chat.cpp
   src/benchmark.cpp
   src/scheduler.cpp
-  src/chat_template.cpp
+  src/prompt.cpp
   src/grpc_server.cpp
   src/safetensors.cpp
   src/tokenizer.cpp

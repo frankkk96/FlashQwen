@@ -1,6 +1,6 @@
 #include "grpc_server.hpp"
 #include "scheduler.hpp"
-#include "chat_template.hpp"
+#include "prompt.hpp"
 #include "rapidjson/document.h"
 #include "rapidjson/stringbuffer.h"
 #include "rapidjson/writer.h"
@@ -163,7 +163,7 @@ public:
         for (const auto& t : req->tools())
             tools.push_back({t.name(), t.description(), t.parameters_json()});
 
-        std::string prompt = render_chatml(msgs, tools, req->enable_thinking());
+        std::string prompt = render_prompt(msgs, tools, req->enable_thinking());
 
         auto c = std::make_shared<RequestCtx>();
         c->req.prompt = eng_.tok.encode(prompt);
