@@ -28,7 +28,7 @@ INT8 in memory at load.
 ### Build
 
 ```bash
-cmake -B build -DCMAKE_BUILD_TYPE=Release
+cmake -B build -S engine -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j
 ```
 
@@ -113,17 +113,17 @@ each gain came from.
 The whole **inference stack** — tokenizer, safetensors loading, every CUDA kernel — is
 hand-written against only the **C++ standard library**, the **CUDA Runtime** (toolkit-bundled),
 and **POSIX**. The only third-party code is header-only **utility** parsing, vendored under
-`third_party/` (so a plain `cmake --build` still works offline): RapidJSON for the few JSON files
+`engine/third_party/` (so a plain `cmake --build` still works offline): RapidJSON for the few JSON files
 and CLI11 for argument parsing — neither touches a tensor. The optional Go API gateway
 (`api/`) additionally uses Gin.
 
 | usually a library | here |
 |---|---|
-| HF tokenizers / sentencepiece | hand-written byte-level BPE `src/tokenizer.*` |
-| safetensors C++ lib | hand-written `src/safetensors.*` (mmap + header parse) |
+| HF tokenizers / sentencepiece | hand-written byte-level BPE `engine/src/tokenizer.*` |
+| safetensors C++ lib | hand-written `engine/src/safetensors.*` (mmap + header parse) |
 | cuBLAS / CUTLASS | hand-written matmul (tensor-core WMMA for prefill, GEMV for decode) |
 | PyTorch (any DL framework) | not used |
-| JSON / arg parsing | RapidJSON + CLI11 (header-only, `third_party/`) — utility only |
+| JSON / arg parsing | RapidJSON + CLI11 (header-only, `engine/third_party/`) — utility only |
 
 - C++ stdlib: `<vector> <string> <unordered_map> <chrono> <random> <cmath> <fstream>` …
 - CUDA: `<cuda_runtime.h>`, `<cuda_bf16.h>` — **no** cuBLAS / cuDNN / cuRAND / Thrust.
@@ -138,26 +138,26 @@ dispatches. Roughly 1940 lines total.
 
 | file | role | lines |
 |---|---|---:|
-| `src/main.cpp` | entry point: argument parsing + dispatch | 69 |
-| `src/cli.cpp` / `.hpp` | architecture check + `--help` | 63 |
-| `src/chat.cpp` / `.hpp` | interactive multi-turn chat | 55 |
-| `src/benchmark.cpp` / `.hpp` | benchmark mode (input-length sweep) | 92 |
-| `src/generate.cpp` / `.hpp` | shared prefill + decode loop | 66 |
-| `src/sampler.cpp` / `.hpp` | token sampling (greedy / temp / top-p) | 50 |
+| `engine/src/main.cpp` | entry point: argument parsing + dispatch | 69 |
+| `engine/src/cli.cpp` / `.hpp` | architecture check + `--help` | 63 |
+| `engine/src/chat.cpp` / `.hpp` | interactive multi-turn chat | 55 |
+| `engine/src/benchmark.cpp` / `.hpp` | benchmark mode (input-length sweep) | 92 |
+| `engine/src/generate.cpp` / `.hpp` | shared prefill + decode loop | 66 |
+| `engine/src/sampler.cpp` / `.hpp` | token sampling (greedy / temp / top-p) | 50 |
 
 **Core engine**
 
 | file | role | lines |
 |---|---|---:|
-| `src/model.cu` / `.hpp` | weight loading (INT8 quant) + forward + KV cache + CUDA graph | 331 |
-| `src/kernels.cu` / `.cuh` | CUDA kernels (INT8 GEMV / WMMA matmul, attention, split-K, …) | 431 |
-| `src/tokenizer.cpp` / `.hpp` | byte-level BPE encode/decode | 394 |
-| `src/safetensors.cpp` / `.hpp` | mmap + `.safetensors` header parse (RapidJSON) | 105 |
-| `src/config.hpp` | parse `config.json` (RapidJSON) | 45 |
-| `CMakeLists.txt` | build | 36 |
+| `engine/src/model.cu` / `.hpp` | weight loading (INT8 quant) + forward + KV cache + CUDA graph | 331 |
+| `engine/src/kernels.cu` / `.cuh` | CUDA kernels (INT8 GEMV / WMMA matmul, attention, split-K, …) | 431 |
+| `engine/src/tokenizer.cpp` / `.hpp` | byte-level BPE encode/decode | 394 |
+| `engine/src/safetensors.cpp` / `.hpp` | mmap + `.safetensors` header parse (RapidJSON) | 105 |
+| `engine/src/config.hpp` | parse `config.json` (RapidJSON) | 45 |
+| `engine/CMakeLists.txt` | build | 37 |
 
-The continuous-batching serving path (`src/scheduler.*`, `src/server.*`) and the Go API
-gateway (`api/`) are described in their own sections below.
+The continuous-batching serving path (`engine/src/scheduler.*`, `engine/src/grpc_server.*`,
+`engine/src/prompt.*`) and the Go API gateway (`api/`) are described in their own sections below.
 
 Notably, the hand-written tokenizer is ~394 lines, and the actual neural network — CUDA
 kernels (431) + forward (331) — is ~760 lines, with the growth coming from the optimization
@@ -190,7 +190,7 @@ little prefill TTFT for the decode win.) Reproduce any stage:
 
 ```bash
 git checkout bench-1-wmma     # or bench-0-scalar … bench-4-gemv
-cmake -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build -j8
+cmake -B build -S engine -DCMAKE_BUILD_TYPE=Release && cmake --build build -j8
 ./build/flashqwen benchmark --model models/qwen3-8b
 ```
 
@@ -301,7 +301,7 @@ weight dequant write (~14 GB, batch-independent) dominated. Left as future work.
 `decode`, which takes an arbitrary running set (per-sequence KV slot + `past_len`). So "static"
 vs "continuous" is a host-side *scheduling policy*, not a separate engine mode. Naive (static)
 batching holds a fixed group's slots until its *slowest* sequence finishes, leaving short
-requests idle behind long ones (head-of-line blocking). Continuous batching (`src/scheduler.*`)
+requests idle behind long ones (head-of-line blocking). Continuous batching (`engine/src/scheduler.*`)
 instead keeps `n_slots` busy: admit a waiting request the instant a slot frees, and decode the
 whole running set each step. On a varied-length workload it measured ~1.4× faster than the
 static baseline, so continuous batching is the only serving path kept. Each request carries its
@@ -333,7 +333,7 @@ sequences is decoupled from `max_ctx`. On the 4090 the same VRAM becomes a **520
 The three KV kernels are reworked to address through the block table (the arithmetic is otherwise
 identical to the contiguous version): `store_kv_paged` (shared by prefill and decode),
 `attention_paged` (prefill), and the split-K `attention_decode_paged`. The scheduler
-(`src/scheduler.*`) owns a free-block list and grows each running sequence's block table across
+(`engine/src/scheduler.*`) owns a free-block list and grows each running sequence's block table across
 BLOCK boundaries. When the pool is exhausted it **preempts** the youngest running sequence —
 frees its blocks and requeues it — and **recomputes** its KV from `prompt + output` when it is
 later resumed (the same recomputation policy vLLM uses). This keeps the engine correct under
@@ -347,7 +347,7 @@ reproduce the reference output exactly. Chat runs as `B=1` over an identity bloc
 
 ```bash
 git checkout feature/batching
-cmake -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build -j8
+cmake -B build -S engine -DCMAKE_BUILD_TYPE=Release && cmake --build build -j8
 ./build/flashqwen benchmark --model models/qwen3-8b   # adds static-batch + continuous sweeps
 ```
 
@@ -370,9 +370,9 @@ so Go does serving and C++ does the model — the boundary is a **gRPC** service
   GPU
 ```
 
-The contract is `proto/inference.proto`. The **C++ engine** (`flashqwen serve`, `src/grpc_server.cpp`)
+The contract is `proto/inference.proto`. The **C++ engine** (`flashqwen serve`, `engine/src/grpc_server.cpp`)
 owns everything model-specific: it receives structured messages + tools, renders the Qwen3 ChatML
-template (`src/chat_template.cpp`), tokenises, runs the continuous-batching `Scheduler` on a single
+template (`engine/src/prompt.cpp`), tokenises, runs the continuous-batching `Scheduler` on a single
 GPU thread, and detects tool calls at the **token level** (`<tool_call>`/`</tool_call>` are special
 tokens), emitting typed `TextDelta` / `ToolCall` / `Done` events. The **Go gateway** (`api/`) is a
 thin adapter: it maps the OpenAI request to a `GenerateRequest`, streams events back as SSE chunks

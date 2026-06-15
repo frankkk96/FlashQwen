@@ -39,16 +39,18 @@ else()
   find_program(GRPC_PLUGIN_BIN grpc_cpp_plugin REQUIRED)
 endif()
 
-# Generate the protobuf + gRPC C++ stubs from proto/inference.proto into the build tree.
+# Generate the protobuf + gRPC C++ stubs from the shared proto (kept at the repo root, since the
+# Go gateway generates from it too) into the build tree.
 set(GEN_DIR ${CMAKE_BINARY_DIR}/gen)
 file(MAKE_DIRECTORY ${GEN_DIR})
-set(PROTO ${CMAKE_SOURCE_DIR}/proto/inference.proto)
+set(PROTO_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../proto)
+set(PROTO ${PROTO_DIR}/inference.proto)
 set(PROTO_SRCS ${GEN_DIR}/inference.pb.cc ${GEN_DIR}/inference.grpc.pb.cc)
 set(PROTO_HDRS ${GEN_DIR}/inference.pb.h  ${GEN_DIR}/inference.grpc.pb.h)
 add_custom_command(
   OUTPUT ${PROTO_SRCS} ${PROTO_HDRS}
   COMMAND ${PROTOC_BIN}
-          -I ${CMAKE_SOURCE_DIR}/proto
+          -I ${PROTO_DIR}
           --cpp_out=${GEN_DIR}
           --grpc_out=${GEN_DIR}
           --plugin=protoc-gen-grpc=${GRPC_PLUGIN_BIN}
