@@ -18,6 +18,14 @@ Scheduler::Scheduler(Model& model, int n_slots, bool stop_on_eos, std::mt19937& 
 
 void Scheduler::add(Request* r) { waiting_.push_back(r); }
 
+void Scheduler::remove(Request* r) {
+    for (auto it = waiting_.begin(); it != waiting_.end(); ++it)
+        if (*it == r) { waiting_.erase(it); return; }
+    if (pf_ == r) { release(r); pf_ = nullptr; return; }
+    for (auto it = running_.begin(); it != running_.end(); ++it)
+        if (*it == r) { release(r); running_.erase(it); return; }
+}
+
 bool Scheduler::finished(const Request* r) const {
     if ((int)r->output.size() >= r->max_new) return true;
     if (stop_on_eos_ && !r->output.empty() && (r->cur == EOS1 || r->cur == EOS2)) return true;

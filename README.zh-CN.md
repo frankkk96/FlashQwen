@@ -315,37 +315,45 @@ cmake -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build -j8
 
 ## OpenAI 兼容 API 服务(Go 网关,`feature/api-server`)
 
-把引擎通过 OpenAI Chat Completions API 暴露出来的双进程方案:
+把引擎通过 OpenAI Chat Completions API 暴露出来的双进程方案——Go 管服务、C++ 管模型,边界是 **gRPC**:
 
 ```
 [OpenAI 客户端]
    | HTTP /v1/chat/completions (SSE)
    v
-[Go + Gin 网关]   OpenAI 协议、Qwen3 chat 模板、tool_call 解析、SSE
-   | Unix socket, 按行 JSON   {prompt,max_tokens,temperature,top_p} -> {delta}.. {done}
+[Go + Gin 网关]   OpenAI 协议 <-> gRPC、SSE   (对模型零知识)
+   | gRPC server-streaming   GenerateRequest{messages,tools,params} ->
+   |   TextDelta / ToolCall / Done 事件流
    v
-[C++ flashqwen serve]   分词 -> 连续批处理 decode -> 反分词
+[C++ flashqwen serve]   Qwen3 模板 -> 分词 -> 连续批处理 decode
+   |                     -> 反分词 -> token 级工具调用识别
    v
   GPU
 ```
 
-分工让两边各做擅长的事。**C++ 引擎**(`flashqwen serve`,`src/server.cpp`)只加载一次模型并常驻:
-accept 线程每个连接读一个请求并分词;单独一个引擎线程(唯一碰 GPU 的线程)驱动连续批处理
-`Scheduler`,把 token 增量按连接流式写回。**Go 网关**(`api/`)负责所有 OpenAI 形态的东西——
-把消息列表渲染成 Qwen3 ChatML 模板(system / tools / 多轮、可选 `<think>` 块),把纯文本转发给引擎,
-把回复作为 SSE chunk 流式吐出,并把 Qwen3 的 `<tool_call>` 块解析成 OpenAI `tool_calls`。采样是
-temperature + top-p(OpenAI 的参数面,没有 top-k)。每个 HTTP 请求是一条独立序列,所以一个批处理
-引擎可以并发服务多个客户端。
+契约是 `proto/inference.proto`。**C++ 引擎**(`flashqwen serve`,`src/grpc_server.cpp`)拥有所有模型
+相关的东西:接收结构化 messages + tools,渲染 Qwen3 ChatML 模板(`src/chat_template.cpp`),分词,在
+单个 GPU 线程上跑连续批处理 `Scheduler`,并在 **token 级**识别工具调用(`<tool_call>`/`</tool_call>`
+是特殊 token),吐出 `TextDelta` / `ToolCall` / `Done` 三种事件。**Go 网关**(`api/`)是个薄适配层:
+把 OpenAI 请求映射成 `GenerateRequest`,把事件作为 SSE chunk 流式吐出或攒成一整条,并报告 usage——
+它**不含 chat 模板、也不解析工具格式**,所以换模型完全不用动 Go。gRPC 取消已打通:客户端断开 → RPC
+取消 → 引擎丢弃在途序列(释放其 KV)。采样是 temperature + top-p。每个请求是独立序列,多客户端共享同一个
+批处理引擎。
 
 **运行**(两个终端):
 
 ```bash
-# 1) 引擎(C++):加载模型,监听 Unix socket
-./build/flashqwen serve --model models/qwen3-8b --socket /tmp/flashqwen.sock --slots 16
+# 1) 引擎(C++):加载模型,提供 gRPC 服务
+./build/flashqwen serve --model models/qwen3-8b --address 127.0.0.1:50051 --slots 16
 
-# 2) 网关(Go):在 :8000 上说 OpenAI 协议,转发给引擎
-cd api && go build -o flashqwen-api . && ./flashqwen-api --socket /tmp/flashqwen.sock --addr :8000
+# 2) 网关(Go):在 :8000 上说 OpenAI 协议,经 gRPC 转发给引擎
+cd api && go build -o flashqwen-api . && ./flashqwen-api --engine 127.0.0.1:50051 --addr :8000
 ```
+
+编译引擎需要 gRPC + Protobuf C++(CMake 自动探测 `find_package(gRPC CONFIG)` 安装,例如装到
+`/usr/local` 的源码构建;否则回退到发行版的 `libgrpc++-dev` 走 pkg-config)。Go 侧用 `go mod` 拉
+`google.golang.org/grpc`。改了 proto 后重新生成:C++ stub 由 CMake 构建时用 `protoc` 生成,Go stub
+在 `api/pb/`。
 
 之后任意 OpenAI 客户端都能用(`base_url=http://localhost:8000/v1`):
 

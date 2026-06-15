@@ -7,14 +7,15 @@ import (
 	"strings"
 	"time"
 
+	pb "flashqwen-api/pb"
 	"github.com/gin-gonic/gin"
 )
 
-// Server holds the gateway config: where the C++ engine socket is and the model id to report.
+// Server is the OpenAI gateway: it holds the gRPC client to the engine and the model id.
 type Server struct {
-	socket string
-	model  string
-	idSeq  int
+	eng   *engineClient
+	model string
+	idSeq int
 }
 
 func (s *Server) newID() string {
@@ -23,25 +24,23 @@ func (s *Server) newID() string {
 }
 
 func (s *Server) listModels(c *gin.Context) {
+	id := s.model
+	if got, err := s.eng.modelID(c.Request.Context()); err == nil && got != "" {
+		id = got
+	}
 	c.JSON(http.StatusOK, ModelList{
 		Object: "list",
-		Data:   []Model{{ID: s.model, Object: "model", Created: time.Now().Unix(), OwnedBy: "flashqwen"}},
+		Data:   []Model{{ID: id, Object: "model", Created: time.Now().Unix(), OwnedBy: "flashqwen"}},
 	})
 }
 
-// buildEngineReq maps an OpenAI request to the engine protocol (defaults: greedy, no nucleus cut).
-func (s *Server) buildEngineReq(req ChatRequest) engineReq {
-	er := engineReq{Prompt: renderPrompt(req), MaxTokens: req.MaxTokens, Temperature: 0, TopP: 1.0}
-	if er.MaxTokens <= 0 {
-		er.MaxTokens = 512
+func pbToolCalls(tcs []*pb.ToolCall) []ToolCall {
+	out := make([]ToolCall, 0, len(tcs))
+	for _, tc := range tcs {
+		out = append(out, ToolCall{ID: tc.Id, Type: "function",
+			Function: ToolCallFunction{Name: tc.Name, Arguments: tc.ArgumentsJson}})
 	}
-	if req.Temperature != nil {
-		er.Temperature = *req.Temperature
-	}
-	if req.TopP != nil {
-		er.TopP = *req.TopP
-	}
-	return er
+	return out
 }
 
 func (s *Server) chatCompletions(c *gin.Context) {
@@ -54,44 +53,48 @@ func (s *Server) chatCompletions(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": gin.H{"message": "messages is required", "type": "invalid_request_error"}})
 		return
 	}
-	er := s.buildEngineReq(req)
+	g := toGenerateRequest(req)
 	if req.Stream {
-		s.streamChat(c, req, er)
+		s.streamChat(c, g)
 	} else {
-		s.blockingChat(c, req, er)
+		s.blockingChat(c, g)
 	}
 }
 
-func (s *Server) blockingChat(c *gin.Context, req ChatRequest, er engineReq) {
+func (s *Server) blockingChat(c *gin.Context, g *pb.GenerateRequest) {
 	var sb strings.Builder
-	fin, err := generate(s.socket, er, func(d string) { sb.WriteString(d) })
+	var calls []ToolCall
+	done, err := s.eng.generate(c.Request.Context(), g,
+		func(t string) { sb.WriteString(t) },
+		func(tc *pb.ToolCall) {
+			calls = append(calls, ToolCall{ID: tc.Id, Type: "function",
+				Function: ToolCallFunction{Name: tc.Name, Arguments: tc.ArgumentsJson}})
+		})
 	if err != nil {
 		c.JSON(http.StatusBadGateway, gin.H{"error": gin.H{"message": "engine: " + err.Error(), "type": "engine_error"}})
 		return
 	}
-	calls, clean := extractToolCalls(sb.String())
-
 	msg := RespMessage{Role: "assistant"}
-	reason := fin.FinishReason
 	if len(calls) > 0 {
 		msg.ToolCalls = calls
-		reason = "tool_calls"
-		if clean != "" {
-			msg.Content = &clean
+		if sb.Len() > 0 {
+			t := sb.String()
+			msg.Content = &t
 		}
 	} else {
-		full := sb.String()
-		msg.Content = &full
+		t := sb.String()
+		msg.Content = &t
 	}
+	reason := done.FinishReason
 	c.JSON(http.StatusOK, ChatCompletion{
 		ID: s.newID(), Object: "chat.completion", Created: time.Now().Unix(), Model: s.model,
 		Choices: []Choice{{Index: 0, Message: &msg, FinishReason: &reason}},
-		Usage: &Usage{PromptTokens: fin.PromptTokens, CompletionTokens: fin.CompletionTokens,
-			TotalTokens: fin.PromptTokens + fin.CompletionTokens},
+		Usage: &Usage{PromptTokens: int(done.PromptTokens), CompletionTokens: int(done.CompletionTokens),
+			TotalTokens: int(done.PromptTokens + done.CompletionTokens)},
 	})
 }
 
-func (s *Server) streamChat(c *gin.Context, req ChatRequest, er engineReq) {
+func (s *Server) streamChat(c *gin.Context, g *pb.GenerateRequest) {
 	c.Header("Content-Type", "text/event-stream")
 	c.Header("Cache-Control", "no-cache")
 	c.Header("Connection", "keep-alive")
@@ -102,7 +105,6 @@ func (s *Server) streamChat(c *gin.Context, req ChatRequest, er engineReq) {
 	}
 	id := s.newID()
 	created := time.Now().Unix()
-
 	chunk := func(delta *RespMessage, reason *string) {
 		cc := ChatCompletion{ID: id, Object: "chat.completion.chunk", Created: created, Model: s.model,
 			Choices: []Choice{{Index: 0, Delta: delta, FinishReason: reason}}}
@@ -112,34 +114,14 @@ func (s *Server) streamChat(c *gin.Context, req ChatRequest, er engineReq) {
 	}
 
 	chunk(&RespMessage{Role: "assistant"}, nil) // opening chunk carries the role
-
-	if len(req.Tools) == 0 {
-		// True token-by-token streaming when no tool parsing is needed.
-		fin, err := generate(s.socket, er, func(d string) { chunk(&RespMessage{Content: &d}, nil) })
-		reason := fin.FinishReason
-		if err != nil {
-			reason = "stop"
-		}
-		chunk(&RespMessage{}, &reason)
-	} else {
-		// Tool calls need the whole completion, so buffer then emit once.
-		var sb strings.Builder
-		fin, _ := generate(s.socket, er, func(d string) { sb.WriteString(d) })
-		calls, clean := extractToolCalls(sb.String())
-		reason := fin.FinishReason
-		if len(calls) > 0 {
-			reason = "tool_calls"
-			d := &RespMessage{ToolCalls: calls}
-			if clean != "" {
-				d.Content = &clean
-			}
-			chunk(d, nil)
-		} else {
-			full := sb.String()
-			chunk(&RespMessage{Content: &full}, nil)
-		}
-		chunk(&RespMessage{}, &reason)
+	done, err := s.eng.generate(c.Request.Context(), g,
+		func(t string) { d := t; chunk(&RespMessage{Content: &d}, nil) },
+		func(tc *pb.ToolCall) { chunk(&RespMessage{ToolCalls: pbToolCalls([]*pb.ToolCall{tc})}, nil) })
+	reason := "stop"
+	if err == nil && done != nil {
+		reason = done.FinishReason
 	}
+	chunk(&RespMessage{}, &reason)
 	fmt.Fprint(c.Writer, "data: [DONE]\n\n")
 	flusher.Flush()
 }

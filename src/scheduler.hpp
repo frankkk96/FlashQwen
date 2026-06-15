@@ -37,6 +37,7 @@ public:
     Scheduler(Model& model, int n_slots, bool stop_on_eos, std::mt19937& rng);
 
     void add(Request* r);           // enqueue a new request (not yet prefilled)
+    void remove(Request* r);        // drop a request (cancellation); frees its blocks. Engine-thread only.
     bool busy() const { return !waiting_.empty() || !running_.empty() || pf_ != nullptr; }
 
     using TokenFn  = std::function<void(Request*, int)>;   // fired per produced token id
