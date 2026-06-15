@@ -5,12 +5,20 @@
 #include <algorithm>
 #include <vector>
 #include <random>
+#include <chrono>
 
 // Fixed sweep configuration.
 static const std::vector<int> INPUT_LENS = {16, 128, 512, 1024};  // prompt lengths (tokens)
+static const std::vector<int> BATCH_INPUT_LENS = {128, 512, 1024};// 2D sweep prompt lengths
+static const std::vector<int> BATCH_SIZES = {1, 8, 16};           // 2D sweep batch sizes
 static const int OUTPUT_LEN = 128;                                // tokens generated per run
 static const int WARMUP     = 1;                                  // untimed runs
 static const int REPEAT     = 3;                                  // measured runs -> median
+
+using Clock = std::chrono::steady_clock;
+static double ms_since(Clock::time_point t) {
+    return std::chrono::duration<double, std::milli>(Clock::now() - t).count();
+}
 
 static double median(std::vector<double> v) {
     if (v.empty()) return 0.0;
@@ -44,12 +52,32 @@ static std::vector<int> make_prompt(int n, int vocab, std::mt19937& rng) {
     return ids;
 }
 
-int run_benchmark(Model& model, const Tokenizer& tok, int max_ctx) {
-    SampleParams sp{0.0f, 1.0f, 0};   // greedy: timing shouldn't depend on sampling
-    std::mt19937 rng(1234);
-    int vocab = model.config().vocab_size;
+// One static-batch run: prefill B sequences (each `input_len` tokens) into slots 0..B-1, then
+// decode all B in lock-step for `steps` tokens. Returns total decode wall time (ms).
+static double batch_decode_ms(Model& model, int input_len, int B, int steps,
+                              int vocab, std::mt19937& rng) {
+    std::vector<std::vector<int>> prompts(B);
+    std::vector<int> cur(B), past(B), slots(B), out;
+    for (int b = 0; b < B; ++b) {
+        prompts[b] = make_prompt(input_len, vocab, rng);
+        model.prefill(prompts[b], /*slot=*/b, /*past_len=*/0);
+        cur[b]  = model.argmax_last();   // first generated token for sequence b
+        past[b] = input_len;
+        slots[b] = b;
+    }
+    auto t0 = Clock::now();
+    for (int s = 0; s < steps; ++s) {
+        model.decode(cur, past, slots, out);
+        for (int b = 0; b < B; ++b) past[b] += 1;
+        cur = out;
+    }
+    return ms_since(t0);
+}
 
-    std::fprintf(stderr, "[benchmark: output %d tok, warmup %d, repeat %d (median), batch 1]\n\n",
+// Section 1: single-sequence latency sweep (batch 1). TTFT / TPOT / throughput vs prompt length.
+static void single_seq_sweep(Model& model, const Tokenizer& tok, int max_ctx, int vocab,
+                             SampleParams sp, std::mt19937& rng) {
+    std::fprintf(stderr, "[1] single-sequence latency (batch 1, output %d tok, warmup %d, median of %d)\n\n",
                  OUTPUT_LEN, WARMUP, REPEAT);
     std::fprintf(stderr, "  input    TTFT      TPOT     decode     output      peak\n");
     std::fprintf(stderr, "  (tok)    (ms)    (ms/tok)  (tok/s)    (tok/s)    (tok/s)\n");
@@ -60,7 +88,6 @@ int run_benchmark(Model& model, const Tokenizer& tok, int max_ctx) {
             continue;
         }
         std::vector<int> ids = make_prompt(isl, vocab, rng);
-
         auto one_run = [&]() {
             int past = 0;
             return generate(model, tok, ids, past, OUTPUT_LEN, sp, rng,
@@ -77,5 +104,45 @@ int run_benchmark(Model& model, const Tokenizer& tok, int max_ctx) {
         std::fprintf(stderr, "  %5d  %8.1f  %7.2f  %8.1f  %9.1f  %9.1f\n",
                      isl, median(ttft), median(tpot), median(dtps), median(otps), median(ptps));
     }
+}
+
+// Section 2: static-batch decode throughput. For each (prompt length, batch) the per-sequence
+// TPOT and the aggregate decode throughput (all sequences together) show the batching win.
+static void batch_sweep(Model& model, int max_ctx, int vocab, std::mt19937& rng) {
+    int max_b = model.max_batch();
+    std::fprintf(stderr, "\n[2] static-batch decode throughput (output %d tok/seq, median of %d, "
+                 "max batch %d)\n\n", OUTPUT_LEN, REPEAT, max_b);
+    std::fprintf(stderr, "  input   batch    TPOT/seq    aggregate\n");
+    std::fprintf(stderr, "  (tok)            (ms/tok)     (tok/s)\n");
+
+    for (int isl : BATCH_INPUT_LENS) {
+        if (isl + OUTPUT_LEN >= max_ctx) {
+            std::fprintf(stderr, "  %5d   (skipped: input+output exceeds max-ctx %d)\n", isl, max_ctx);
+            continue;
+        }
+        for (int B : BATCH_SIZES) {
+            if (B > max_b) {
+                std::fprintf(stderr, "  %5d  %5d   (skipped: exceeds max batch %d)\n", isl, B, max_b);
+                continue;
+            }
+            batch_decode_ms(model, isl, B, OUTPUT_LEN, vocab, rng);   // warmup
+            std::vector<double> tpot, agg;
+            for (int r = 0; r < REPEAT; ++r) {
+                double dec = batch_decode_ms(model, isl, B, OUTPUT_LEN, vocab, rng);
+                tpot.push_back(dec / OUTPUT_LEN);
+                agg.push_back((double)B * OUTPUT_LEN / (dec / 1000.0));
+            }
+            std::fprintf(stderr, "  %5d  %5d   %8.2f  %11.1f\n", isl, B, median(tpot), median(agg));
+        }
+    }
+}
+
+int run_benchmark(Model& model, const Tokenizer& tok, int max_ctx) {
+    SampleParams sp{0.0f, 1.0f, 0};   // greedy: timing shouldn't depend on sampling
+    std::mt19937 rng(1234);
+    int vocab = model.config().vocab_size;
+
+    single_seq_sweep(model, tok, max_ctx, vocab, sp, rng);
+    batch_sweep(model, max_ctx, vocab, rng);
     return 0;
 }

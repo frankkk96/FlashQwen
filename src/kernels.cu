@@ -99,6 +99,65 @@ void launch_matmul(const float* x, const int8_t* W, const float* scale, float* y
 }
 
 // ---------------------------------------------------------------------------------------
+// Batched decode GEMV: y[B,OUT] = x[B,IN] @ W[OUT,IN]^T. One warp per output row reads the
+// INT8 weight row ONCE (16-byte loads) and computes all B dot products, so weight traffic is
+// amortized across the batch — this is what makes batched decode faster per token than B
+// separate single-token GEMVs. B is a compile-time template so the acc[] array stays in
+// registers (a runtime-bounded array would spill to local memory). Requires IN % 16 == 0.
+// ---------------------------------------------------------------------------------------
+template<int B>
+__global__ void gemv_batch_kernel(const float* __restrict__ x, const int8_t* __restrict__ W,
+                                  const float* __restrict__ scale, float* __restrict__ y,
+                                  int IN, int OUT) {
+    int warp = threadIdx.x >> 5;
+    int lane = threadIdx.x & 31;
+    int row = blockIdx.x * (blockDim.x >> 5) + warp;
+    if (row >= OUT) return;
+
+    const int8_t* wr = W + (size_t)row * IN;
+    float acc[B];
+    #pragma unroll
+    for (int b = 0; b < B; ++b) acc[b] = 0.f;
+
+    for (int i = lane * 16; i + 16 <= IN; i += 512) {
+        int4 wpack = *reinterpret_cast<const int4*>(wr + i);     // 16 INT8 weights, read once
+        const int8_t* wb = reinterpret_cast<const int8_t*>(&wpack);
+        #pragma unroll
+        for (int b = 0; b < B; ++b) {
+            const float4* xv = reinterpret_cast<const float4*>(x + (size_t)b * IN + i);
+            #pragma unroll
+            for (int q = 0; q < 4; ++q) {
+                float4 xx = xv[q];
+                acc[b] += xx.x * (float)wb[q*4+0] + xx.y * (float)wb[q*4+1]
+                        + xx.z * (float)wb[q*4+2] + xx.w * (float)wb[q*4+3];
+            }
+        }
+    }
+    #pragma unroll
+    for (int b = 0; b < B; ++b) {
+        #pragma unroll
+        for (int o = 16; o > 0; o >>= 1) acc[b] += __shfl_down_sync(0xffffffff, acc[b], o);
+        if (lane == 0) y[(size_t)b * OUT + row] = acc[b] * scale[row];
+    }
+}
+
+void launch_matmul_decode(const float* x, const int8_t* W, const float* scale, float* y,
+                          int B, int IN, int OUT, cudaStream_t s) {
+    const int warps = 8;
+    int blocks = (OUT + warps - 1) / warps, th = warps * 32;
+    // Round B up to the nearest instantiated template size; extra rows compute from (unused)
+    // activation rows and their outputs are ignored by the caller.
+    #define LAUNCH_GEMV_B(T) gemv_batch_kernel<T><<<blocks, th, 0, s>>>(x, W, scale, y, IN, OUT)
+    if      (B <= 1)  LAUNCH_GEMV_B(1);
+    else if (B <= 2)  LAUNCH_GEMV_B(2);
+    else if (B <= 4)  LAUNCH_GEMV_B(4);
+    else if (B <= 8)  LAUNCH_GEMV_B(8);
+    else if (B <= 16) LAUNCH_GEMV_B(16);
+    else              LAUNCH_GEMV_B(32);
+    #undef LAUNCH_GEMV_B
+}
+
+// ---------------------------------------------------------------------------------------
 // rmsnorm: one block per row, block-reduction over H.
 // ---------------------------------------------------------------------------------------
 __global__ void rmsnorm_kernel(const float* __restrict__ x, const float* __restrict__ w,
@@ -238,6 +297,23 @@ void launch_store_kv(const float* src, bf16* cache, const int* d_past, int kv_di
     store_kv_kernel<<<(n + blk - 1) / blk, blk, 0, s>>>(src, cache, d_past, kv_dim, M);
 }
 
+// Batched store into the [B_max, max_ctx, kv_dim] pool: token m -> slot[m], row rowpos[m].
+__global__ void store_kv_batch_kernel(const float* __restrict__ src, bf16* __restrict__ cache,
+                                      const int* __restrict__ slot, const int* __restrict__ rowpos,
+                                      int kv_dim, int max_ctx, int M) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= M * kv_dim) return;
+    int m = idx / kv_dim, i = idx % kv_dim;
+    size_t row = (size_t)slot[m] * max_ctx + rowpos[m];
+    cache[row * kv_dim + i] = __float2bfloat16(src[idx]);
+}
+
+void launch_store_kv_batch(const float* src, bf16* cache, const int* slot, const int* rowpos,
+                           int kv_dim, int max_ctx, int M, cudaStream_t s) {
+    int n = M * kv_dim, blk = 256;
+    store_kv_batch_kernel<<<(n + blk - 1) / blk, blk, 0, s>>>(src, cache, slot, rowpos, kv_dim, max_ctx, M);
+}
+
 // Flash-decoding phase 1: warp (h, split) does a partial online-softmax over its key chunk.
 // Stores UN-normalized acc plus (m, l) so the combine pass can merge chunks.
 __global__ void attn_decode_split_kernel(const float* __restrict__ q, const bf16* __restrict__ cache_k,
@@ -315,6 +391,88 @@ void launch_attention_decode(const float* q, const bf16* cache_k, const bf16* ca
     attn_decode_combine_kernel<<<n_heads, 32, 0, s>>>(part_m, part_l, part_acc, out, head_dim);
 }
 
+// Batched flash-decoding phase 1: block (h, split, b) does a partial online-softmax over its
+// key chunk of sequence b (slot[b]), attending keys [0, past_len[b]].
+__global__ void attn_decode_split_batch_kernel(
+        const float* __restrict__ q, const bf16* __restrict__ cache_k, const bf16* __restrict__ cache_v,
+        float* __restrict__ part_m, float* __restrict__ part_l, float* __restrict__ part_acc,
+        int n_heads, int n_kv, int head_dim, const int* __restrict__ slot,
+        const int* __restrict__ past_len, int max_ctx, float scale) {
+    constexpr int DPL = 4;
+    int h = blockIdx.x, sp = blockIdx.y, b = blockIdx.z, lane = threadIdx.x;
+    int kvh = h / (n_heads / n_kv);
+    int kv_dim = n_kv * head_dim;
+    int L = past_len[b] + 1;                       // keys [0, past_len[b]]
+    int per = (L + ATTN_SPLITS - 1) / ATTN_SPLITS;
+    int kb = sp * per, ke = min(kb + per, L);
+
+    const bf16* ck = cache_k + (size_t)slot[b] * max_ctx * kv_dim;
+    const bf16* cv = cache_v + (size_t)slot[b] * max_ctx * kv_dim;
+    const float* qv = q + ((size_t)b * n_heads + h) * head_dim;
+    float qreg[DPL], acc[DPL];
+    #pragma unroll
+    for (int i = 0; i < DPL; ++i) { qreg[i] = qv[lane + (i << 5)]; acc[i] = 0.f; }
+    float m_run = -1e30f, l_run = 0.f;
+
+    for (int j = kb; j < ke; ++j) {
+        const bf16* kj = ck + ((size_t)j * n_kv + kvh) * head_dim;
+        float p = 0.f;
+        #pragma unroll
+        for (int i = 0; i < DPL; ++i) p += qreg[i] * __bfloat162float(kj[lane + (i << 5)]);
+        #pragma unroll
+        for (int o = 16; o > 0; o >>= 1) p += __shfl_xor_sync(0xffffffff, p, o);
+        float score = p * scale;
+        float m_new = fmaxf(m_run, score);
+        float corr = __expf(m_run - m_new), pp = __expf(score - m_new);
+        l_run = l_run * corr + pp;
+        const bf16* vj = cv + ((size_t)j * n_kv + kvh) * head_dim;
+        #pragma unroll
+        for (int i = 0; i < DPL; ++i) acc[i] = acc[i] * corr + pp * __bfloat162float(vj[lane + (i << 5)]);
+        m_run = m_new;
+    }
+    int slot_idx = ((size_t)b * n_heads + h) * ATTN_SPLITS + sp;
+    if (lane == 0) { part_m[slot_idx] = m_run; part_l[slot_idx] = l_run; }
+    #pragma unroll
+    for (int i = 0; i < DPL; ++i) part_acc[(size_t)slot_idx * head_dim + lane + (i << 5)] = acc[i];
+}
+
+// Batched flash-decoding phase 2: one warp per (b, head) merges the ATTN_SPLITS partials.
+__global__ void attn_decode_combine_batch_kernel(
+        const float* __restrict__ part_m, const float* __restrict__ part_l,
+        const float* __restrict__ part_acc, float* __restrict__ out, int n_heads, int head_dim) {
+    constexpr int DPL = 4;
+    int h = blockIdx.x, b = blockIdx.y, lane = threadIdx.x;
+    int base = ((size_t)b * n_heads + h) * ATTN_SPLITS;
+    float gm = -1e30f;
+    #pragma unroll
+    for (int sp = 0; sp < ATTN_SPLITS; ++sp) gm = fmaxf(gm, part_m[base + sp]);
+    float gl = 0.f, gacc[DPL];
+    #pragma unroll
+    for (int i = 0; i < DPL; ++i) gacc[i] = 0.f;
+    #pragma unroll
+    for (int sp = 0; sp < ATTN_SPLITS; ++sp) {
+        int slot_idx = base + sp;
+        float w = __expf(part_m[slot_idx] - gm);
+        gl += part_l[slot_idx] * w;
+        #pragma unroll
+        for (int i = 0; i < DPL; ++i) gacc[i] += part_acc[(size_t)slot_idx * head_dim + lane + (i << 5)] * w;
+    }
+    float inv = 1.0f / gl;
+    float* o = out + ((size_t)b * n_heads + h) * head_dim;
+    #pragma unroll
+    for (int i = 0; i < DPL; ++i) o[lane + (i << 5)] = gacc[i] * inv;
+}
+
+void launch_attention_decode_batch(const float* q, const bf16* cache_k, const bf16* cache_v,
+                                   float* out, int B, int n_heads, int n_kv, int head_dim,
+                                   const int* slot, const int* past_len, int max_ctx, float scale,
+                                   float* part_m, float* part_l, float* part_acc, cudaStream_t s) {
+    attn_decode_split_batch_kernel<<<dim3(n_heads, ATTN_SPLITS, B), 32, 0, s>>>(
+        q, cache_k, cache_v, part_m, part_l, part_acc, n_heads, n_kv, head_dim, slot, past_len, max_ctx, scale);
+    attn_decode_combine_batch_kernel<<<dim3(n_heads, B), 32, 0, s>>>(
+        part_m, part_l, part_acc, out, n_heads, head_dim);
+}
+
 // ---------------------------------------------------------------------------------------
 // elementwise helpers
 // ---------------------------------------------------------------------------------------
@@ -360,4 +518,28 @@ __global__ void argmax_kernel(const float* __restrict__ logits, int N, int* __re
 
 void launch_argmax(const float* logits, int N, int* d_out, cudaStream_t s) {
     argmax_kernel<<<1, 256, 0, s>>>(logits, N, d_out);
+}
+
+// Batched argmax: one block per row of logits[B, N]; d_out[b] = argmax over row b.
+__global__ void argmax_batch_kernel(const float* __restrict__ logits, int N, int* __restrict__ out) {
+    __shared__ float sval[256];
+    __shared__ int   sidx[256];
+    int b = blockIdx.x, tid = threadIdx.x;
+    const float* lg = logits + (size_t)b * N;
+    float best = -1e30f; int bi = 0;
+    for (int i = tid; i < N; i += blockDim.x) {
+        float v = lg[i];
+        if (v > best) { best = v; bi = i; }
+    }
+    sval[tid] = best; sidx[tid] = bi;
+    __syncthreads();
+    for (int s = blockDim.x >> 1; s > 0; s >>= 1) {
+        if (tid < s && sval[tid + s] > sval[tid]) { sval[tid] = sval[tid + s]; sidx[tid] = sidx[tid + s]; }
+        __syncthreads();
+    }
+    if (tid == 0) out[b] = sidx[0];
+}
+
+void launch_argmax_batch(const float* logits, int B, int N, int* d_out, cudaStream_t s) {
+    argmax_batch_kernel<<<B, 256, 0, s>>>(logits, N, d_out);
 }

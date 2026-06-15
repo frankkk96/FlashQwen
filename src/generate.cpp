@@ -10,22 +10,20 @@ static double ms_since(Clock::time_point t) {
 
 static const int EOS1 = 151645, EOS2 = 151643;   // <|im_end|>, <|endoftext|>
 
+// Single-sequence streaming generation (interactive chat). Runs as a batch of one through the
+// same prefill + batched-decode path the benchmark uses for many sequences; slot is always 0.
 GenStats generate(Model& model, const Tokenizer& tok, const std::vector<int>& chunk,
                   int& past, int max_gen, const SampleParams& sp, std::mt19937& rng,
                   bool stream, bool stop_on_eos) {
     GenStats st;
     Tokenizer::Stream detok;
+    std::vector<int> out;
 
-    // greedy uses a GPU argmax (copies one int); sampling copies the full logits to host.
-    auto pick = [&]() {
-        return sp.temp <= 0.0f ? model.argmax_last() : sample(model.copy_logits(), sp, rng);
-    };
-
-    // prefill (TTFT)
+    // prefill (TTFT): extend slot 0's sequence by `chunk` at position `past`.
     auto t0 = Clock::now();
-    model.forward(chunk, past);
+    model.prefill(chunk, /*slot=*/0, past);
     past += (int)chunk.size();
-    int next = pick();
+    int next = sp.temp <= 0.0f ? model.argmax_last() : sample(model.copy_logits(), sp, rng);
     st.ttft_ms = ms_since(t0);
 
     // decode: emit the current token, then feed it back to get the next one
@@ -40,9 +38,9 @@ GenStats generate(Model& model, const Tokenizer& tok, const std::vector<int>& ch
         st.n_out++;
 
         auto ts = Clock::now();
-        model.forward({next}, past);
+        model.decode({next}, {past}, {0}, out);   // greedy result in out[0]; logits row 0 too
         past += 1;
-        next = pick();
+        next = sp.temp <= 0.0f ? out[0] : sample(model.copy_logits(), sp, rng);
         st.step_ms.push_back(ms_since(ts));
     }
     return st;

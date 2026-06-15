@@ -77,7 +77,7 @@ Model::QWeight Model::upload_int8(const std::string& name) {
     return qw;
 }
 
-void Model::load(const std::string& dir, int max_ctx) {
+void Model::load(const std::string& dir, int max_ctx, float gpu_mem_fraction) {
     cfg_ = ModelConfig::load(dir + "/config.json");
     max_ctx_ = ((max_ctx + 15) / 16) * 16;   // round up so WMMA tiles never read past buffers
     std::fprintf(stderr, "[model] loading weights from %s ...\n", dir.c_str());
@@ -106,17 +106,9 @@ void Model::load(const std::string& dir, int max_ctx) {
             std::fprintf(stderr, "[model] uploaded layer %d/%d\n", l + 1, cfg_.num_layers);
     }
 
-    // KV cache
-    int kvd = cfg_.kv_dim();
-    cache_k_.resize(cfg_.num_layers);
-    cache_v_.resize(cfg_.num_layers);
-    for (int l = 0; l < cfg_.num_layers; ++l) {
-        CUDA_CHECK(cudaMalloc(&cache_k_[l], (size_t)max_ctx_ * kvd * sizeof(bf16)));
-        CUDA_CHECK(cudaMalloc(&cache_v_[l], (size_t)max_ctx_ * kvd * sizeof(bf16)));
-    }
-
-    // activation scratch
+    // activation scratch (sized to max_ctx tokens; a decode batch is at most MAX_DECODE_B <= that)
     int H = cfg_.hidden_size, QD = cfg_.q_dim(), I = cfg_.intermediate, V = cfg_.vocab_size;
+    int kvd = cfg_.kv_dim(), nh = cfg_.num_heads, hd = cfg_.head_dim;
     auto fmalloc = [&](float** p, size_t n) { CUDA_CHECK(cudaMalloc(p, n * sizeof(float))); };
     fmalloc(&x_,    (size_t)max_ctx_ * H);
     fmalloc(&xb_,   (size_t)max_ctx_ * H);
@@ -128,43 +120,55 @@ void Model::load(const std::string& dir, int max_ctx) {
     fmalloc(&gate_, (size_t)max_ctx_ * I);
     fmalloc(&up_,   (size_t)max_ctx_ * I);
     fmalloc(&hmlp_, (size_t)max_ctx_ * I);
-    fmalloc(&logits_, (size_t)V);
+    fmalloc(&logits_, (size_t)LM_CHUNK * V);   // lm_head runs <= LM_CHUNK sequences at a time
     // BF16 activation scratch for the tensor-core prefill GEMM (largest IN is `I`).
     CUDA_CHECK(cudaMalloc(&xbf_, (size_t)max_ctx_ * I * sizeof(bf16)));
     // BF16 dequantized-weight scratch for prefill (largest matmul weight is I*H).
     CUDA_CHECK(cudaMalloc(&w_dq_, (size_t)I * H * sizeof(bf16)));
-    CUDA_CHECK(cudaMalloc(&d_ids_, max_ctx_ * sizeof(int)));
-    CUDA_CHECK(cudaMalloc(&d_pos_, max_ctx_ * sizeof(int)));
-    CUDA_CHECK(cudaMalloc(&d_arg_, sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&d_ids_,  max_ctx_ * sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&d_pos_,  max_ctx_ * sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&d_slot_, MAX_DECODE_B * sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&d_arg_,  MAX_DECODE_B * sizeof(int)));
     CUDA_CHECK(cudaMalloc(&d_past_, sizeof(int)));
-    // flash-decoding split-K scratch
-    int nh = cfg_.num_heads, hd = cfg_.head_dim;
-    CUDA_CHECK(cudaMalloc(&part_m_,   (size_t)nh * ATTN_SPLITS * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&part_l_,   (size_t)nh * ATTN_SPLITS * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&part_acc_, (size_t)nh * ATTN_SPLITS * hd * sizeof(float)));
+    // flash-decoding split-K scratch, sized for a full decode batch
+    CUDA_CHECK(cudaMalloc(&part_m_,   (size_t)MAX_DECODE_B * nh * ATTN_SPLITS * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&part_l_,   (size_t)MAX_DECODE_B * nh * ATTN_SPLITS * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&part_acc_, (size_t)MAX_DECODE_B * nh * ATTN_SPLITS * hd * sizeof(float)));
     CUDA_CHECK(cudaStreamCreate(&stream_));
     host_logits_.resize(V);
 
+    // Everything except the KV pool is now allocated. Give the pool whatever VRAM is left under
+    // the gpu_mem_fraction cap; that fixes how many sequence slots we can serve.
     size_t freeb, totalb;
     CUDA_CHECK(cudaMemGetInfo(&freeb, &totalb));
-    std::fprintf(stderr, "[model] ready. GPU mem: %.1f GB used / %.1f GB total\n",
-                 (totalb - freeb) / 1e9, totalb / 1e9);
+    size_t used = totalb - freeb;
+    size_t budget = (size_t)(totalb * gpu_mem_fraction);
+    size_t kv_avail = budget > used ? budget - used : 0;
+    size_t per_seq = (size_t)cfg_.num_layers * 2 * max_ctx_ * kvd * sizeof(bf16);
+    b_max_ = (int)(kv_avail / per_seq);
+    if (b_max_ < 1) {
+        std::fprintf(stderr, "error: not enough VRAM for even one KV slot at max_ctx=%d "
+                     "(need %.1f GB, have %.1f GB under the %.0f%% cap).\n",
+                     max_ctx_, per_seq / 1e9, kv_avail / 1e9, gpu_mem_fraction * 100);
+        std::exit(1);
+    }
+
+    cache_k_.resize(cfg_.num_layers);
+    cache_v_.resize(cfg_.num_layers);
+    for (int l = 0; l < cfg_.num_layers; ++l) {
+        CUDA_CHECK(cudaMalloc(&cache_k_[l], (size_t)b_max_ * max_ctx_ * kvd * sizeof(bf16)));
+        CUDA_CHECK(cudaMalloc(&cache_v_[l], (size_t)b_max_ * max_ctx_ * kvd * sizeof(bf16)));
+    }
+
+    CUDA_CHECK(cudaMemGetInfo(&freeb, &totalb));
+    std::fprintf(stderr, "[model] ready. %d KV slots (max_ctx=%d). GPU mem: %.1f GB used / %.1f GB total\n",
+                 b_max_, max_ctx_, (totalb - freeb) / 1e9, totalb / 1e9);
 }
 
-// Host -> device: token ids, positions, and past_len (read by the kernels). Synchronous, so
-// the buffers are in place before the (graph or eager) kernel sequence runs.
-void Model::set_inputs(const std::vector<int>& tokens, int past_len) {
-    int M = (int)tokens.size();
-    CUDA_CHECK(cudaMemcpy(d_ids_, tokens.data(), M * sizeof(int), cudaMemcpyHostToDevice));
-    std::vector<int> pos(M);
-    for (int i = 0; i < M; ++i) pos[i] = past_len + i;
-    CUDA_CHECK(cudaMemcpy(d_pos_, pos.data(), M * sizeof(int), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_past_, &past_len, sizeof(int), cudaMemcpyHostToDevice));
-}
-
-// The kernel sequence for M tokens. Pure async launches on stream_ (no syncs), so it can be
-// captured into a CUDA graph. Reads d_ids_/d_pos_/d_past_; leaves logits_ on the device.
-void Model::run_layers(int M) {
+// --- single-sequence prefill: M tokens into KV slot `slot` at positions 0..M-1 -----------
+// Reuses the single-sequence kernels; the only difference from a fresh decode is that the
+// store/attention kernels point at this slot's region of the KV pool (d_past_ == 0).
+void Model::run_layers_prefill(int M, int slot) {
     const ModelConfig& c = cfg_;
     int H = c.hidden_size, QD = c.q_dim(), KVD = c.kv_dim(), I = c.intermediate;
     int nH = c.num_heads, nKV = c.num_kv_heads, hd = c.head_dim;
@@ -175,32 +179,26 @@ void Model::run_layers(int M) {
 
     for (int l = 0; l < c.num_layers; ++l) {
         Layer& L = layers_[l];
+        bf16* ck = cache_k_[l] + (size_t)slot * max_ctx_ * KVD;   // this slot's KV region
+        bf16* cv = cache_v_[l] + (size_t)slot * max_ctx_ * KVD;
 
-        // --- attention block ---
         launch_rmsnorm(x_, L.in_norm, xb_, M, H, eps, s);
         launch_matmul(xb_, L.q_proj.w, L.q_proj.scale, q_, M, H, QD,  xbf_, w_dq_, s);
         launch_matmul(xb_, L.k_proj.w, L.k_proj.scale, k_, M, H, KVD, xbf_, w_dq_, s);
         launch_matmul(xb_, L.v_proj.w, L.v_proj.scale, v_, M, H, KVD, xbf_, w_dq_, s);
 
-        // per-head QK RMSNorm (Qwen3), then RoPE
         launch_rmsnorm(q_, L.q_norm, q_, M * nH,  hd, eps, s);
         launch_rmsnorm(k_, L.k_norm, k_, M * nKV, hd, eps, s);
         launch_rope(q_, d_pos_, M, nH,  hd, c.rope_theta, s);
         launch_rope(k_, d_pos_, M, nKV, hd, c.rope_theta, s);
 
-        // append K/V to cache at device offset *d_past_ (FP32 -> BF16)
-        launch_store_kv(k_, cache_k_[l], d_past_, KVD, M, s);
-        launch_store_kv(v_, cache_v_[l], d_past_, KVD, M, s);
+        launch_store_kv(k_, ck, d_past_, KVD, M, s);   // *d_past_ == 0
+        launch_store_kv(v_, cv, d_past_, KVD, M, s);
+        launch_attention(q_, ck, cv, attn_, M, nH, nKV, hd, d_past_, scale, s);
 
-        if (M == 1)   // decode: flash-decoding split-K (more parallelism over the KV cache)
-            launch_attention_decode(q_, cache_k_[l], cache_v_[l], attn_, nH, nKV, hd, d_past_,
-                                    scale, part_m_, part_l_, part_acc_, s);
-        else          // prefill: one warp per (head, query); plenty of parallelism already
-            launch_attention(q_, cache_k_[l], cache_v_[l], attn_, M, nH, nKV, hd, d_past_, scale, s);
         launch_matmul(attn_, L.o_proj.w, L.o_proj.scale, xb2_, M, QD, H, xbf_, w_dq_, s);
         launch_add(x_, xb2_, M * H, s);
 
-        // --- MLP block (SwiGLU) ---
         launch_rmsnorm(x_, L.post_norm, xb_, M, H, eps, s);
         launch_matmul(xb_, L.gate.w, L.gate.scale, gate_, M, H, I, xbf_, w_dq_, s);
         launch_matmul(xb_, L.up.w,   L.up.scale,   up_,   M, H, I, xbf_, w_dq_, s);
@@ -209,34 +207,94 @@ void Model::run_layers(int M) {
         launch_add(x_, xb2_, M * H, s);
     }
 
-    // only the last token's logits are needed
+    // only the last token's logits are needed (GEMV) -> logits_ row 0
     float* xlast = x_ + (size_t)(M - 1) * H;
     launch_rmsnorm(xlast, fnorm_, xb_, 1, H, eps, s);
     launch_matmul(xb_, lm_head_.w, lm_head_.scale, logits_, 1, H, c.vocab_size, xbf_, w_dq_, s);
 }
 
-void Model::forward(const std::vector<int>& tokens, int past_len) {
-    set_inputs(tokens, past_len);
-    if ((int)tokens.size() == 1) {
-        // single-token decode: fixed shape -> capture once, replay every step.
-        if (!graph_ready_) {
-            CUDA_CHECK(cudaStreamBeginCapture(stream_, cudaStreamCaptureModeThreadLocal));
-            run_layers(1);
-            CUDA_CHECK(cudaStreamEndCapture(stream_, &graph_));
-            CUDA_CHECK(cudaGraphInstantiate(&graph_exec_, graph_, 0));
-            graph_ready_ = true;
-        }
-        CUDA_CHECK(cudaGraphLaunch(graph_exec_, stream_));
-    } else {
-        run_layers((int)tokens.size());          // prefill: variable shape, run eagerly
+void Model::prefill(const std::vector<int>& tokens, int slot, int past_len) {
+    int M = (int)tokens.size();
+    CUDA_CHECK(cudaMemcpy(d_ids_, tokens.data(), M * sizeof(int), cudaMemcpyHostToDevice));
+    std::vector<int> pos(M);
+    for (int i = 0; i < M; ++i) pos[i] = past_len + i;
+    CUDA_CHECK(cudaMemcpy(d_pos_, pos.data(), M * sizeof(int), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_past_, &past_len, sizeof(int), cudaMemcpyHostToDevice));
+    run_layers_prefill(M, slot);
+    CUDA_CHECK(cudaStreamSynchronize(stream_));   // logits_ row 0 ready
+}
+
+// --- batched single-token decode for B sequences -----------------------------------------
+// Leaves the post-final-layer residual stream for all B sequences in x_ ([B, H]).
+void Model::run_layers_decode(int B) {
+    const ModelConfig& c = cfg_;
+    int H = c.hidden_size, QD = c.q_dim(), KVD = c.kv_dim(), I = c.intermediate;
+    int nH = c.num_heads, nKV = c.num_kv_heads, hd = c.head_dim;
+    float eps = c.rms_eps, scale = 1.0f / std::sqrt((float)hd);
+    cudaStream_t s = stream_;
+
+    launch_embed(d_ids_, embed_, x_, B, H, s);
+
+    for (int l = 0; l < c.num_layers; ++l) {
+        Layer& L = layers_[l];
+
+        launch_rmsnorm(x_, L.in_norm, xb_, B, H, eps, s);
+        launch_matmul_decode(xb_, L.q_proj.w, L.q_proj.scale, q_, B, H, QD,  s);
+        launch_matmul_decode(xb_, L.k_proj.w, L.k_proj.scale, k_, B, H, KVD, s);
+        launch_matmul_decode(xb_, L.v_proj.w, L.v_proj.scale, v_, B, H, KVD, s);
+
+        launch_rmsnorm(q_, L.q_norm, q_, B * nH,  hd, eps, s);
+        launch_rmsnorm(k_, L.k_norm, k_, B * nKV, hd, eps, s);
+        launch_rope(q_, d_pos_, B, nH,  hd, c.rope_theta, s);   // d_pos_[b] = past_len[b]
+        launch_rope(k_, d_pos_, B, nKV, hd, c.rope_theta, s);
+
+        // append each sequence's new K/V to its slot at row past_len[b] (= d_pos_)
+        launch_store_kv_batch(k_, cache_k_[l], d_slot_, d_pos_, KVD, max_ctx_, B, s);
+        launch_store_kv_batch(v_, cache_v_[l], d_slot_, d_pos_, KVD, max_ctx_, B, s);
+        launch_attention_decode_batch(q_, cache_k_[l], cache_v_[l], attn_, B, nH, nKV, hd,
+                                      d_slot_, d_pos_, max_ctx_, scale,
+                                      part_m_, part_l_, part_acc_, s);
+
+        launch_matmul_decode(attn_, L.o_proj.w, L.o_proj.scale, xb2_, B, QD, H, s);
+        launch_add(x_, xb2_, B * H, s);
+
+        launch_rmsnorm(x_, L.post_norm, xb_, B, H, eps, s);
+        launch_matmul_decode(xb_, L.gate.w, L.gate.scale, gate_, B, H, I, s);
+        launch_matmul_decode(xb_, L.up.w,   L.up.scale,   up_,   B, H, I, s);
+        launch_silu_mul(gate_, up_, hmlp_, B * I, s);
+        launch_matmul_decode(hmlp_, L.down.w, L.down.scale, xb2_, B, I, H, s);
+        launch_add(x_, xb2_, B * H, s);
     }
-    CUDA_CHECK(cudaStreamSynchronize(stream_));   // logits_ ready for argmax_last/copy_logits
+}
+
+void Model::decode(const std::vector<int>& in_tokens, const std::vector<int>& past_len,
+                   const std::vector<int>& slots, std::vector<int>& out_tokens) {
+    int B = (int)in_tokens.size();
+    int V = cfg_.vocab_size, H = cfg_.hidden_size;
+    CUDA_CHECK(cudaMemcpy(d_ids_,  in_tokens.data(), B * sizeof(int), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_pos_,  past_len.data(),  B * sizeof(int), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_slot_, slots.data(),     B * sizeof(int), cudaMemcpyHostToDevice));
+
+    run_layers_decode(B);
+    launch_rmsnorm(x_, fnorm_, xb_, B, H, cfg_.rms_eps, stream_);   // final norm, all B rows
+
+    // lm_head + argmax in chunks of <= LM_CHUNK so the [chunk, vocab] logits buffer stays small.
+    out_tokens.resize(B);
+    for (int c0 = 0; c0 < B; c0 += LM_CHUNK) {
+        int cb = std::min(LM_CHUNK, B - c0);
+        launch_matmul_decode(xb_ + (size_t)c0 * H, lm_head_.w, lm_head_.scale, logits_, cb, H, V, stream_);
+        launch_argmax_batch(logits_, cb, V, d_arg_, stream_);
+        CUDA_CHECK(cudaMemcpyAsync(out_tokens.data() + c0, d_arg_, cb * sizeof(int),
+                                   cudaMemcpyDeviceToHost, stream_));
+    }
+    CUDA_CHECK(cudaStreamSynchronize(stream_));
 }
 
 int Model::argmax_last() {
-    launch_argmax(logits_, cfg_.vocab_size, d_arg_, 0);
+    launch_argmax(logits_, cfg_.vocab_size, d_arg_, stream_);
     int id = 0;
-    CUDA_CHECK(cudaMemcpy(&id, d_arg_, sizeof(int), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpyAsync(&id, d_arg_, sizeof(int), cudaMemcpyDeviceToHost, stream_));
+    CUDA_CHECK(cudaStreamSynchronize(stream_));
     return id;
 }
 
@@ -254,8 +312,6 @@ Model::~Model() {
     cudaFree(x_); cudaFree(xb_); cudaFree(xb2_); cudaFree(q_); cudaFree(k_); cudaFree(v_);
     cudaFree(attn_); cudaFree(gate_); cudaFree(up_); cudaFree(hmlp_); cudaFree(logits_);
     cudaFree(xbf_); cudaFree(w_dq_); cudaFree(part_m_); cudaFree(part_l_); cudaFree(part_acc_);
-    cudaFree(d_ids_); cudaFree(d_pos_); cudaFree(d_arg_); cudaFree(d_past_);
-    if (graph_exec_) cudaGraphExecDestroy(graph_exec_);
-    if (graph_) cudaGraphDestroy(graph_);
+    cudaFree(d_ids_); cudaFree(d_pos_); cudaFree(d_arg_); cudaFree(d_past_); cudaFree(d_slot_);
     if (stream_) cudaStreamDestroy(stream_);
 }

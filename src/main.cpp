@@ -22,6 +22,7 @@ int main(int argc, char** argv) {
     int   top_k     = 20;
     unsigned seed   = 1234;
     bool  think     = false;
+    float gpu_mem_fraction = 0.9f;   // VRAM cap; the KV pool gets whatever is left under it
 
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
@@ -31,6 +32,7 @@ int main(int argc, char** argv) {
         else if (a == "benchmark" || a == "bench") mode = BENCHMARK;
         else if (a == "--model")       model_dir = next();
         else if (a == "--max-ctx")     max_ctx = std::stoi(next());
+        else if (a == "--gpu-mem-fraction") gpu_mem_fraction = std::stof(next());
         else if (a == "--temperature") temp = std::stof(next());
         else if (a == "--top-p")       top_p = std::stof(next());
         else if (a == "--top-k")       top_k = std::stoi(next());
@@ -58,7 +60,7 @@ int main(int argc, char** argv) {
     Tokenizer tok;
     tok.load(model_dir);
     Model model;
-    model.load(model_dir, max_ctx);
+    model.load(model_dir, max_ctx, gpu_mem_fraction);
 
     SampleParams sp{temp, top_p, top_k};
     std::mt19937 rng(seed);
