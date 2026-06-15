@@ -3,9 +3,9 @@
 // (vocab / context limits), CLI validation, and the runtime. The GPU executor that actually runs
 // the forward pass is ModelRuntime (model_runtime.*).
 //
-// Porting note: this is the declarative half of the model — declare your model's shape, the
-// special-token ids (special_tokens.hpp), and how config.json maps to these fields. The compute
-// half (kernels + forward) is ModelRuntime.
+// Porting note: this is the declarative half of the model — declare your model's shape and how
+// config.json maps to these fields. The compute half (kernels + forward) is ModelRuntime. Token
+// semantics (tokeniser, special tokens, chat template) live entirely in the Go app, not here.
 #pragma once
 #include <string>
 #include <fstream>

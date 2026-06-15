@@ -1,14 +1,11 @@
-// gRPC inference server (serve mode). The Go OpenAI gateway is the client. The engine owns all
-// model-specific logic: it receives structured chat messages + tools, renders the Qwen3 template,
-// tokenises, runs continuous-batched generation, detects tool calls at the token level, and
-// streams typed events (text deltas / tool calls / done) back over a server-streaming RPC.
+// Token-level gRPC inference engine (the only mode). The Go app is the client: it sends prompt
+// token ids + sampling + stop ids, and the engine streams back sampled token ids. The engine has
+// no model-text knowledge — tokenisation, chat template, and tool-call detection all live in Go.
 #pragma once
 #include "model_runtime.hpp"
-#include "tokenizer.hpp"
 #include "kv_cache.hpp"
 #include <string>
 #include <random>
 
-int run_grpc_server(ModelRuntime& model, const KVCache& kv, const Tokenizer& tok,
-                    const std::string& address, int n_slots, const std::string& model_id,
-                    std::mt19937& rng);
+int run_grpc_server(ModelRuntime& model, const KVCache& kv, const std::string& address,
+                    int n_slots, const std::string& model_id, std::mt19937& rng);

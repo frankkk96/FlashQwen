@@ -1,13 +1,12 @@
 #include "scheduler.hpp"
-#include "special_tokens.hpp"
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 
 static const int PREFILL_CHUNK = 256;            // tokens prefilled per scheduler iteration
 
-Scheduler::Scheduler(ModelRuntime& model, const KVCache& kv, int n_slots, bool stop_on_eos, std::mt19937& rng)
-    : model_(model), kv_(kv), stop_on_eos_(stop_on_eos), rng_(rng) {
+Scheduler::Scheduler(ModelRuntime& model, const KVCache& kv, int n_slots, std::mt19937& rng)
+    : model_(model), kv_(kv), rng_(rng) {
     n_slots_ = std::min(n_slots, model_.max_batch());
     max_ctx_ = model_.max_ctx();
     V_       = model_.spec().vocab_size;
@@ -28,7 +27,9 @@ void Scheduler::remove(Request* r) {
 
 bool Scheduler::finished(const Request* r) const {
     if ((int)r->output.size() >= r->max_new) return true;
-    if (stop_on_eos_ && !r->output.empty() && special::is_eos(r->cur)) return true;
+    if (!r->output.empty() &&
+        std::find(r->stop_ids.begin(), r->stop_ids.end(), r->cur) != r->stop_ids.end())
+        return true;                        // sampled a caller-provided stop token
     if (r->past >= max_ctx_) return true;   // sequence full — no room for another token
     return false;
 }
@@ -138,11 +139,4 @@ void Scheduler::step(const TokenFn& on_token, const FinishFn& on_finish) {
         else still.push_back(r);
     }
     running_.swap(still);
-}
-
-void run_continuous(ModelRuntime& model, const KVCache& kv, std::vector<Request>& reqs, int n_slots,
-                    bool stop_on_eos, std::mt19937& rng) {
-    Scheduler sched(model, kv, n_slots, stop_on_eos, rng);
-    for (auto& r : reqs) sched.add(&r);
-    while (sched.busy()) sched.step();
 }

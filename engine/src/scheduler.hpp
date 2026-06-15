@@ -8,10 +8,10 @@
 // per sequence. When the pool is exhausted, the youngest running sequence is preempted (its
 // blocks freed, its KV recomputed from prompt+output when it is later resumed).
 //
-// The loop is packaged as a class so both the offline benchmark (run_continuous, a fixed set of
-// requests) and the live API server (requests arriving over time, tokens streamed out) drive the
-// exact same logic: add() enqueues, step() advances one iteration and reports tokens / finishes
-// through callbacks.
+// The loop is packaged as a class so the live API server (requests arriving over time, tokens
+// streamed out) drives it through callbacks: add() enqueues, step() advances one iteration and
+// reports tokens / finishes through callbacks. A request stops when it samples one of its own
+// stop_ids or reaches max_new — the scheduler has no built-in notion of EOS (that's the caller's).
 #pragma once
 #include "model_runtime.hpp"
 #include "kv_cache.hpp"
@@ -25,6 +25,7 @@ struct Request {
     std::vector<int> prompt;        // input: prompt token ids
     int max_new = 0;                // input: number of tokens to generate
     SampleParams sp{0.0f, 1.0f};    // input: per-request sampling (temp<=0 => greedy)
+    std::vector<int> stop_ids;      // input: stop as soon as one of these is sampled (empty => none)
     std::vector<int> output;        // result: generated token ids
 
     // scheduler-internal state
@@ -35,7 +36,7 @@ struct Request {
 
 class Scheduler {
 public:
-    Scheduler(ModelRuntime& model, const KVCache& kv, int n_slots, bool stop_on_eos, std::mt19937& rng);
+    Scheduler(ModelRuntime& model, const KVCache& kv, int n_slots, std::mt19937& rng);
 
     void add(Request* r);           // enqueue a new request (not yet prefilled)
     void remove(Request* r);        // drop a request (cancellation); frees its blocks. Engine-thread only.
@@ -57,7 +58,6 @@ private:
     ModelRuntime& model_;
     const KVCache& kv_;
     int  n_slots_, max_ctx_, V_, bsz_;
-    bool stop_on_eos_;
     std::mt19937& rng_;
 
     std::vector<int>      free_blocks_;      // free KV block ids
@@ -71,8 +71,3 @@ private:
     std::vector<int> in_tok_, past_, out_;
     std::vector<std::vector<int>> bts_;
 };
-
-// Offline convenience: serve a fixed set of requests to completion using up to n_slots
-// concurrent sequences. Each request samples with its own SampleParams (greedy when temp<=0).
-void run_continuous(ModelRuntime& model, const KVCache& kv, std::vector<Request>& reqs, int n_slots,
-                    bool stop_on_eos, std::mt19937& rng);

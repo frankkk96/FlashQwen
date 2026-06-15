@@ -40,13 +40,13 @@ else()
 endif()
 
 # Generate the protobuf + gRPC C++ stubs from the shared proto (kept at the repo root, since the
-# Go gateway generates from it too) into the build tree.
+# Go app generates from it too) into the build tree.
 set(GEN_DIR ${CMAKE_BINARY_DIR}/gen)
 file(MAKE_DIRECTORY ${GEN_DIR})
 set(PROTO_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../proto)
-set(PROTO ${PROTO_DIR}/inference.proto)
-set(PROTO_SRCS ${GEN_DIR}/inference.pb.cc ${GEN_DIR}/inference.grpc.pb.cc)
-set(PROTO_HDRS ${GEN_DIR}/inference.pb.h  ${GEN_DIR}/inference.grpc.pb.h)
+set(PROTO ${PROTO_DIR}/engine.proto)
+set(PROTO_SRCS ${GEN_DIR}/engine.pb.cc ${GEN_DIR}/engine.grpc.pb.cc)
+set(PROTO_HDRS ${GEN_DIR}/engine.pb.h  ${GEN_DIR}/engine.grpc.pb.h)
 add_custom_command(
   OUTPUT ${PROTO_SRCS} ${PROTO_HDRS}
   COMMAND ${PROTOC_BIN}
@@ -56,27 +56,22 @@ add_custom_command(
           --plugin=protoc-gen-grpc=${GRPC_PLUGIN_BIN}
           ${PROTO}
   DEPENDS ${PROTO}
-  COMMENT "protoc: inference.proto -> C++ stubs")
+  COMMENT "protoc: engine.proto -> C++ stubs")
 
-add_executable(flashqwen
+add_executable(flashqwen-engine
   src/main.cpp
   src/args.cpp
   src/sampler.cpp
-  src/generate.cpp
-  src/chat.cpp
-  src/benchmark.cpp
   src/scheduler.cpp
   src/grpc_server.cpp
   src/safetensors.cpp
   src/kernels.cu
   src/kv_cache.cu
   src/model_runtime.cu
-  src/tokenizer.cpp
-  src/chatml.cpp
   ${PROTO_SRCS}
 )
-target_include_directories(flashqwen PRIVATE src third_party ${GEN_DIR})  # third_party: RapidJSON + CLI11
-target_link_libraries(flashqwen PRIVATE ${GRPC_LIBS})
+target_include_directories(flashqwen-engine PRIVATE src third_party ${GEN_DIR})  # third_party: RapidJSON + CLI11
+target_link_libraries(flashqwen-engine PRIVATE ${GRPC_LIBS})
 # Prefer the source-built gRPC/protobuf in /usr/local over any system (apt) copy at runtime.
-set_target_properties(flashqwen PROPERTIES CUDA_SEPARABLE_COMPILATION ON
-                                           BUILD_RPATH /usr/local/lib)
+set_target_properties(flashqwen-engine PROPERTIES CUDA_SEPARABLE_COMPILATION ON
+                                                  BUILD_RPATH /usr/local/lib)
