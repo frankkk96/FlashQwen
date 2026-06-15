@@ -10,6 +10,7 @@
 #include "cli.hpp"
 #include "chat.hpp"
 #include "benchmark.hpp"
+#include "server.hpp"
 #include "CLI11.hpp"
 #include <cstdio>
 #include <string>
@@ -22,6 +23,8 @@ int main(int argc, char** argv) {
     unsigned seed   = 1234;
     bool  think     = false;
     float gpu_mem_fraction = 0.9f;   // VRAM cap; the KV pool gets whatever is left under it
+    std::string socket_path = "/tmp/flashqwen.sock";   // serve mode
+    int   slots     = 16;            // serve mode: max concurrent sequences
 
     CLI::App app{"FlashQwen — minimal from-scratch C++/CUDA inference engine for Qwen3 (dense)"};
     app.footer(
@@ -48,9 +51,13 @@ int main(int argc, char** argv) {
     // Mode is selected by an optional subcommand; chat is the default.
     auto* chat  = app.add_subcommand("chat", "interactive chat (default)");
     auto* bench = app.add_subcommand("benchmark", "measure TTFT / TPOT / tok/s");
+    auto* serve = app.add_subcommand("serve", "run the local inference server (for the Go OpenAI gateway)");
     bench->alias("bench");
+    serve->add_option("--socket", socket_path, "Unix-domain socket path")->capture_default_str();
+    serve->add_option("--slots", slots, "max concurrent sequences")->capture_default_str();
     chat->fallthrough();
     bench->fallthrough();
+    serve->fallthrough();
     app.require_subcommand(0, 1);
 
     CLI11_PARSE(app, argc, argv);
@@ -75,5 +82,7 @@ int main(int argc, char** argv) {
 
     if (bench->parsed())
         return run_benchmark(model, tok, max_ctx);
+    if (serve->parsed())
+        return run_server(model, tok, socket_path, slots, rng);
     return run_chat(model, tok, sp, rng, think, max_ctx);
 }

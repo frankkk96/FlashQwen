@@ -27,6 +27,7 @@ add_executable(flashqwen
   src/chat.cpp
   src/benchmark.cpp
   src/scheduler.cpp
+  src/server.cpp
   src/safetensors.cpp
   src/tokenizer.cpp
   src/model.cu

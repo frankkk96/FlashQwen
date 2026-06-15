@@ -1,8 +1,9 @@
 # FlashQwen
 
-A minimal, **from-scratch C++/CUDA inference engine for Qwen3-8B** — no external libraries
-(no PyTorch, no cuBLAS, no tokenizers crate). Built for learning. Supports multi-turn
-streaming chat and a benchmark mode (TTFT / TPOT / tok/s).
+A minimal, **from-scratch C++/CUDA inference engine for Qwen3-8B** — the model stack uses no ML
+libraries (no PyTorch, no cuBLAS, no tokenizers crate; only header-only JSON/CLI helpers). Built
+for learning. Supports multi-turn streaming chat, a benchmark mode (TTFT / TPOT / tok/s),
+continuous batching with PagedAttention, and an OpenAI-compatible API server.
 
 Chinese / 中文文档: [README.zh-CN.md](README.zh-CN.md)
 
@@ -107,22 +108,22 @@ each gain came from.
 
 ## Dependencies & code structure
 
-### Dependencies — none third-party
+### Dependencies — the model stack is from scratch
 
-Only the **C++ standard library**, the **CUDA Runtime** (toolkit-bundled, not a 3rd-party
-library), and **POSIX** system calls. `CMakeLists.txt` has no `target_link_libraries`.
-
-With no dependencies to compile, a clean build (`-j8`) takes about **9 seconds**, and the
-resulting binary is about **1.8 MB** (1.6 MB stripped). The model weights are loaded from
-disk at runtime, so they are not part of the binary.
+The whole **inference stack** — tokenizer, safetensors loading, every CUDA kernel — is
+hand-written against only the **C++ standard library**, the **CUDA Runtime** (toolkit-bundled),
+and **POSIX**. The only third-party code is header-only **utility** parsing, vendored under
+`third_party/` (so a plain `cmake --build` still works offline): RapidJSON for the few JSON files
+and CLI11 for argument parsing — neither touches a tensor. The optional Go API gateway
+(`api/`) additionally uses Gin.
 
 | usually a library | here |
 |---|---|
-| nlohmann/json, rapidjson | hand-written `src/json.hpp` |
 | HF tokenizers / sentencepiece | hand-written byte-level BPE `src/tokenizer.*` |
 | safetensors C++ lib | hand-written `src/safetensors.*` (mmap + header parse) |
 | cuBLAS / CUTLASS | hand-written matmul (tensor-core WMMA for prefill, GEMV for decode) |
 | PyTorch (any DL framework) | not used |
+| JSON / arg parsing | RapidJSON + CLI11 (header-only, `third_party/`) — utility only |
 
 - C++ stdlib: `<vector> <string> <unordered_map> <chrono> <random> <cmath> <fstream>` …
 - CUDA: `<cuda_runtime.h>`, `<cuda_bf16.h>` — **no** cuBLAS / cuDNN / cuRAND / Thrust.
@@ -151,15 +152,16 @@ dispatches. Roughly 1940 lines total.
 | `src/model.cu` / `.hpp` | weight loading (INT8 quant) + forward + KV cache + CUDA graph | 331 |
 | `src/kernels.cu` / `.cuh` | CUDA kernels (INT8 GEMV / WMMA matmul, attention, split-K, …) | 431 |
 | `src/tokenizer.cpp` / `.hpp` | byte-level BPE encode/decode | 394 |
-| `src/safetensors.cpp` / `.hpp` | mmap + `.safetensors` header parse | 105 |
-| `src/json.hpp` | minimal JSON parser | 203 |
-| `src/config.hpp` | parse `config.json` | 45 |
-| `CMakeLists.txt` | build | 35 |
+| `src/safetensors.cpp` / `.hpp` | mmap + `.safetensors` header parse (RapidJSON) | 105 |
+| `src/config.hpp` | parse `config.json` (RapidJSON) | 45 |
+| `CMakeLists.txt` | build | 36 |
 
-Notably, the "usually-a-library" plumbing — tokenizer (394) + JSON (203) — is ~600 lines,
-nearly half the project. The actual neural network — CUDA kernels (431) + forward (331) —
-is ~760 lines, with the growth coming from the optimization stages below (INT8, split-K,
-CUDA graph) rather than the base Qwen3 transformer, which is small and regular.
+The continuous-batching serving path (`src/scheduler.*`, `src/server.*`) and the Go API
+gateway (`api/`) are described in their own sections below.
+
+Notably, the hand-written tokenizer is ~394 lines, and the actual neural network — CUDA
+kernels (431) + forward (331) — is ~760 lines, with the growth coming from the optimization
+stages below (INT8, split-K) rather than the base Qwen3 transformer, which is small and regular.
 
 ## Optimization study
 
@@ -348,3 +350,59 @@ git checkout feature/batching
 cmake -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build -j8
 ./build/flashqwen benchmark --model models/qwen3-8b   # adds static-batch + continuous sweeps
 ```
+
+## OpenAI-compatible API server (Go gateway, `feature/api-server`)
+
+A two-process serving setup that exposes the engine over the OpenAI Chat Completions API:
+
+```
+[OpenAI client]
+   | HTTP /v1/chat/completions (SSE)
+   v
+[Go + Gin gateway]   OpenAI protocol, Qwen3 chat template, tool-call parse, SSE
+   | Unix socket, newline-JSON   {prompt,max_tokens,temperature,top_p} -> {delta}.. {done}
+   v
+[C++ flashqwen serve]   tokenize -> continuous-batched decode -> detokenize
+   v
+  GPU
+```
+
+The split keeps each side doing what it is good at. The **C++ engine** (`flashqwen serve`,
+`src/server.cpp`) loads the model once and runs a persistent server: an accept thread reads one
+request per connection and tokenises it; a single engine thread (the only one that touches the
+GPU) drives the continuous-batching `Scheduler` and streams token deltas back per connection.
+The **Go gateway** (`api/`) owns everything OpenAI-shaped — it renders the message list into the
+Qwen3 ChatML template (system / tools / turns, optional `<think>` block), forwards plain text to
+the engine, streams the reply back as SSE chunks, and parses Qwen3 `<tool_call>` blocks into
+OpenAI `tool_calls`. Sampling is temperature + top-p (the OpenAI surface; no top-k). Each HTTP
+request is an independent sequence, so many clients are served concurrently by one batched engine.
+
+**Run it** (two terminals):
+
+```bash
+# 1) the engine (C++): loads the model, listens on a Unix socket
+./build/flashqwen serve --model models/qwen3-8b --socket /tmp/flashqwen.sock --slots 16
+
+# 2) the gateway (Go): speaks OpenAI on :8000, forwards to the engine
+cd api && go build -o flashqwen-api . && ./flashqwen-api --socket /tmp/flashqwen.sock --addr :8000
+```
+
+Then any OpenAI client works (`base_url=http://localhost:8000/v1`):
+
+```bash
+# non-streaming
+curl localhost:8000/v1/chat/completions -H 'Content-Type: application/json' -d '{
+  "model":"qwen3-8b","messages":[{"role":"user","content":"Capital of France? One word."}]}'
+
+# streaming (SSE)
+curl -N localhost:8000/v1/chat/completions -H 'Content-Type: application/json' -d '{
+  "model":"qwen3-8b","stream":true,"messages":[{"role":"user","content":"List three colors."}]}'
+
+# function calling — the model returns tool_calls; feed the result back as a role:"tool" message
+curl localhost:8000/v1/chat/completions -H 'Content-Type: application/json' -d '{
+  "model":"qwen3-8b","messages":[{"role":"user","content":"Weather in Paris?"}],
+  "tools":[{"type":"function","function":{"name":"get_weather",
+    "parameters":{"type":"object","properties":{"location":{"type":"string"}},"required":["location"]}}}]}'
+```
+
+Endpoints: `POST /v1/chat/completions` (stream + non-stream, tools), `GET /v1/models`, `GET /healthz`.

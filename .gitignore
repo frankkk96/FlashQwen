@@ -11,3 +11,6 @@ models/
 compile_commands.json
 .vscode/
 .cache/
+
+# Go gateway build artifact
+api/flashqwen-api

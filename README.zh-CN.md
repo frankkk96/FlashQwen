@@ -1,7 +1,8 @@
 # FlashQwen
 
-从零实现、**零外部依赖的 Qwen3-8B C++/CUDA 推理引擎**(没有 PyTorch、没有 cuBLAS、没有
-tokenizers),主要面向学习。支持多轮流式对话,以及 benchmark 模式(TTFT / TPOT / tok/s)。
+从零实现的 **Qwen3-8B C++/CUDA 推理引擎**,模型栈零 ML 依赖(没有 PyTorch、没有 cuBLAS、没有
+tokenizers;只有 header-only 的 JSON/命令行小工具),主要面向学习。支持多轮流式对话、benchmark
+模式(TTFT / TPOT / tok/s)、连续批处理 + PagedAttention,以及 OpenAI 兼容 API 服务。
 
 English: [README.md](README.md)
 
@@ -100,21 +101,20 @@ INT8 权重要先反量化成 BF16,所以 TTFT 比纯 BF16 版略高。这些是
 
 ## 依赖的库 & 代码结构
 
-### 依赖——没有任何第三方库
+### 依赖——模型栈全部从零实现
 
-只用了 **C++ 标准库**、**CUDA Runtime**(toolkit 自带,不算第三方库)和 **POSIX** 系统调用。
-`CMakeLists.txt` 里没有任何 `target_link_libraries`。
-
-由于没有任何依赖需要编译,一次干净编译(`-j8`)约 **9 秒**,产物二进制约 **1.8 MB**
-(strip 后 1.6 MB)。模型权重是运行时从磁盘加载的,不打进二进制里。
+整个**推理栈**——分词器、safetensors 加载、每一个 CUDA kernel——都只基于 **C++ 标准库**、
+**CUDA Runtime**(toolkit 自带)和 **POSIX** 手写。唯一的第三方代码是 header-only 的**工具类**
+解析库,vendored 在 `third_party/`(所以 `cmake --build` 离线即可编译):RapidJSON 解析那几个
+JSON 文件、CLI11 解析命令行参数——它们都不碰张量。可选的 Go API 网关(`api/`)另外用了 Gin。
 
 | 通常要用的库 | 这里的做法 |
 |---|---|
-| nlohmann/json、rapidjson | 手写 `src/json.hpp` |
 | HF tokenizers / sentencepiece | 手写 byte-level BPE `src/tokenizer.*` |
 | safetensors C++ 库 | 手写 `src/safetensors.*`(mmap + 解析头) |
 | cuBLAS / CUTLASS | 手写 matmul(prefill 用 tensor core WMMA,decode 用 GEMV) |
 | PyTorch(任意深度学习框架) | 完全没用 |
+| JSON / 参数解析 | RapidJSON + CLI11(header-only,`third_party/`)—— 仅工具用途 |
 
 - C++ 标准库:`<vector> <string> <unordered_map> <chrono> <random> <cmath> <fstream>` 等
 - CUDA:`<cuda_runtime.h>`、`<cuda_bf16.h>` —— **没有** cuBLAS / cuDNN / cuRAND / Thrust
@@ -142,14 +142,14 @@ INT8 权重要先反量化成 BF16,所以 TTFT 比纯 BF16 版略高。这些是
 | `src/model.cu` / `.hpp` | 权重加载(INT8 量化)+ 前向 + KV cache + CUDA graph | 331 |
 | `src/kernels.cu` / `.cuh` | CUDA kernel(INT8 GEMV / WMMA matmul、attention、split-K…) | 431 |
 | `src/tokenizer.cpp` / `.hpp` | byte-level BPE 编码/解码 | 394 |
-| `src/safetensors.cpp` / `.hpp` | mmap + 解析 `.safetensors` 头 | 105 |
-| `src/json.hpp` | 极简 JSON 解析器 | 203 |
-| `src/config.hpp` | 解析 `config.json` | 45 |
-| `CMakeLists.txt` | 构建 | 35 |
+| `src/safetensors.cpp` / `.hpp` | mmap + 解析 `.safetensors` 头(RapidJSON) | 105 |
+| `src/config.hpp` | 解析 `config.json`(RapidJSON) | 45 |
+| `CMakeLists.txt` | 构建 | 36 |
 
-值得一提:那些"通常靠库"的胶水代码——分词器(394)+ JSON(203)——约 600 行,占了快一半。
-真正的神经网络部分——CUDA kernel(431)+ 前向(331)——约 760 行,增长主要来自下面的优化阶段
-(INT8、split-K、CUDA graph),而不是 Qwen3 本身——它结构小而规整。
+连续批处理服务路径(`src/scheduler.*`、`src/server.*`)和 Go API 网关(`api/`)在下文各自的章节里介绍。
+
+值得一提:手写分词器约 394 行;真正的神经网络部分——CUDA kernel(431)+ 前向(331)——约 760 行,
+增长主要来自下面的优化阶段(INT8、split-K),而不是 Qwen3 本身——它结构小而规整。
 
 ## 优化历程
 
@@ -312,3 +312,57 @@ git checkout feature/batching
 cmake -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build -j8
 ./build/flashqwen benchmark --model models/qwen3-8b   # benchmark 多出静态批处理 + 连续批处理两段
 ```
+
+## OpenAI 兼容 API 服务(Go 网关,`feature/api-server`)
+
+把引擎通过 OpenAI Chat Completions API 暴露出来的双进程方案:
+
+```
+[OpenAI 客户端]
+   | HTTP /v1/chat/completions (SSE)
+   v
+[Go + Gin 网关]   OpenAI 协议、Qwen3 chat 模板、tool_call 解析、SSE
+   | Unix socket, 按行 JSON   {prompt,max_tokens,temperature,top_p} -> {delta}.. {done}
+   v
+[C++ flashqwen serve]   分词 -> 连续批处理 decode -> 反分词
+   v
+  GPU
+```
+
+分工让两边各做擅长的事。**C++ 引擎**(`flashqwen serve`,`src/server.cpp`)只加载一次模型并常驻:
+accept 线程每个连接读一个请求并分词;单独一个引擎线程(唯一碰 GPU 的线程)驱动连续批处理
+`Scheduler`,把 token 增量按连接流式写回。**Go 网关**(`api/`)负责所有 OpenAI 形态的东西——
+把消息列表渲染成 Qwen3 ChatML 模板(system / tools / 多轮、可选 `<think>` 块),把纯文本转发给引擎,
+把回复作为 SSE chunk 流式吐出,并把 Qwen3 的 `<tool_call>` 块解析成 OpenAI `tool_calls`。采样是
+temperature + top-p(OpenAI 的参数面,没有 top-k)。每个 HTTP 请求是一条独立序列,所以一个批处理
+引擎可以并发服务多个客户端。
+
+**运行**(两个终端):
+
+```bash
+# 1) 引擎(C++):加载模型,监听 Unix socket
+./build/flashqwen serve --model models/qwen3-8b --socket /tmp/flashqwen.sock --slots 16
+
+# 2) 网关(Go):在 :8000 上说 OpenAI 协议,转发给引擎
+cd api && go build -o flashqwen-api . && ./flashqwen-api --socket /tmp/flashqwen.sock --addr :8000
+```
+
+之后任意 OpenAI 客户端都能用(`base_url=http://localhost:8000/v1`):
+
+```bash
+# 非流式
+curl localhost:8000/v1/chat/completions -H 'Content-Type: application/json' -d '{
+  "model":"qwen3-8b","messages":[{"role":"user","content":"法国的首都?一个词回答。"}]}'
+
+# 流式(SSE)
+curl -N localhost:8000/v1/chat/completions -H 'Content-Type: application/json' -d '{
+  "model":"qwen3-8b","stream":true,"messages":[{"role":"user","content":"列出三种颜色。"}]}'
+
+# function calling —— 模型返回 tool_calls;把结果作为 role:"tool" 消息再发回去
+curl localhost:8000/v1/chat/completions -H 'Content-Type: application/json' -d '{
+  "model":"qwen3-8b","messages":[{"role":"user","content":"巴黎天气怎么样?"}],
+  "tools":[{"type":"function","function":{"name":"get_weather",
+    "parameters":{"type":"object","properties":{"location":{"type":"string"}},"required":["location"]}}}]}'
+```
+
+端点:`POST /v1/chat/completions`(流式 + 非流式、tools)、`GET /v1/models`、`GET /healthz`。
