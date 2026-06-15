@@ -286,13 +286,15 @@ Static-batch decode throughput (RTX 4090, Qwen3-8B INT8, greedy, 128 tok/seq, `i
 | 16 | 49.7 ms | **322** |
 
 So aggregate decode goes **~98 → ~322 tok/s (~3.3×)** at batch 16 — sublinear, and the reason
-is instructive. A batch-16 step moves ~9 GB of weights in ~50 ms ≈ 190 GB/s, far under the
-4090's ~1 TB/s, so batched decode is **not** weight-bandwidth-bound: it's **compute/occupancy-
-bound in the batched INT8 GEMV** (the per-token FMA work grows with `B` and stops hiding behind
-the weight reads). The real lever is therefore the decode GEMV itself — an INT8 tensor-core
-(IMMA/DP4A) decode GEMM or better register tiling — not memory traffic. (`lm_head` is already
-fused with its argmax so its weight is read once per step, but that only trims traffic, which
-confirms the limiter is compute, not bandwidth.)
+is instructive (and not the obvious one). A batch-16 step is **neither** weight-bandwidth-bound
+(~9 GB in ~50 ms ≈ 190 GB/s, far under the 4090's ~1 TB/s) **nor** ALU-bound (FP32 math for the
+step is ~2.5 ms of compute, ~5 % utilization). The limiter is **activation L2 re-reads**: the
+GEMV computes one output row per warp and re-reads all `B` activation vectors for *every* row,
+so activation traffic scales as `B × params` (~400 GB of L2 reads at B=16) — which is why the
+step time grows ~linearly with `B`. The fix is activation *reuse* (shared-memory / tiled GEMV),
+not tensor cores: a tried dequant→BF16 WMMA path was **slower** because the per-step INT8→BF16
+weight dequant write (~14 GB, batch-independent) dominated. Left as future work. (`lm_head` is
+fused with its argmax so its weight is read once per step.)
 
 **Stage B — continuous batching.** There is only one execution primitive — the batched
 `decode`, which takes an arbitrary running set (per-sequence KV slot + `past_len`). So "static"
