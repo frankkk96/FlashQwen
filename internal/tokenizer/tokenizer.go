@@ -123,7 +123,9 @@ func (t *Tokenizer) loadMerges(path string) error {
 	rank := 0
 	for sc.Scan() {
 		line := sc.Text()
-		if line == "" || line[0] == '#' {
+		// Skip blanks and the "#version: ..." header only — a real merge can legitimately start
+		// with '#' (e.g. "# '"), so we must not drop every '#'-leading line.
+		if line == "" || strings.HasPrefix(line, "#version") {
 			continue
 		}
 		sp := strings.IndexByte(line, ' ')
@@ -389,13 +391,24 @@ func (t *Tokenizer) pretokenizeAndBPE(text string, out *[]int) {
 			}
 		}
 
-		// 5) whitespace run (leave one trailing space for the next word, like \s+(?!\S))
+		// 5) whitespace run. The HF regex tries `\s*[\r\n]+` before `\s+(?!\S)|\s+`, so a run that
+		// contains a newline is grouped up through its LAST newline (e.g. "\n\n" stays one token);
+		// a newline-free run leaves one trailing space for the following word.
 		if isSpace(c) {
 			j := i
+			last := -1
 			for j < n && isSpace(cps[j].r) {
+				if isNewline(cps[j].r) {
+					last = j
+				}
 				j++
 			}
-			take := j
+			if last >= 0 { // \s*[\r\n]+ : consume up to and including the last newline
+				t.applyBPE(bytesOf(i, last+1), out)
+				i = last + 1
+				continue
+			}
+			take := j // \s+(?!\S) | \s+ : leave one space for the next word
 			if j < n && !isSpace(cps[j].r) && (j-i) >= 2 {
 				take = j - 1
 			}

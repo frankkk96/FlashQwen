@@ -1,8 +1,15 @@
 # FlashQwen
 
-从零实现的 **Qwen3-8B C++/CUDA 推理引擎**,模型栈零 ML 依赖(没有 PyTorch、没有 cuBLAS、没有
-tokenizers;只有 header-only 的 JSON/命令行小工具),主要面向学习。支持多轮流式对话、benchmark
-模式(TTFT / TPOT / tok/s)、连续批处理 + PagedAttention,以及 OpenAI 兼容 API 服务。
+从零实现的 **Qwen3-8B 推理栈**,主要面向学习。两层:
+
+- **C++/CUDA token 引擎**(`engine/`)—— 模型栈零 ML 依赖(没有 PyTorch、cuBLAS、tokenizers),
+  连续批处理 + PagedAttention。它是个纯执行器:**token id 进 → 采样后的 token id 出**,经 gRPC
+  暴露;不懂任何文本语义。
+- **Go 应用**(根模块)—— 单一入口二进制,拥有全部"文本层"(分词、Qwen3 ChatML 模板、工具调用
+  检测),提供 OpenAI 兼容 API 与交互式 CLI。它通过 `//go:embed` **自带并拉起** C++ 引擎,无需
+  单独启动引擎进程。
+
+这种切分对应工业界做法(网关分词、线上传 token id;参见 TGI/vLLM):C++ 只管张量,Go 管文本。
 
 English: [README.md](README.md)
 
@@ -20,43 +27,46 @@ git clone https://huggingface.co/Qwen/Qwen3-8B models/qwen3-8b
 ```
 
 这个目录需要包含 `config.json`、`*.safetensors` 分片、`model.safetensors.index.json`、
-`vocab.json` 和 `merges.txt`。无需离线转换或重打包——FlashQwen 直接读 BF16 文件,并在加载时
-把 matmul 权重在显存里量化成 INT8。
+`tokenizer.json`、`vocab.json`、`merges.txt`、`generation_config.json`。无需离线转换或重打包——
+引擎直接读 BF16 文件并在加载时把 matmul 权重在显存里量化成 INT8;Go 侧从 `tokenizer.json` /
+`vocab.json` / `merges.txt` 加载分词器,从 `generation_config.json` 读 eos。
 
 ### 编译
 
 ```bash
-cmake -B build -S engine -DCMAKE_BUILD_TYPE=Release
-cmake --build build -j
+make            # 编译 C++ 引擎 -> 嵌入 -> go build,产出 ./flashqwen
 ```
 
-需要 CUDA toolkit(建议 12.x)和一块 ≥20 GB 显存的 NVIDIA GPU。默认按 `sm_89`(RTX 4090 /
-Ada)编译;其他显卡用 `-DCMAKE_CUDA_ARCHITECTURES=<arch>` 覆盖(如 Hopper 用 `90`)。
+`make` 串起固定顺序:cmake 编译引擎 → 把引擎二进制拷进 `internal/supervisor/bin/`(供
+`//go:embed`)→ `go build`。需要 CUDA toolkit(建议 12.x)、Go 1.26+、一块 ≥20 GB 显存的
+NVIDIA GPU,以及 gRPC/protobuf。默认按 `sm_89`(RTX 4090 / Ada)编译;其他显卡用
+`make engine` 前设 `-DCMAKE_CUDA_ARCHITECTURES=<arch>`(如 Hopper 用 `90`)。
+
+> 注意:最终的 `./flashqwen` 是"自带并拉起引擎"的单文件,但**运行时仍需机器装有 CUDA /
+> libgrpc++ 等共享库**——embed 进去的是可执行文件,不含它的 `.so` 依赖。
 
 ### 运行
 
-`--model` 是**必填项**,指向模型目录(比如上面建好的 `models/qwen3-8b`;直接传 HF hub
-缓存目录也可以)。`--help` 会列出支持的模型,并扫描本地 hub 缓存看有哪些可用。
+三个子命令,都由 `./flashqwen` 自己释放并启动内嵌的引擎(`--model` 必填):
 
 ```bash
-# 交互式多轮对话(默认模式),KV cache 跨轮保留
-./build/flashqwen --model models/qwen3-8b
+# OpenAI 兼容服务(默认端口 :8000)
+./flashqwen serve --model models/qwen3-8b
 
-# 用 temperature + nucleus 采样对话
-./build/flashqwen --model models/qwen3-8b --temperature 0.6 --top-p 0.95
+# 交互式多轮对话
+./flashqwen chat --model models/qwen3-8b
 
-# benchmark(内置的固定输入长度扫描)
-./build/flashqwen benchmark --model models/qwen3-8b
+# 端到端吞吐基准(并发 1/8/16,合成请求过 gRPC)
+./flashqwen benchmark --model models/qwen3-8b
 
-./build/flashqwen --help
+./flashqwen --help
 ```
-
-**模式:** 不带子命令(或写 `chat`)→ 交互对话;`benchmark` → 跑指标。
 
 **对话内命令:** `/exit`  `/quit`  `/reset`(清空上下文)  `/think on|off`。
 
-**常用参数:** `--max-ctx N`(KV cache 大小,默认 4096)、`--temperature`、`--top-p`、
-`--seed`、`--think`(开启 Qwen3 思考模式)。
+**常用参数:** `--max-ctx N`(KV cache 大小,默认 4096)、`--slots N`(serve/benchmark 的最大
+并发序列)、`--addr`(serve 的 HTTP 监听地址)。采样参数(temperature / top_p)按 OpenAI 请求
+逐条传入。
 
 **支持的模型:** 任意 dense 的 Qwen3 模型(架构为 `Qwen3ForCausalLM`):Qwen3-0.6B / 1.7B /
 4B / 8B / 14B / 32B,各维度从 `config.json` 读取。**不支持:** Qwen3.5(混合线性注意力 +
@@ -103,53 +113,55 @@ INT8 权重要先反量化成 BF16,所以 TTFT 比纯 BF16 版略高。这些是
 
 ### 依赖——模型栈全部从零实现
 
-整个**推理栈**——分词器、safetensors 加载、每一个 CUDA kernel——都只基于 **C++ 标准库**、
-**CUDA Runtime**(toolkit 自带)和 **POSIX** 手写。唯一的第三方代码是 header-only 的**工具类**
-解析库,vendored 在 `engine/third_party/`(所以 `cmake --build` 离线即可编译):RapidJSON 解析那几个
-JSON 文件、CLI11 解析命令行参数——它们都不碰张量。可选的 Go API 网关(`api/`)另外用了 Gin。
+整个**模型栈**——safetensors 加载、每一个 CUDA kernel、连续批处理——都只基于 **C++ 标准库**、
+**CUDA Runtime** 和 **POSIX** 手写;C++ 侧唯一的第三方代码是 vendored 在 `engine/third_party/`
+的 header-only 工具库(RapidJSON 解析 JSON、CLI11 解析参数,都不碰张量)+ gRPC/protobuf。
+
+**分词器也是从零写的,但在 Go 侧**(`internal/tokenizer`,byte-level BPE,从旧 C++ 版逐行移植)。
+本想直接用现成库,但唯一成熟的纯 Go 选项 `sugarme` 装不下 Qwen3:它要旧式字符串 merges,更致命的是
+GPT-2/Qwen 预分词正则用了负向先行断言 `\s+(?!\S)`,Go 的 RE2 引擎根本编译不了。所以预分词手写
+绕开了正则。结果用 HF `tokenizers` 做基准、1000+ 随机样本逐 token 对拍**完全一致**
+(回归测试见 `internal/tokenizer/tokenizer_test.go`)。Go 侧另用了 Gin(HTTP)+ gRPC。
 
 | 通常要用的库 | 这里的做法 |
 |---|---|
-| HF tokenizers / sentencepiece | 手写 byte-level BPE `engine/src/tokenizer.*` |
+| HF tokenizers / sentencepiece | 手写 byte-level BPE `internal/tokenizer`(Go) |
+| Jinja chat template 引擎 | 手写 ChatML 拼接 `internal/chat`(gonja 解析不了 Qwen3 模板) |
 | safetensors C++ 库 | 手写 `engine/src/safetensors.*`(mmap + 解析头) |
 | cuBLAS / CUTLASS | 手写 matmul(prefill 用 tensor core WMMA,decode 用 GEMV) |
 | PyTorch(任意深度学习框架) | 完全没用 |
-| JSON / 参数解析 | RapidJSON + CLI11(header-only,`engine/third_party/`)—— 仅工具用途 |
-
-- C++ 标准库:`<vector> <string> <unordered_map> <chrono> <random> <cmath> <fstream>` 等
-- CUDA:`<cuda_runtime.h>`、`<cuda_bf16.h>` —— **没有** cuBLAS / cuDNN / cuRAND / Thrust
-- POSIX:`<sys/mman.h>`(mmap)、`<fcntl.h>`、`<unistd.h>`
 
 ### 代码结构与行数
 
-每个文件只做一件事;`main.cpp` 是个很薄的入口,只负责解析参数和分发。总共约 1940 行。
+两层。每个文件只做一件事。
 
-**应用层**
+**Go 应用(根模块)——文本层 + 服务 + CLI**
+
+| 路径 | 作用 | 行数 |
+|---|---|---:|
+| `cmd/flashqwen/` | 入口:`serve` / `chat` / `benchmark` 子命令 | 385 |
+| `internal/tokenizer/` | 从零 byte-level BPE(读 vocab/merges/tokenizer.json) | 424 |
+| `internal/chat/` | Qwen3 ChatML 模板 + eos/stop ids + token 流工具检测 | 264 |
+| `internal/openai/` | OpenAI 兼容 HTTP 层(render→分词→引擎→解码) | 327 |
+| `internal/engine/` | token 级 gRPC 客户端 | 58 |
+| `internal/supervisor/` | `//go:embed` 引擎二进制,释放/拉起/健康检查/收尾 | 78 |
+
+**C++/CUDA token 引擎(`engine/src/`)——纯执行器**
 
 | 文件 | 作用 | 行数 |
 |---|---|---:|
-| `engine/src/main.cpp` | 入口:参数解析 + 分发 | 69 |
-| `engine/src/cli.cpp` / `.hpp` | 架构检查 + `--help` | 63 |
-| `engine/src/chat.cpp` / `.hpp` | 交互式多轮对话 | 55 |
-| `engine/src/benchmark.cpp` / `.hpp` | benchmark 模式(扫描输入长度) | 92 |
-| `engine/src/generate.cpp` / `.hpp` | 共用的 prefill + decode 循环 | 66 |
-| `engine/src/sampler.cpp` / `.hpp` | 采样(greedy / temp / top-p) | 50 |
+| `model_runtime.cu` / `.hpp` | 权重加载(INT8 量化)+ 前向 | 435 |
+| `kernels.cu` / `.cuh` | CUDA kernel(INT8 GEMV / WMMA matmul、attention、split-K…) | 529 |
+| `scheduler.cpp` / `.hpp` | 连续批处理调度(prefill 分块 + 抢占) | 215 |
+| `grpc_server.cpp` / `.hpp` | token 级 gRPC 服务(ids 进 / ids 出) | 181 |
+| `kv_cache.{hpp,cuh,cu}` | PagedAttention 的分页 KV 池(存储层) | 127 |
+| `safetensors.cpp` / `.hpp` | mmap + 解析 `.safetensors` 头(RapidJSON) | 111 |
+| `model_spec.hpp` | `config.json` 维度 + 架构(声明层) | 64 |
+| `sampler.cpp` / `.hpp` | 采样(greedy / temperature / top-p) | 54 |
+| `main.cpp` / `args.*` | 入口 + 参数 | 88 |
 
-**核心引擎**
-
-| 文件 | 作用 | 行数 |
-|---|---|---:|
-| `engine/src/model.cu` / `.hpp` | 权重加载(INT8 量化)+ 前向 + KV cache + CUDA graph | 331 |
-| `engine/src/kernels.cu` / `.cuh` | CUDA kernel(INT8 GEMV / WMMA matmul、attention、split-K…) | 431 |
-| `engine/src/tokenizer.cpp` / `.hpp` | byte-level BPE 编码/解码 | 394 |
-| `engine/src/safetensors.cpp` / `.hpp` | mmap + 解析 `.safetensors` 头(RapidJSON) | 105 |
-| `engine/src/config.hpp` | 解析 `config.json`(RapidJSON) | 45 |
-| `engine/CMakeLists.txt` | 构建 | 37 |
-
-连续批处理服务路径(`engine/src/scheduler.*`、`engine/src/grpc_server.*`、`engine/src/prompt.*`)和 Go API 网关(`api/`)在下文各自的章节里介绍。
-
-值得一提:手写分词器约 394 行;真正的神经网络部分——CUDA kernel(431)+ 前向(331)——约 760 行,
-增长主要来自下面的优化阶段(INT8、split-K),而不是 Qwen3 本身——它结构小而规整。
+真正的神经网络部分——CUDA kernel(529)+ 前向(435)——约 960 行,增长主要来自优化阶段
+(INT8、split-K),而不是 Qwen3 本身——它结构小而规整。`proto/engine.proto` 是两层之间的契约。
 
 ## 优化历程
 
@@ -313,47 +325,43 @@ cmake -B build -S engine -DCMAKE_BUILD_TYPE=Release && cmake --build build -j8
 ./build/flashqwen benchmark --model models/qwen3-8b   # benchmark 多出静态批处理 + 连续批处理两段
 ```
 
-## OpenAI 兼容 API 服务(Go 网关,`feature/api-server`)
+## OpenAI 兼容 API 服务
 
-把引擎通过 OpenAI Chat Completions API 暴露出来的双进程方案——Go 管服务、C++ 管模型,边界是 **gRPC**:
+`flashqwen serve` 把引擎通过 OpenAI Chat Completions API 暴露出来。**单进程**:Go 二进制自带并拉起
+内嵌的 C++ 引擎,边界仍是 **gRPC**,但**文本层全在 Go**,C++ 只过 token id:
 
 ```
 [OpenAI 客户端]
    | HTTP /v1/chat/completions (SSE)
    v
-[Go + Gin 网关]   OpenAI 协议 <-> gRPC、SSE   (对模型零知识)
-   | gRPC server-streaming   GenerateRequest{messages,tools,params} ->
-   |   TextDelta / ToolCall / Done 事件流
+[flashqwen (Go)]   OpenAI 协议 + 分词 + ChatML 模板 + 工具调用检测
+   | gRPC server-streaming   GenerateRequest{input_ids, params, stop_ids} ->
+   |   token_id 流 / Done
    v
-[C++ flashqwen serve]   Qwen3 模板 -> 分词 -> 连续批处理 decode
-   |                     -> 反分词 -> token 级工具调用识别
+[内嵌 flashqwen-engine (C++)]   纯执行器:prefill -> 连续批处理 decode -> 采样
    v
   GPU
 ```
 
-契约是 `proto/inference.proto`。**C++ 引擎**(`flashqwen serve`,`engine/src/grpc_server.cpp`)拥有所有模型
-相关的东西:接收结构化 messages + tools,渲染 Qwen3 ChatML 模板(`engine/src/prompt.cpp`),分词,在
-单个 GPU 线程上跑连续批处理 `Scheduler`,并在 **token 级**识别工具调用(`<tool_call>`/`</tool_call>`
-是特殊 token),吐出 `TextDelta` / `ToolCall` / `Done` 三种事件。**Go 网关**(`api/`)是个薄适配层:
-把 OpenAI 请求映射成 `GenerateRequest`,把事件作为 SSE chunk 流式吐出或攒成一整条,并报告 usage——
-它**不含 chat 模板、也不解析工具格式**,所以换模型完全不用动 Go。gRPC 取消已打通:客户端断开 → RPC
-取消 → 引擎丢弃在途序列(释放其 KV)。采样是 temperature + top-p。每个请求是独立序列,多客户端共享同一个
-批处理引擎。
+契约是 `proto/engine.proto`。**Go 应用**渲染 Qwen3 ChatML 模板(`internal/chat`)、分词
+(`internal/tokenizer`)成 `input_ids`,把 eos 作为 `stop_token_ids` 传下去;收到 token id 流后反分词、
+在 **token 级**识别工具调用(`<tool_call>`/`</tool_call>` 的 id),组装成 OpenAI 响应。**C++ 引擎**
+(`engine/src/grpc_server.cpp`)对 token 语义一无所知:`input_ids` 进,在单 GPU 线程上跑连续批处理
+`Scheduler`,采样后的 `token_id` 出,采到 `stop_token_ids` 之一或到 `max_tokens` 即停。这与
+TGI/vLLM 的"网关分词、线上传 token id"一致;换模型时 C++ 侧连分词器/模板都不用碰(都在 Go)。
+gRPC 取消已打通:客户端断开 → RPC 取消 → 引擎丢弃在途序列(释放其 KV)。每个请求是独立序列,
+多客户端共享同一个批处理引擎。
 
-**运行**(两个终端):
+**运行**(一个终端,引擎由 Go 自动拉起):
 
 ```bash
-# 1) 引擎(C++):加载模型,提供 gRPC 服务
-./build/flashqwen serve --model models/qwen3-8b --address 127.0.0.1:50051 --slots 16
-
-# 2) 网关(Go):在 :8000 上说 OpenAI 协议,经 gRPC 转发给引擎
-cd api && go build -o flashqwen-api . && ./flashqwen-api --engine 127.0.0.1:50051 --addr :8000
+make
+./flashqwen serve --model models/qwen3-8b --addr :8000 --slots 16
 ```
 
-编译引擎需要 gRPC + Protobuf C++(CMake 自动探测 `find_package(gRPC CONFIG)` 安装,例如装到
-`/usr/local` 的源码构建;否则回退到发行版的 `libgrpc++-dev` 走 pkg-config)。Go 侧用 `go mod` 拉
-`google.golang.org/grpc`。改了 proto 后重新生成:C++ stub 由 CMake 构建时用 `protoc` 生成,Go stub
-在 `api/pb/`。
+编译需要 gRPC + Protobuf C++(CMake 自动探测 `find_package(gRPC CONFIG)`,否则回退到发行版的
+`libgrpc++-dev` 走 pkg-config)+ Go 1.26+。改了 proto 后:C++ stub 由 CMake 构建时用 `protoc` 生成,
+Go stub 用 `make proto` 重新生成到 `internal/enginepb/`。
 
 之后任意 OpenAI 客户端都能用(`base_url=http://localhost:8000/v1`):
 
