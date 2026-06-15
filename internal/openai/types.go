@@ -1,4 +1,4 @@
-package main
+package openai
 
 import "encoding/json"
 
@@ -24,8 +24,8 @@ type ChatMessage struct {
 	ToolCallID string          `json:"tool_call_id,omitempty"`
 }
 
-// Text flattens an OpenAI content field (a plain string, a multimodal parts array, or null)
-// into plain text — the only thing a text model consumes.
+// Text flattens an OpenAI content field (a plain string, a multimodal parts array, or null) into
+// plain text — the only thing a text model consumes.
 func (m ChatMessage) Text() string {
 	if len(m.Content) == 0 || string(m.Content) == "null" {
 		return ""
