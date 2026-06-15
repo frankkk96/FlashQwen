@@ -1,9 +1,9 @@
 #include "scheduler.hpp"
+#include "special_tokens.hpp"
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 
-static const int EOS1 = 151645, EOS2 = 151643;   // <|im_end|>, <|endoftext|>
 static const int PREFILL_CHUNK = 256;            // tokens prefilled per scheduler iteration
 
 Scheduler::Scheduler(Model& model, int n_slots, bool stop_on_eos, std::mt19937& rng)
@@ -28,7 +28,7 @@ void Scheduler::remove(Request* r) {
 
 bool Scheduler::finished(const Request* r) const {
     if ((int)r->output.size() >= r->max_new) return true;
-    if (stop_on_eos_ && !r->output.empty() && (r->cur == EOS1 || r->cur == EOS2)) return true;
+    if (stop_on_eos_ && !r->output.empty() && special::is_eos(r->cur)) return true;
     if (r->past >= max_ctx_) return true;   // sequence full — no room for another token
     return false;
 }

@@ -1,4 +1,5 @@
 #include "generate.hpp"
+#include "special_tokens.hpp"
 #include <chrono>
 #include <cstdio>
 #include <string>
@@ -7,8 +8,6 @@ using Clock = std::chrono::steady_clock;
 static double ms_since(Clock::time_point t) {
     return std::chrono::duration<double, std::milli>(Clock::now() - t).count();
 }
-
-static const int EOS1 = 151645, EOS2 = 151643;   // <|im_end|>, <|endoftext|>
 
 // Single-sequence streaming generation (interactive chat). Runs as a batch of one through the
 // same paged prefill + batched-decode path the scheduler uses. Chat is the only sequence, so it
@@ -31,7 +30,7 @@ GenStats generate(Model& model, const Tokenizer& tok, const std::vector<int>& ch
 
     // decode: emit the current token, then feed it back to get the next one
     while (st.n_out < max_gen) {
-        if (stop_on_eos && (next == EOS1 || next == EOS2)) break;
+        if (stop_on_eos && special::is_eos(next)) break;
         if (past + 1 > model.max_ctx()) break;
 
         if (stream) {

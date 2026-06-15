@@ -1,4 +1,5 @@
 #include "tokenizer.hpp"
+#include "special_tokens.hpp"
 #include "rapidjson/document.h"
 #include <fstream>
 #include <sstream>
@@ -90,19 +91,19 @@ void Tokenizer::build_byte_maps() {
 void Tokenizer::load(const std::string& dir) {
     build_byte_maps();
 
-    // The canonical Qwen3 special tokens (ids are stable across the family).
+    // The canonical Qwen3 special tokens; ids come from special_tokens.hpp (the single registry).
     static const std::pair<const char*, int> kSpecials[] = {
-        {"<|endoftext|>",151643},{"<|im_start|>",151644},{"<|im_end|>",151645},
-        {"<|object_ref_start|>",151646},{"<|object_ref_end|>",151647},
-        {"<|box_start|>",151648},{"<|box_end|>",151649},
-        {"<|quad_start|>",151650},{"<|quad_end|>",151651},
-        {"<|vision_start|>",151652},{"<|vision_end|>",151653},
-        {"<|vision_pad|>",151654},{"<|image_pad|>",151655},{"<|video_pad|>",151656},
-        {"<tool_call>",151657},{"</tool_call>",151658},
-        {"<|fim_prefix|>",151659},{"<|fim_middle|>",151660},{"<|fim_suffix|>",151661},
-        {"<|fim_pad|>",151662},{"<|repo_name|>",151663},{"<|file_sep|>",151664},
-        {"<tool_response>",151665},{"</tool_response>",151666},
-        {"<think>",151667},{"</think>",151668},
+        {"<|endoftext|>",special::ENDOFTEXT},{"<|im_start|>",special::IM_START},{"<|im_end|>",special::IM_END},
+        {"<|object_ref_start|>",special::OBJECT_REF_START},{"<|object_ref_end|>",special::OBJECT_REF_END},
+        {"<|box_start|>",special::BOX_START},{"<|box_end|>",special::BOX_END},
+        {"<|quad_start|>",special::QUAD_START},{"<|quad_end|>",special::QUAD_END},
+        {"<|vision_start|>",special::VISION_START},{"<|vision_end|>",special::VISION_END},
+        {"<|vision_pad|>",special::VISION_PAD},{"<|image_pad|>",special::IMAGE_PAD},{"<|video_pad|>",special::VIDEO_PAD},
+        {"<tool_call>",special::TOOL_CALL_OPEN},{"</tool_call>",special::TOOL_CALL_CLOSE},
+        {"<|fim_prefix|>",special::FIM_PREFIX},{"<|fim_middle|>",special::FIM_MIDDLE},{"<|fim_suffix|>",special::FIM_SUFFIX},
+        {"<|fim_pad|>",special::FIM_PAD},{"<|repo_name|>",special::REPO_NAME},{"<|file_sep|>",special::FILE_SEP},
+        {"<tool_response>",special::TOOL_RESPONSE_OPEN},{"</tool_response>",special::TOOL_RESPONSE_CLOSE},
+        {"<think>",special::THINK_OPEN},{"</think>",special::THINK_CLOSE},
     };
 
     // vocab.json

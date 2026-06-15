@@ -1,6 +1,7 @@
 #include "grpc_server.hpp"
 #include "scheduler.hpp"
 #include "prompt.hpp"
+#include "special_tokens.hpp"
 #include "rapidjson/document.h"
 #include "rapidjson/stringbuffer.h"
 #include "rapidjson/writer.h"
@@ -20,9 +21,6 @@ using flashqwen::GenerateRequest;
 using flashqwen::GenerateEvent;
 using flashqwen::ModelRequest;
 using flashqwen::ModelInfo;
-
-static const int EOS1 = 151645, EOS2 = 151643;        // <|im_end|>, <|endoftext|>
-static const int TOOLCALL_OPEN = 151657, TOOLCALL_CLOSE = 151658;  // <tool_call>, </tool_call>
 
 // ---- per-request server-side state ------------------------------------------------------
 // Owned by a shared_ptr held jointly by the gRPC handler thread (writes to the stream) and the
@@ -96,9 +94,9 @@ struct Engine {
         auto on_token = [&](Request* r, int t) {
             auto it = conns.find(r); if (it == conns.end()) return;
             RequestCtx* c = it->second.get();
-            if (t == EOS1 || t == EOS2) return;
-            if (t == TOOLCALL_OPEN)  { c->in_tool = true; c->tool_buf.clear(); return; }
-            if (t == TOOLCALL_CLOSE) { emit_tool(c); c->in_tool = false; return; }
+            if (special::is_eos(t)) return;
+            if (t == special::TOOL_CALL_OPEN)  { c->in_tool = true; c->tool_buf.clear(); return; }
+            if (t == special::TOOL_CALL_CLOSE) { emit_tool(c); c->in_tool = false; return; }
             std::string piece = tok.is_special(t) ? tok.token_bytes(t) : tok.stream_decode(c->detok, t);
             if (c->in_tool) c->tool_buf += piece;
             else if (!piece.empty()) { GenerateEvent ev; ev.set_text_delta(piece); c->queue.push(std::move(ev)); }
@@ -106,7 +104,7 @@ struct Engine {
         auto on_finish = [&](Request* r) {
             auto it = conns.find(r); if (it == conns.end()) return;
             RequestCtx* c = it->second.get();
-            bool eos = (r->cur == EOS1 || r->cur == EOS2);
+            bool eos = special::is_eos(r->cur);
             const char* reason = c->n_tools > 0 ? "tool_calls" : (eos ? "stop" : "length");
             int comp = (int)r->output.size() - (eos ? 1 : 0);
             GenerateEvent ev;
