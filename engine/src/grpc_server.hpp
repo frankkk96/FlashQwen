@@ -3,12 +3,12 @@
 // tokenises, runs continuous-batched generation, detects tool calls at the token level, and
 // streams typed events (text deltas / tool calls / done) back over a server-streaming RPC.
 #pragma once
-#include "model.hpp"
+#include "model_runtime.hpp"
 #include "tokenizer.hpp"
 #include "kv_cache.hpp"
 #include <string>
 #include <random>
 
-int run_grpc_server(Model& model, const KVCache& kv, const Tokenizer& tok,
+int run_grpc_server(ModelRuntime& model, const KVCache& kv, const Tokenizer& tok,
                     const std::string& address, int n_slots, const std::string& model_id,
                     std::mt19937& rng);

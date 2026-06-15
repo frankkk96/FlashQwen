@@ -12,7 +12,7 @@ static double ms_since(Clock::time_point t) {
 // Single-sequence streaming generation (interactive chat). Runs as a batch of one through the
 // same paged prefill + batched-decode path the scheduler uses. Chat is the only sequence, so it
 // gets an identity block table [0,1,2,...] over the whole pool (a contiguous KV mapping).
-GenStats generate(Model& model, const KVCache& kv, const Tokenizer& tok,
+GenStats generate(ModelRuntime& model, const KVCache& kv, const Tokenizer& tok,
                   const std::vector<int>& chunk, int& past, int max_gen, const SampleParams& sp,
                   std::mt19937& rng, bool stream, bool stop_on_eos) {
     GenStats st;

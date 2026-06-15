@@ -1,5 +1,5 @@
-// Command-line layer: turn argv into a validated Args (argument parsing + model-arch check).
-// The actual run lives in main.cpp, which just dispatches on Args::mode.
+// Command-line layer: parse argv into an Args. Pure CLI syntax — no model knowledge; whether the
+// model is supported is checked in main.cpp via ModelSpec. The run is dispatched on Args::mode.
 #pragma once
 #include <string>
 

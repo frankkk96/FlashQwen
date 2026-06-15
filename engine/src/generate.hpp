@@ -5,7 +5,7 @@
 // token is fed back through the model, the cache always holds the full prefix (which is
 // what makes multi-turn chat work).
 #pragma once
-#include "model.hpp"
+#include "model_runtime.hpp"
 #include "tokenizer.hpp"
 #include "kv_cache.hpp"
 #include "sampler.hpp"
@@ -18,6 +18,6 @@ struct GenStats {
     int n_out = 0;               // tokens emitted
 };
 
-GenStats generate(Model& model, const KVCache& kv, const Tokenizer& tok,
+GenStats generate(ModelRuntime& model, const KVCache& kv, const Tokenizer& tok,
                   const std::vector<int>& chunk, int& past, int max_gen, const SampleParams& sp,
                   std::mt19937& rng, bool stream, bool stop_on_eos);

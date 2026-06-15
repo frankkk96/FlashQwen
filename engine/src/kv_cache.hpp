@@ -11,7 +11,7 @@
 // Porting note: a different transformer that still uses a per-layer paged KV cache can reuse this
 // class unchanged — only the model's attention kernels that index k(l)/v(l) need rewriting.
 #pragma once
-#include "config.hpp"
+#include "model_spec.hpp"
 #include "kernels.cuh"   // bf16
 #include <vector>
 
@@ -21,7 +21,7 @@ public:
 
     // Carve the pool out of the VRAM left under gpu_mem_fraction. Needs room for at least one
     // full-length (max_ctx) sequence; prints an error and exits the process if not.
-    KVCache(const ModelConfig& cfg, int max_ctx, float gpu_mem_fraction);
+    KVCache(const ModelSpec& spec, int max_ctx, float gpu_mem_fraction);
     ~KVCache();
     KVCache(const KVCache&) = delete;
     KVCache& operator=(const KVCache&) = delete;

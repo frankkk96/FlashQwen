@@ -55,7 +55,7 @@ static std::vector<int> make_prompt(int n, int vocab, std::mt19937& rng) {
 
 // One static-batch run: prefill B sequences (each `input_len` tokens) into slots 0..B-1, then
 // decode all B in lock-step for `steps` tokens. Returns total decode wall time (ms).
-static double batch_decode_ms(Model& model, const KVCache& kv, int input_len, int B, int steps,
+static double batch_decode_ms(ModelRuntime& model, const KVCache& kv, int input_len, int B, int steps,
                               int vocab, std::mt19937& rng) {
     int bsz = kv.block_size();
     int nb = (input_len + steps + bsz - 1) / bsz;     // KV blocks each sequence needs
@@ -79,7 +79,7 @@ static double batch_decode_ms(Model& model, const KVCache& kv, int input_len, in
 }
 
 // Section 1: single-sequence latency sweep (batch 1). TTFT / TPOT / throughput vs prompt length.
-static void single_seq_sweep(Model& model, const KVCache& kv, const Tokenizer& tok, int max_ctx,
+static void single_seq_sweep(ModelRuntime& model, const KVCache& kv, const Tokenizer& tok, int max_ctx,
                              int vocab, SampleParams sp, std::mt19937& rng) {
     std::fprintf(stderr, "[1] single-sequence latency (batch 1, output %d tok, warmup %d, median of %d)\n\n",
                  OUTPUT_LEN, WARMUP, REPEAT);
@@ -112,7 +112,7 @@ static void single_seq_sweep(Model& model, const KVCache& kv, const Tokenizer& t
 
 // Section 2: static-batch decode throughput. For each (prompt length, batch) the per-sequence
 // TPOT and the aggregate decode throughput (all sequences together) show the batching win.
-static void batch_sweep(Model& model, const KVCache& kv, int max_ctx, int vocab, std::mt19937& rng) {
+static void batch_sweep(ModelRuntime& model, const KVCache& kv, int max_ctx, int vocab, std::mt19937& rng) {
     int max_b = model.max_batch();
     std::fprintf(stderr, "\n[2] static-batch decode throughput (output %d tok/seq, median of %d, "
                  "max batch %d)\n\n", OUTPUT_LEN, REPEAT, max_b);
@@ -144,7 +144,7 @@ static void batch_sweep(Model& model, const KVCache& kv, int max_ctx, int vocab,
 // Section 3: continuous-batching throughput on a workload with VARIED output lengths. Slots=1
 // is sequential serving (one request at a time); more slots let the scheduler keep the GPU busy
 // by admitting a new request the instant one finishes, so aggregate throughput climbs.
-static void continuous_sweep(Model& model, const KVCache& kv, int max_ctx, int vocab) {
+static void continuous_sweep(ModelRuntime& model, const KVCache& kv, int max_ctx, int vocab) {
     const int R = 32, INPUT = 128, LEN_MIN = 16, LEN_MAX = 128;
     if (INPUT + LEN_MAX >= max_ctx) {
         std::fprintf(stderr, "\n[3] continuous batching (skipped: input+output exceeds max-ctx)\n");
@@ -179,10 +179,10 @@ static void continuous_sweep(Model& model, const KVCache& kv, int max_ctx, int v
     }
 }
 
-int run_benchmark(Model& model, const KVCache& kv, const Tokenizer& tok, int max_ctx) {
+int run_benchmark(ModelRuntime& model, const KVCache& kv, const Tokenizer& tok, int max_ctx) {
     SampleParams sp{0.0f, 1.0f};   // greedy: timing shouldn't depend on sampling
     std::mt19937 rng(1234);
-    int vocab = model.config().vocab_size;
+    int vocab = model.spec().vocab_size;
 
     single_seq_sweep(model, kv, tok, max_ctx, vocab, sp, rng);
     batch_sweep(model, kv, max_ctx, vocab, rng);

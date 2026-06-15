@@ -70,7 +70,7 @@ add_executable(flashqwen
   src/safetensors.cpp
   src/kernels.cu
   src/kv_cache.cu
-  src/model.cu
+  src/model_runtime.cu
   src/tokenizer.cpp
   src/chatml.cpp
   ${PROTO_SRCS}

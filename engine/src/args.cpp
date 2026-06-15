@@ -1,27 +1,5 @@
 #include "args.hpp"
 #include "CLI11.hpp"
-#include "rapidjson/document.h"
-#include <cstdio>
-#include <fstream>
-#include <sstream>
-
-// Read architectures[0] from <dir>/config.json (empty string if unavailable).
-static std::string read_arch(const std::string& dir) {
-    std::ifstream f(dir + "/config.json");
-    if (!f) return "";
-    std::stringstream ss; ss << f.rdbuf();
-    std::string text = ss.str();
-    rapidjson::Document root;
-    root.Parse(text.c_str());
-    if (!root.HasParseError() && root.HasMember("architectures") &&
-        root["architectures"].IsArray() && !root["architectures"].Empty() &&
-        root["architectures"][0].IsString())
-        return root["architectures"][0].GetString();
-    return "";
-}
-
-// Whether FlashQwen supports this architecture (dense Qwen3 only).
-static bool arch_supported(const std::string& arch) { return arch == "Qwen3ForCausalLM"; }
 
 int parse_args(int argc, char** argv, Args& out) {
     CLI::App app{"FlashQwen — minimal from-scratch C++/CUDA inference engine for Qwen3 (dense)"};
@@ -67,15 +45,5 @@ int parse_args(int argc, char** argv, Args& out) {
     out.mode = bench->parsed() ? Args::Mode::Benchmark
              : serve->parsed() ? Args::Mode::Serve
                                : Args::Mode::Chat;
-
-    std::string arch = read_arch(out.model_dir);
-    if (!arch_supported(arch)) {
-        std::fprintf(stderr,
-            "error: '%s' has no readable config.json / unsupported architecture '%s'.\n"
-            "       --model must point at a plain dir with config.json + *.safetensors +\n"
-            "       vocab.json + merges.txt; FlashQwen supports dense Qwen3 (Qwen3ForCausalLM).\n",
-            out.model_dir.c_str(), arch.empty() ? "unknown" : arch.c_str());
-        return 1;
-    }
-    return -1;   // parsed and validated; main continues
+    return -1;   // parsed OK; main continues (model-arch support is checked there via ModelSpec)
 }

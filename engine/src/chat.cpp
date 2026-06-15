@@ -18,7 +18,7 @@ static std::string user_chunk(const std::string& msg, bool first, bool think) {
     return s;
 }
 
-int run_chat(Model& model, const KVCache& kv, const Tokenizer& tok, SampleParams sp,
+int run_chat(ModelRuntime& model, const KVCache& kv, const Tokenizer& tok, SampleParams sp,
              std::mt19937& rng, bool think, int max_ctx) {
     std::printf("\nFlashQwen interactive chat. Commands: /exit /quit /reset /think on|off\n");
     int past = 0; bool first = true;

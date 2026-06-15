@@ -53,7 +53,7 @@ struct RequestCtx {
 
 // ---- the engine: the single thread that touches the model / GPU -------------------------
 struct Engine {
-    Model& model; const KVCache& kv; const Tokenizer& tok; std::mt19937& rng; int n_slots;
+    ModelRuntime& model; const KVCache& kv; const Tokenizer& tok; std::mt19937& rng; int n_slots;
     std::mutex mu; std::condition_variable cv;
     std::deque<std::shared_ptr<RequestCtx>> inbound;
     std::deque<Request*> cancel_q;
@@ -192,7 +192,7 @@ private:
     std::string model_id_;
 };
 
-int run_grpc_server(Model& model, const KVCache& kv, const Tokenizer& tok,
+int run_grpc_server(ModelRuntime& model, const KVCache& kv, const Tokenizer& tok,
                     const std::string& address, int n_slots, const std::string& model_id,
                     std::mt19937& rng) {
     if (n_slots > model.max_batch()) n_slots = model.max_batch();

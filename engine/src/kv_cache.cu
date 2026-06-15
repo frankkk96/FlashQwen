@@ -3,8 +3,8 @@
 #include <cstdio>
 #include <cstdlib>
 
-KVCache::KVCache(const ModelConfig& cfg, int max_ctx, float gpu_mem_fraction) {
-    int kvd = cfg.kv_dim();
+KVCache::KVCache(const ModelSpec& spec, int max_ctx, float gpu_mem_fraction) {
+    int kvd = spec.kv_dim();
     max_blocks_ = (max_ctx + BLOCK - 1) / BLOCK;   // block-table length for a full-length sequence
 
     // The pool gets whatever VRAM is left under the gpu_mem_fraction cap, carved into fixed-size
@@ -15,7 +15,7 @@ KVCache::KVCache(const ModelConfig& cfg, int max_ctx, float gpu_mem_fraction) {
     size_t used      = totalb - freeb;
     size_t budget    = (size_t)(totalb * gpu_mem_fraction);
     size_t kv_avail  = budget > used ? budget - used : 0;
-    size_t per_block = (size_t)cfg.num_layers * 2 * BLOCK * kvd * sizeof(bf16);
+    size_t per_block = (size_t)spec.num_layers * 2 * BLOCK * kvd * sizeof(bf16);
     num_blocks_ = (int)(kv_avail / per_block);
     if (num_blocks_ < max_blocks_) {
         std::fprintf(stderr, "error: not enough VRAM for even one full-length sequence at "
@@ -25,9 +25,9 @@ KVCache::KVCache(const ModelConfig& cfg, int max_ctx, float gpu_mem_fraction) {
         std::exit(1);
     }
 
-    k_.resize(cfg.num_layers);
-    v_.resize(cfg.num_layers);
-    for (int l = 0; l < cfg.num_layers; ++l) {
+    k_.resize(spec.num_layers);
+    v_.resize(spec.num_layers);
+    for (int l = 0; l < spec.num_layers; ++l) {
         CUDA_CHECK(cudaMalloc(&k_[l], (size_t)num_blocks_ * BLOCK * kvd * sizeof(bf16)));
         CUDA_CHECK(cudaMalloc(&v_[l], (size_t)num_blocks_ * BLOCK * kvd * sizeof(bf16)));
     }

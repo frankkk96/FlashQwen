@@ -1,21 +1,23 @@
-// Qwen3 dense decoder: weight management + forward pass on the GPU.
+// Qwen3 dense decoder — the GPU executor: weight management + forward pass. The declarative half
+// (dims, arch) is ModelSpec (model_spec.hpp). Porting note: this is the compute half — the kernels
+// and the prefill/decode forward are what you rewrite for a different model.
 #pragma once
-#include "config.hpp"
+#include "model_spec.hpp"
 #include "safetensors.hpp"
 #include "kernels.cuh"
 #include "kv_cache.hpp"
 #include <vector>
 #include <string>
 
-class Model {
+class ModelRuntime {
 public:
-    // Loads weights from <dir> (config.json + safetensors). max_ctx bounds the per-sequence KV
-    // cache and the prefill batch size. Allocates weights + activation scratch only — the paged KV
-    // pool lives in a separate KVCache; attach one (sized from the VRAM left after load) before any
-    // prefill/decode call.
-    void load(const std::string& dir, int max_ctx);
+    // Load the weights described by `spec` (safetensors, from spec.dir). max_ctx bounds the
+    // per-sequence KV cache and the prefill batch size. Allocates weights + activation scratch only
+    // — the paged KV pool lives in a separate KVCache; attach one (sized from the VRAM left after
+    // construction) before any prefill/decode call.
+    ModelRuntime(const ModelSpec& spec, int max_ctx);
     void attach_kv(const KVCache& kv) { kv_ = &kv; }   // non-owning; storage for the attention kernels
-    ~Model();
+    ~ModelRuntime();
 
     // --- single-sequence prefill ---------------------------------------------------------
     // Prefill `tokens` into the sequence whose paged KV is described by `block_table` (physical
@@ -38,7 +40,7 @@ public:
     const float* decode_logits_host(const std::vector<int>& in_tokens, const std::vector<int>& past_len,
                                     const std::vector<std::vector<int>>& block_tables);
 
-    const ModelConfig& config() const { return cfg_; }
+    const ModelSpec& spec() const { return spec_; }
     int max_ctx() const { return max_ctx_; }
     int max_batch() const { return MAX_DECODE_B; }                 // concurrent decode cap
 
@@ -59,7 +61,7 @@ private:
     void decode_forward(const std::vector<int>& in_tokens, const std::vector<int>& past_len,
                         const std::vector<std::vector<int>>& block_tables);  // -> logits_ [B, vocab]
 
-    ModelConfig cfg_;
+    ModelSpec spec_;
     SafeTensors st_;
     int max_ctx_     = 4096;
     int max_blocks_  = 0;    // ceil(max_ctx / KVCache::BLOCK) = max block-table length per sequence
