@@ -13,7 +13,8 @@
 // exact same logic: add() enqueues, step() advances one iteration and reports tokens / finishes
 // through callbacks.
 #pragma once
-#include "model/model.hpp"
+#include "model.hpp"
+#include "kv_cache.hpp"
 #include "sampler.hpp"
 #include <vector>
 #include <deque>
@@ -34,7 +35,7 @@ struct Request {
 
 class Scheduler {
 public:
-    Scheduler(Model& model, int n_slots, bool stop_on_eos, std::mt19937& rng);
+    Scheduler(Model& model, const KVCache& kv, int n_slots, bool stop_on_eos, std::mt19937& rng);
 
     void add(Request* r);           // enqueue a new request (not yet prefilled)
     void remove(Request* r);        // drop a request (cancellation); frees its blocks. Engine-thread only.
@@ -54,6 +55,7 @@ private:
     void release(Request* r);               // return a finished/preempted seq's blocks to the pool
 
     Model& model_;
+    const KVCache& kv_;
     int  n_slots_, max_ctx_, V_, bsz_;
     bool stop_on_eos_;
     std::mt19937& rng_;
@@ -72,5 +74,5 @@ private:
 
 // Offline convenience: serve a fixed set of requests to completion using up to n_slots
 // concurrent sequences. Each request samples with its own SampleParams (greedy when temp<=0).
-void run_continuous(Model& model, std::vector<Request>& reqs, int n_slots, bool stop_on_eos,
-                    std::mt19937& rng);
+void run_continuous(Model& model, const KVCache& kv, std::vector<Request>& reqs, int n_slots,
+                    bool stop_on_eos, std::mt19937& rng);

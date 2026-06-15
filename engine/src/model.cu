@@ -77,7 +77,7 @@ Model::QWeight Model::upload_int8(const std::string& name) {
     return qw;
 }
 
-void Model::load(const std::string& dir, int max_ctx, float gpu_mem_fraction) {
+void Model::load(const std::string& dir, int max_ctx) {
     cfg_ = ModelConfig::load(dir + "/config.json");
     max_ctx_ = ((max_ctx + 15) / 16) * 16;   // round up so WMMA tiles never read past buffers
     std::fprintf(stderr, "[model] loading weights from %s ...\n", dir.c_str());
@@ -132,7 +132,7 @@ void Model::load(const std::string& dir, int max_ctx, float gpu_mem_fraction) {
     // Paged-KV indexing buffers. d_bt_ holds up to MAX_DECODE_B padded block tables (one per
     // decode-batch row, or row 0 for prefill). d_iota_ = {0,1,..} is the decode bt_row map;
     // d_zero_ = {0,0,..} is the prefill bt_row map (all M tokens use block-table row 0).
-    max_blocks_ = (max_ctx_ + block_ - 1) / block_;
+    max_blocks_ = (max_ctx_ + KVCache::BLOCK - 1) / KVCache::BLOCK;
     CUDA_CHECK(cudaMalloc(&d_bt_,   (size_t)MAX_DECODE_B * max_blocks_ * sizeof(int)));
     CUDA_CHECK(cudaMalloc(&d_iota_, MAX_DECODE_B * sizeof(int)));
     CUDA_CHECK(cudaMalloc(&d_zero_, max_ctx_ * sizeof(int)));
@@ -151,37 +151,11 @@ void Model::load(const std::string& dir, int max_ctx, float gpu_mem_fraction) {
     CUDA_CHECK(cudaStreamCreate(&stream_));
     host_logits_.resize((size_t)MAX_DECODE_B * V);
 
-    // Everything except the KV pool is now allocated. Give the pool whatever VRAM is left under
-    // the gpu_mem_fraction cap, carved into fixed-size blocks of `block_` tokens. Unlike a
-    // per-sequence reservation, blocks are handed out on demand by the scheduler, so the number
-    // of concurrent sequences is decoupled from max_ctx.
     size_t freeb, totalb;
     CUDA_CHECK(cudaMemGetInfo(&freeb, &totalb));
-    size_t used = totalb - freeb;
-    size_t budget = (size_t)(totalb * gpu_mem_fraction);
-    size_t kv_avail = budget > used ? budget - used : 0;
-    size_t per_block = (size_t)cfg_.num_layers * 2 * block_ * kvd * sizeof(bf16);
-    num_blocks_ = (int)(kv_avail / per_block);
-    if (num_blocks_ < max_blocks_) {
-        std::fprintf(stderr, "error: not enough VRAM for even one full-length sequence at "
-                     "max_ctx=%d (need %d blocks = %.1f GB, have %d blocks = %.1f GB under the "
-                     "%.0f%% cap).\n", max_ctx_, max_blocks_, max_blocks_ * per_block / 1e9,
-                     num_blocks_, kv_avail / 1e9, gpu_mem_fraction * 100);
-        std::exit(1);
-    }
-
-    cache_k_.resize(cfg_.num_layers);
-    cache_v_.resize(cfg_.num_layers);
-    for (int l = 0; l < cfg_.num_layers; ++l) {
-        CUDA_CHECK(cudaMalloc(&cache_k_[l], (size_t)num_blocks_ * block_ * kvd * sizeof(bf16)));
-        CUDA_CHECK(cudaMalloc(&cache_v_[l], (size_t)num_blocks_ * block_ * kvd * sizeof(bf16)));
-    }
-
-    CUDA_CHECK(cudaMemGetInfo(&freeb, &totalb));
-    std::fprintf(stderr, "[model] ready. %d KV blocks x %d tok = %d-token pool (max_ctx=%d, up to "
-                 "%d concurrent). GPU mem: %.1f GB used / %.1f GB total\n",
-                 num_blocks_, block_, num_blocks_ * block_, max_ctx_, max_batch(),
-                 (totalb - freeb) / 1e9, totalb / 1e9);
+    std::fprintf(stderr, "[model] weights + activations ready (max_ctx=%d, up to %d concurrent). "
+                 "GPU mem: %.1f GB used / %.1f GB total. KV pool allocated separately.\n",
+                 max_ctx_, max_batch(), (totalb - freeb) / 1e9, totalb / 1e9);
 }
 
 // --- single-sequence prefill: M tokens into the paged KV described by d_bt_ row 0 ----------
@@ -210,10 +184,11 @@ void Model::run_layers_prefill(int M) {
         launch_rope(q_, d_pos_, M, nH,  hd, c.rope_theta, s);
         launch_rope(k_, d_pos_, M, nKV, hd, c.rope_theta, s);
 
-        launch_store_kv_paged(k_, cache_k_[l], d_bt_, bt_stride_, block_, KVD, d_zero_, d_pos_, M, s);
-        launch_store_kv_paged(v_, cache_v_[l], d_bt_, bt_stride_, block_, KVD, d_zero_, d_pos_, M, s);
-        launch_attention_paged(q_, cache_k_[l], cache_v_[l], attn_, M, nH, nKV, hd, d_past_, scale,
-                               d_bt_, bt_stride_, block_, s);
+        int blk = kv_->block_size();
+        launch_store_kv_paged(k_, kv_->k(l), d_bt_, bt_stride_, blk, KVD, d_zero_, d_pos_, M, s);
+        launch_store_kv_paged(v_, kv_->v(l), d_bt_, bt_stride_, blk, KVD, d_zero_, d_pos_, M, s);
+        launch_attention_paged(q_, kv_->k(l), kv_->v(l), attn_, M, nH, nKV, hd, d_past_, scale,
+                               d_bt_, bt_stride_, blk, s);
 
         launch_matmul(attn_, L.o_proj.w, L.o_proj.scale, xb2_, M, QD, H, xbf_, w_dq_, s);
         launch_add(x_, xb2_, M * H, s);
@@ -271,10 +246,11 @@ void Model::run_layers_decode(int B) {
 
         // append each sequence's new K/V at its logical position past_len[b] (= d_pos_); the
         // block table (d_bt_, row b via d_iota_) maps that to a physical block row.
-        launch_store_kv_paged(k_, cache_k_[l], d_bt_, bt_stride_, block_, KVD, d_iota_, d_pos_, B, s);
-        launch_store_kv_paged(v_, cache_v_[l], d_bt_, bt_stride_, block_, KVD, d_iota_, d_pos_, B, s);
-        launch_attention_decode_paged(q_, cache_k_[l], cache_v_[l], attn_, B, nH, nKV, hd,
-                                      d_pos_, d_bt_, bt_stride_, block_, scale,
+        int blk = kv_->block_size();
+        launch_store_kv_paged(k_, kv_->k(l), d_bt_, bt_stride_, blk, KVD, d_iota_, d_pos_, B, s);
+        launch_store_kv_paged(v_, kv_->v(l), d_bt_, bt_stride_, blk, KVD, d_iota_, d_pos_, B, s);
+        launch_attention_decode_paged(q_, kv_->k(l), kv_->v(l), attn_, B, nH, nKV, hd,
+                                      d_pos_, d_bt_, bt_stride_, blk, scale,
                                       part_m_, part_l_, part_acc_, s);
 
         launch_matmul_decode(attn_, L.o_proj.w, L.o_proj.scale, xb2_, B, QD, H, s);
@@ -358,8 +334,6 @@ Model::~Model() {
     for (auto p : all_bufs_)  if (p) cudaFree(p);
     for (auto p : all_fbufs_) if (p) cudaFree(p);
     for (auto p : all_i8_)    if (p) cudaFree(p);
-    for (auto p : cache_k_)   if (p) cudaFree(p);
-    for (auto p : cache_v_)   if (p) cudaFree(p);
     cudaFree(x_); cudaFree(xb_); cudaFree(xb2_); cudaFree(q_); cudaFree(k_); cudaFree(v_);
     cudaFree(attn_); cudaFree(gate_); cudaFree(up_); cudaFree(hmlp_); cudaFree(logits_);
     cudaFree(xbf_); cudaFree(w_dq_); cudaFree(part_m_); cudaFree(part_l_); cudaFree(part_acc_);

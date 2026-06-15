@@ -3,15 +3,18 @@
 #include "config.hpp"
 #include "safetensors.hpp"
 #include "kernels.cuh"
+#include "kv_cache.hpp"
 #include <vector>
 #include <string>
 
 class Model {
 public:
     // Loads weights from <dir> (config.json + safetensors). max_ctx bounds the per-sequence KV
-    // cache and the prefill batch size. gpu_mem_fraction caps total VRAM use; whatever is left
-    // after weights + activations becomes the KV pool, which fixes the number of sequence slots.
-    void load(const std::string& dir, int max_ctx, float gpu_mem_fraction);
+    // cache and the prefill batch size. Allocates weights + activation scratch only — the paged KV
+    // pool lives in a separate KVCache; attach one (sized from the VRAM left after load) before any
+    // prefill/decode call.
+    void load(const std::string& dir, int max_ctx);
+    void attach_kv(const KVCache& kv) { kv_ = &kv; }   // non-owning; storage for the attention kernels
     ~Model();
 
     // --- single-sequence prefill ---------------------------------------------------------
@@ -37,9 +40,6 @@ public:
 
     const ModelConfig& config() const { return cfg_; }
     int max_ctx() const { return max_ctx_; }
-    int block_size() const { return block_; }                      // tokens per KV block (page)
-    int num_blocks() const { return num_blocks_; }                 // physical blocks in the pool
-    int max_blocks_per_seq() const { return max_blocks_; }         // ceil(max_ctx / block_size)
     int max_batch() const { return MAX_DECODE_B; }                 // concurrent decode cap
 
 private:
@@ -62,18 +62,15 @@ private:
     ModelConfig cfg_;
     SafeTensors st_;
     int max_ctx_     = 4096;
-    int block_       = 16;   // tokens per KV block (page)
-    int num_blocks_  = 0;    // physical blocks in the paged KV pool
-    int max_blocks_  = 0;    // ceil(max_ctx / block_) = max block-table length per sequence
+    int max_blocks_  = 0;    // ceil(max_ctx / KVCache::BLOCK) = max block-table length per sequence
     int bt_stride_   = 0;    // current block-table row stride uploaded to d_bt_
+
+    const KVCache* kv_ = nullptr;   // paged KV storage the attention kernels read/write (non-owning)
 
     bf16*   embed_  = nullptr;
     float*  fnorm_  = nullptr;
     QWeight lm_head_;
     std::vector<Layer> layers_;
-
-    // Paged KV pool: per layer [num_blocks, block_, kv_dim], stored BF16
-    std::vector<bf16*> cache_k_, cache_v_;
 
     // activation scratch (sized to max_ctx tokens, which also covers any decode batch)
     float *x_, *xb_, *xb2_, *q_, *k_, *v_, *attn_, *gate_, *up_, *hmlp_, *logits_;

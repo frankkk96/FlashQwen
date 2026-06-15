@@ -60,7 +60,7 @@ add_custom_command(
 
 add_executable(flashqwen
   src/main.cpp
-  src/cli.cpp
+  src/args.cpp
   src/sampler.cpp
   src/generate.cpp
   src/chat.cpp
@@ -69,9 +69,10 @@ add_executable(flashqwen
   src/grpc_server.cpp
   src/safetensors.cpp
   src/kernels.cu
-  src/model/model.cu
-  src/model/tokenizer.cpp
-  src/model/prompt.cpp
+  src/kv_cache.cu
+  src/model.cu
+  src/tokenizer.cpp
+  src/chatml.cpp
   ${PROTO_SRCS}
 )
 target_include_directories(flashqwen PRIVATE src third_party ${GEN_DIR})  # third_party: RapidJSON + CLI11

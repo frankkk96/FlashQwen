@@ -1,4 +1,4 @@
-#include "prompt.hpp"
+#include "chatml.hpp"
 #include "rapidjson/stringbuffer.h"
 #include "rapidjson/writer.h"
 

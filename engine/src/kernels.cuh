@@ -48,17 +48,11 @@ void launch_embed(const int* ids, const bf16* embed, float* out, int M, int H, c
 // In-place rotary position embedding on x[M, n_heads, head_dim], positions pos[M].
 void launch_rope(float* x, const int* pos, int M, int n_heads, int head_dim, float theta, cudaStream_t s);
 
-// ---- Paged KV cache ---------------------------------------------------------------------
+// ---- Paged KV cache attention -----------------------------------------------------------
 // The KV pool for a layer is [num_blocks, BLOCK, kv_dim] BF16. A sequence's KV is a list of
-// physical block ids — its "block table". Logical position p of a sequence lives at physical
-// row  block_table[p / BLOCK] * BLOCK + (p % BLOCK),  addressed as cache + row*kv_dim.
-// `bt` holds one block table per row (stride `max_blocks`); a sequence is identified by its row.
-
-// Store M new K (or V) rows into the paged pool. Token m belongs to the sequence whose block
-// table is row bt_row[m] of `bt`, at logical position pos[m].
-void launch_store_kv_paged(const float* src, bf16* cache, const int* bt, int max_blocks,
-                           int block_size, int kv_dim, const int* bt_row, const int* pos,
-                           int M, cudaStream_t s);
+// physical block ids — its "block table"; the logical->physical addressing lives in kv_cache.cuh
+// (kv_phys_row), and the write side (store) in kv_cache.* . `bt` holds one block table per row
+// (stride `max_blocks`); a sequence is identified by its row.
 
 // Prefill attention (M query rows of ONE sequence, block table = row 0 of `bt`) over the paged
 // pool. q[M, n_heads, hd] FP32; out[M, n_heads, hd]. Query token m attends keys [0, *d_past + m].

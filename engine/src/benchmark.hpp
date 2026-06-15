@@ -5,7 +5,8 @@
 // TTFT / TPOT / decode / output / peak throughput (median of a few runs, after a warmup).
 // The sweep parameters are defined inside benchmark.cpp; there are no benchmark CLI flags.
 #pragma once
-#include "model/model.hpp"
-#include "model/tokenizer.hpp"
+#include "model.hpp"
+#include "tokenizer.hpp"
+#include "kv_cache.hpp"
 
-int run_benchmark(Model& model, const Tokenizer& tok, int max_ctx);
+int run_benchmark(Model& model, const KVCache& kv, const Tokenizer& tok, int max_ctx);

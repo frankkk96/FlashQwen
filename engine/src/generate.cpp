@@ -1,5 +1,5 @@
 #include "generate.hpp"
-#include "model/special_tokens.hpp"
+#include "special_tokens.hpp"
 #include <chrono>
 #include <cstdio>
 #include <string>
@@ -12,13 +12,13 @@ static double ms_since(Clock::time_point t) {
 // Single-sequence streaming generation (interactive chat). Runs as a batch of one through the
 // same paged prefill + batched-decode path the scheduler uses. Chat is the only sequence, so it
 // gets an identity block table [0,1,2,...] over the whole pool (a contiguous KV mapping).
-GenStats generate(Model& model, const Tokenizer& tok, const std::vector<int>& chunk,
-                  int& past, int max_gen, const SampleParams& sp, std::mt19937& rng,
-                  bool stream, bool stop_on_eos) {
+GenStats generate(Model& model, const KVCache& kv, const Tokenizer& tok,
+                  const std::vector<int>& chunk, int& past, int max_gen, const SampleParams& sp,
+                  std::mt19937& rng, bool stream, bool stop_on_eos) {
     GenStats st;
     Tokenizer::Stream detok;
     std::vector<int> out;
-    std::vector<int> bt(model.max_blocks_per_seq());
+    std::vector<int> bt(kv.max_blocks_per_seq());
     for (int i = 0; i < (int)bt.size(); ++i) bt[i] = i;
 
     // prefill (TTFT): extend the sequence by `chunk` at position `past`.

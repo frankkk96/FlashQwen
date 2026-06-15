@@ -1,6 +1,6 @@
 #include "chat.hpp"
 #include "generate.hpp"
-#include "model/prompt.hpp"
+#include "chatml.hpp"
 #include <cstdio>
 #include <iostream>
 #include <string>
@@ -18,8 +18,8 @@ static std::string user_chunk(const std::string& msg, bool first, bool think) {
     return s;
 }
 
-int run_chat(Model& model, const Tokenizer& tok, SampleParams sp, std::mt19937& rng,
-             bool think, int max_ctx) {
+int run_chat(Model& model, const KVCache& kv, const Tokenizer& tok, SampleParams sp,
+             std::mt19937& rng, bool think, int max_ctx) {
     std::printf("\nFlashQwen interactive chat. Commands: /exit /quit /reset /think on|off\n");
     int past = 0; bool first = true;
     while (true) {
@@ -42,7 +42,7 @@ int run_chat(Model& model, const Tokenizer& tok, SampleParams sp, std::mt19937& 
 
         std::printf("\033[1mAssistant:\033[0m ");
         std::fflush(stdout);
-        generate(model, tok, ids, past, max_ctx, sp, rng, /*stream=*/true, /*stop_on_eos=*/true);
+        generate(model, kv, tok, ids, past, max_ctx, sp, rng, /*stream=*/true, /*stop_on_eos=*/true);
         std::printf("\n");
     }
     return 0;

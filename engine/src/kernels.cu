@@ -1,4 +1,5 @@
 #include "kernels.cuh"
+#include "kv_cache.cuh"   // kv_phys_row: the paged-KV addressing contract (shared with kv_cache.cu)
 #include <mma.h>
 using namespace nvcuda;
 
@@ -233,28 +234,6 @@ void launch_rope(float* x, const int* pos, int M, int n_heads, int head_dim, flo
 // the per-token / per-key row lookup now goes through the block table.
 // ---------------------------------------------------------------------------------------
 
-// Store M new K (or V) rows into the paged pool. Token m -> block-table row bt_row[m], logical
-// position pos[m].
-__global__ void store_kv_paged_kernel(const float* __restrict__ src, bf16* __restrict__ cache,
-                                      const int* __restrict__ bt, int max_blocks, int block_size,
-                                      int kv_dim, const int* __restrict__ bt_row,
-                                      const int* __restrict__ pos, int M) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= M * kv_dim) return;
-    int m = idx / kv_dim, i = idx % kv_dim;
-    int p = pos[m], g = p / block_size, off = p - g * block_size;
-    size_t phys = (size_t)bt[(size_t)bt_row[m] * max_blocks + g] * block_size + off;
-    cache[phys * kv_dim + i] = __float2bfloat16(src[idx]);
-}
-
-void launch_store_kv_paged(const float* src, bf16* cache, const int* bt, int max_blocks,
-                           int block_size, int kv_dim, const int* bt_row, const int* pos,
-                           int M, cudaStream_t s) {
-    int n = M * kv_dim, blk = 256;
-    store_kv_paged_kernel<<<(n + blk - 1) / blk, blk, 0, s>>>(
-        src, cache, bt, max_blocks, block_size, kv_dim, bt_row, pos, M);
-}
-
 // Prefill attention — one WARP per (head, query token), online softmax over the paged KV. Each
 // lane owns head_dim/32 dims; the per-key q.k dot is a warp-shuffle reduction (no __syncthreads).
 __global__ void attention_paged_kernel(const float* __restrict__ q, const bf16* __restrict__ cache_k,
@@ -277,8 +256,7 @@ __global__ void attention_paged_kernel(const float* __restrict__ q, const bf16* 
     float m_run = -1e30f, l_run = 0.f;
 
     for (int j = 0; j <= qpos; ++j) {
-        int g = j / block_size, off = j - g * block_size;
-        size_t phys = (size_t)bt[g] * block_size + off;          // block table row 0
+        size_t phys = kv_phys_row(bt, j, block_size);            // block table row 0
         const bf16* kj = cache_k + phys * kv_dim + kvh * head_dim;
         float partial = 0.f;
         #pragma unroll
@@ -333,8 +311,7 @@ __global__ void attn_decode_split_paged_kernel(
     float m_run = -1e30f, l_run = 0.f;
 
     for (int j = kb; j < ke; ++j) {
-        int g = j / block_size, off = j - g * block_size;
-        size_t phys = (size_t)btb[g] * block_size + off;
+        size_t phys = kv_phys_row(btb, j, block_size);
         const bf16* kj = cache_k + phys * kv_dim + kvh * head_dim;
         float p = 0.f;
         #pragma unroll

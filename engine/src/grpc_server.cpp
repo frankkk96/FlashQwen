@@ -1,7 +1,7 @@
 #include "grpc_server.hpp"
 #include "scheduler.hpp"
-#include "model/prompt.hpp"
-#include "model/special_tokens.hpp"
+#include "chatml.hpp"
+#include "special_tokens.hpp"
 #include "rapidjson/document.h"
 #include "rapidjson/stringbuffer.h"
 #include "rapidjson/writer.h"
@@ -53,7 +53,7 @@ struct RequestCtx {
 
 // ---- the engine: the single thread that touches the model / GPU -------------------------
 struct Engine {
-    Model& model; const Tokenizer& tok; std::mt19937& rng; int n_slots;
+    Model& model; const KVCache& kv; const Tokenizer& tok; std::mt19937& rng; int n_slots;
     std::mutex mu; std::condition_variable cv;
     std::deque<std::shared_ptr<RequestCtx>> inbound;
     std::deque<Request*> cancel_q;
@@ -88,7 +88,7 @@ struct Engine {
     }
 
     void run() {
-        Scheduler sched(model, n_slots, /*stop_on_eos=*/true, rng);
+        Scheduler sched(model, kv, n_slots, /*stop_on_eos=*/true, rng);
         std::unordered_map<Request*, std::shared_ptr<RequestCtx>> conns;
 
         auto on_token = [&](Request* r, int t) {
@@ -192,10 +192,11 @@ private:
     std::string model_id_;
 };
 
-int run_grpc_server(Model& model, const Tokenizer& tok, const std::string& address,
-                    int n_slots, const std::string& model_id, std::mt19937& rng) {
+int run_grpc_server(Model& model, const KVCache& kv, const Tokenizer& tok,
+                    const std::string& address, int n_slots, const std::string& model_id,
+                    std::mt19937& rng) {
     if (n_slots > model.max_batch()) n_slots = model.max_batch();
-    Engine engine{model, tok, rng, n_slots};
+    Engine engine{model, kv, tok, rng, n_slots};
     std::thread engine_thread([&] { engine.run(); });
     engine_thread.detach();
 

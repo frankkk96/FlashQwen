@@ -55,9 +55,9 @@ static std::vector<int> make_prompt(int n, int vocab, std::mt19937& rng) {
 
 // One static-batch run: prefill B sequences (each `input_len` tokens) into slots 0..B-1, then
 // decode all B in lock-step for `steps` tokens. Returns total decode wall time (ms).
-static double batch_decode_ms(Model& model, int input_len, int B, int steps,
+static double batch_decode_ms(Model& model, const KVCache& kv, int input_len, int B, int steps,
                               int vocab, std::mt19937& rng) {
-    int bsz = model.block_size();
+    int bsz = kv.block_size();
     int nb = (input_len + steps + bsz - 1) / bsz;     // KV blocks each sequence needs
     std::vector<std::vector<int>> prompts(B), bts(B);
     std::vector<int> cur(B), past(B), out;
@@ -79,8 +79,8 @@ static double batch_decode_ms(Model& model, int input_len, int B, int steps,
 }
 
 // Section 1: single-sequence latency sweep (batch 1). TTFT / TPOT / throughput vs prompt length.
-static void single_seq_sweep(Model& model, const Tokenizer& tok, int max_ctx, int vocab,
-                             SampleParams sp, std::mt19937& rng) {
+static void single_seq_sweep(Model& model, const KVCache& kv, const Tokenizer& tok, int max_ctx,
+                             int vocab, SampleParams sp, std::mt19937& rng) {
     std::fprintf(stderr, "[1] single-sequence latency (batch 1, output %d tok, warmup %d, median of %d)\n\n",
                  OUTPUT_LEN, WARMUP, REPEAT);
     std::fprintf(stderr, "  input    TTFT      TPOT     decode     output      peak\n");
@@ -94,7 +94,7 @@ static void single_seq_sweep(Model& model, const Tokenizer& tok, int max_ctx, in
         std::vector<int> ids = make_prompt(isl, vocab, rng);
         auto one_run = [&]() {
             int past = 0;
-            return generate(model, tok, ids, past, OUTPUT_LEN, sp, rng,
+            return generate(model, kv, tok, ids, past, OUTPUT_LEN, sp, rng,
                             /*stream=*/false, /*stop_on_eos=*/false);
         };
         for (int w = 0; w < WARMUP; ++w) one_run();
@@ -112,7 +112,7 @@ static void single_seq_sweep(Model& model, const Tokenizer& tok, int max_ctx, in
 
 // Section 2: static-batch decode throughput. For each (prompt length, batch) the per-sequence
 // TPOT and the aggregate decode throughput (all sequences together) show the batching win.
-static void batch_sweep(Model& model, int max_ctx, int vocab, std::mt19937& rng) {
+static void batch_sweep(Model& model, const KVCache& kv, int max_ctx, int vocab, std::mt19937& rng) {
     int max_b = model.max_batch();
     std::fprintf(stderr, "\n[2] static-batch decode throughput (output %d tok/seq, median of %d, "
                  "max batch %d)\n\n", OUTPUT_LEN, REPEAT, max_b);
@@ -129,10 +129,10 @@ static void batch_sweep(Model& model, int max_ctx, int vocab, std::mt19937& rng)
                 std::fprintf(stderr, "  %5d  %5d   (skipped: exceeds max batch %d)\n", isl, B, max_b);
                 continue;
             }
-            batch_decode_ms(model, isl, B, OUTPUT_LEN, vocab, rng);   // warmup
+            batch_decode_ms(model, kv, isl, B, OUTPUT_LEN, vocab, rng);   // warmup
             std::vector<double> tpot, agg;
             for (int r = 0; r < REPEAT; ++r) {
-                double dec = batch_decode_ms(model, isl, B, OUTPUT_LEN, vocab, rng);
+                double dec = batch_decode_ms(model, kv, isl, B, OUTPUT_LEN, vocab, rng);
                 tpot.push_back(dec / OUTPUT_LEN);
                 agg.push_back((double)B * OUTPUT_LEN / (dec / 1000.0));
             }
@@ -144,7 +144,7 @@ static void batch_sweep(Model& model, int max_ctx, int vocab, std::mt19937& rng)
 // Section 3: continuous-batching throughput on a workload with VARIED output lengths. Slots=1
 // is sequential serving (one request at a time); more slots let the scheduler keep the GPU busy
 // by admitting a new request the instant one finishes, so aggregate throughput climbs.
-static void continuous_sweep(Model& model, int max_ctx, int vocab) {
+static void continuous_sweep(Model& model, const KVCache& kv, int max_ctx, int vocab) {
     const int R = 32, INPUT = 128, LEN_MIN = 16, LEN_MAX = 128;
     if (INPUT + LEN_MAX >= max_ctx) {
         std::fprintf(stderr, "\n[3] continuous batching (skipped: input+output exceeds max-ctx)\n");
@@ -162,15 +162,15 @@ static void continuous_sweep(Model& model, int max_ctx, int vocab) {
     auto time_slots = [&](int ns) {
         std::vector<Request> w = base;                       // fresh copy (base.output stays empty)
         auto t0 = Clock::now();
-        run_continuous(model, w, ns, /*stop_on_eos=*/false, rng);
+        run_continuous(model, kv, w, ns, /*stop_on_eos=*/false, rng);
         return ms_since(t0);
     };
 
     std::fprintf(stderr, "\n[3] continuous-batching throughput (%d requests, input %d, output %d-%d "
                  "random)\n", R, INPUT, LEN_MIN, LEN_MAX);
     std::fprintf(stderr, "    paged KV: %d blocks x %d tok = %d-token pool (vs %d-token reservation "
-                 "per slot if unpaged)\n\n", model.num_blocks(), model.block_size(),
-                 model.num_blocks() * model.block_size(), max_ctx);
+                 "per slot if unpaged)\n\n", kv.num_blocks(), kv.block_size(),
+                 kv.num_blocks() * kv.block_size(), max_ctx);
     std::fprintf(stderr, "  slots    wall (s)   aggregate tok/s\n");
     for (int ns : {1, 8, 16}) {
         if (ns > model.max_batch()) continue;
@@ -179,13 +179,13 @@ static void continuous_sweep(Model& model, int max_ctx, int vocab) {
     }
 }
 
-int run_benchmark(Model& model, const Tokenizer& tok, int max_ctx) {
+int run_benchmark(Model& model, const KVCache& kv, const Tokenizer& tok, int max_ctx) {
     SampleParams sp{0.0f, 1.0f};   // greedy: timing shouldn't depend on sampling
     std::mt19937 rng(1234);
     int vocab = model.config().vocab_size;
 
-    single_seq_sweep(model, tok, max_ctx, vocab, sp, rng);
-    batch_sweep(model, max_ctx, vocab, rng);
-    continuous_sweep(model, max_ctx, vocab);
+    single_seq_sweep(model, kv, tok, max_ctx, vocab, sp, rng);
+    batch_sweep(model, kv, max_ctx, vocab, rng);
+    continuous_sweep(model, kv, max_ctx, vocab);
     return 0;
 }
