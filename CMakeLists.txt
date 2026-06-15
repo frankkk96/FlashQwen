@@ -32,5 +32,5 @@ add_executable(flashqwen
   src/model.cu
   src/kernels.cu
 )
-target_include_directories(flashqwen PRIVATE src)
+target_include_directories(flashqwen PRIVATE src third_party)  # third_party: RapidJSON + CLI11
 set_target_properties(flashqwen PROPERTIES CUDA_SEPARABLE_COMPILATION ON)

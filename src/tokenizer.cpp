@@ -1,5 +1,5 @@
 #include "tokenizer.hpp"
-#include "json.hpp"
+#include "rapidjson/document.h"
 #include <fstream>
 #include <sstream>
 #include <algorithm>
@@ -110,17 +110,21 @@ void Tokenizer::load(const std::string& dir) {
         std::ifstream f(dir + "/vocab.json");
         if (!f) throw std::runtime_error("cannot open vocab.json");
         std::stringstream ss; ss << f.rdbuf();
-        auto root = minijson::parse(ss.str());
+        std::string text = ss.str();
+        rapidjson::Document root;
+        root.Parse(text.c_str());
+        if (root.HasParseError() || !root.IsObject())
+            throw std::runtime_error("invalid vocab.json");
         int max_id = 0;
-        for (auto& kv : root->obj) max_id = std::max(max_id, kv.second->as_int());
+        for (auto& kv : root.GetObject()) max_id = std::max(max_id, kv.value.GetInt());
         for (auto& sp : kSpecials) max_id = std::max(max_id, sp.second);
 
         id_to_token_.assign(max_id + 1, std::string());
         special_flag_.assign(max_id + 1, 0);
 
-        for (auto& kv : root->obj) {
-            const std::string& sym = kv.first;      // byte-level-unicode string
-            int id = kv.second->as_int();
+        for (auto& kv : root.GetObject()) {
+            const std::string sym = kv.name.GetString();   // byte-level-unicode string
+            int id = kv.value.GetInt();
             token_to_id_[sym] = id;
             // decode symbol-space string back to raw bytes for detokenization
             std::string raw;

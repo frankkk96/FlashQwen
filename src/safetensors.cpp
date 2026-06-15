@@ -1,5 +1,5 @@
 #include "safetensors.hpp"
-#include "json.hpp"
+#include "rapidjson/document.h"
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -34,16 +34,19 @@ void SafeTensors::map_shard(const std::string& path) {
     const char* json_begin = (const char*)(bytes + 8);
     const uint8_t* data_begin = bytes + 8 + header_len;
 
-    auto root = minijson::parse(json_begin, header_len);
-    for (auto& kv : root->obj) {
-        const std::string& name = kv.first;
+    rapidjson::Document root;
+    root.Parse(json_begin, (size_t)header_len);
+    if (root.HasParseError() || !root.IsObject())
+        throw std::runtime_error("invalid safetensors header: " + path);
+    for (auto& kv : root.GetObject()) {
+        std::string name = kv.name.GetString();
         if (name == "__metadata__") continue;
-        const auto& meta = *kv.second;
+        const auto& meta = kv.value;
         TensorView tv;
-        tv.dtype = meta["dtype"].as_str();
-        for (auto& s : meta["shape"].arr) tv.shape.push_back((int64_t)s->number);
-        int64_t begin = (int64_t)meta["data_offsets"][0].number;
-        int64_t end   = (int64_t)meta["data_offsets"][1].number;
+        tv.dtype = meta["dtype"].GetString();
+        for (auto& s : meta["shape"].GetArray()) tv.shape.push_back(s.GetInt64());
+        int64_t begin = meta["data_offsets"][0].GetInt64();
+        int64_t end   = meta["data_offsets"][1].GetInt64();
         tv.data = data_begin + begin;
         tv.nbytes = (size_t)(end - begin);
         tensors_[name] = tv;
@@ -56,9 +59,12 @@ void SafeTensors::load_dir(const std::string& dir) {
     std::set<std::string> shards;
     if (f) {
         std::stringstream ss; ss << f.rdbuf();
-        auto root = minijson::parse(ss.str());
-        const auto& wm = (*root)["weight_map"];
-        for (auto& kv : wm.obj) shards.insert(kv.second->as_str());
+        std::string text = ss.str();
+        rapidjson::Document root;
+        root.Parse(text.c_str());
+        if (root.HasParseError() || !root.HasMember("weight_map"))
+            throw std::runtime_error("invalid safetensors index: " + index);
+        for (auto& kv : root["weight_map"].GetObject()) shards.insert(kv.value.GetString());
     } else {
         shards.insert("model.safetensors");
     }

@@ -10,12 +10,12 @@
 #include "cli.hpp"
 #include "chat.hpp"
 #include "benchmark.hpp"
+#include "CLI11.hpp"
 #include <cstdio>
 #include <string>
 #include <random>
 
 int main(int argc, char** argv) {
-    enum Mode { CHAT, BENCHMARK } mode = CHAT;
     std::string model_dir;
     int   max_ctx   = 4096;
     float temp      = 0.0f, top_p = 0.95f;
@@ -23,27 +23,37 @@ int main(int argc, char** argv) {
     bool  think     = false;
     float gpu_mem_fraction = 0.9f;   // VRAM cap; the KV pool gets whatever is left under it
 
-    for (int i = 1; i < argc; ++i) {
-        std::string a = argv[i];
-        auto next = [&]() -> std::string { return (i + 1 < argc) ? argv[++i] : ""; };
-        if      (a == "--help" || a == "-h") { print_help(); return 0; }
-        else if (a == "chat")          mode = CHAT;
-        else if (a == "benchmark" || a == "bench") mode = BENCHMARK;
-        else if (a == "--model")       model_dir = next();
-        else if (a == "--max-ctx")     max_ctx = std::stoi(next());
-        else if (a == "--gpu-mem-fraction") gpu_mem_fraction = std::stof(next());
-        else if (a == "--temperature") temp = std::stof(next());
-        else if (a == "--top-p")       top_p = std::stof(next());
-        else if (a == "--seed")        seed = (unsigned)std::stoul(next());
-        else if (a == "--think")       think = true;
-        else { std::fprintf(stderr, "unknown argument: %s  (try --help)\n", a.c_str()); return 1; }
-    }
+    CLI::App app{"FlashQwen — minimal from-scratch C++/CUDA inference engine for Qwen3 (dense)"};
+    app.footer(
+        "SUPPORTED MODELS\n"
+        "  Any dense Qwen3 model (architecture Qwen3ForCausalLM): Qwen3-0.6B / 1.7B / 4B /\n"
+        "  8B / 14B / 32B. They share GQA + RoPE + RMSNorm + SwiGLU + QK-Norm; dims are read\n"
+        "  from config.json. (Tested: Qwen3-8B.) NOT supported: Qwen3 MoE variants and\n"
+        "  non-Qwen architectures.\n"
+        "  In-chat commands: /exit  /quit  /reset  /think on|off");
 
-    if (model_dir.empty()) {
-        std::fprintf(stderr, "error: --model is required.\n\n");
-        print_help();
-        return 1;
-    }
+    // Shared options (live on the root app; subcommands fall through to them).
+    app.add_option("--model", model_dir,
+                   "model directory: config.json + *.safetensors + index + vocab.json + merges.txt")
+        ->required()->check(CLI::ExistingDirectory);
+    app.add_option("--max-ctx", max_ctx, "KV / context length")->capture_default_str();
+    app.add_option("--gpu-mem-fraction", gpu_mem_fraction,
+                   "VRAM cap; the paged KV block pool gets whatever is left under it")
+        ->capture_default_str()->check(CLI::Range(0.1, 1.0));
+    app.add_option("--temperature", temp, "0 = greedy (chat only)")->capture_default_str();
+    app.add_option("--top-p", top_p, "nucleus sampling cutoff (chat only)")->capture_default_str();
+    app.add_option("--seed", seed, "RNG seed (chat only)")->capture_default_str();
+    app.add_flag("--think", think, "enable Qwen3 thinking mode (chat only)");
+
+    // Mode is selected by an optional subcommand; chat is the default.
+    auto* chat  = app.add_subcommand("chat", "interactive chat (default)");
+    auto* bench = app.add_subcommand("benchmark", "measure TTFT / TPOT / tok/s");
+    bench->alias("bench");
+    chat->fallthrough();
+    bench->fallthrough();
+    app.require_subcommand(0, 1);
+
+    CLI11_PARSE(app, argc, argv);
 
     std::string arch = read_arch(model_dir);
     if (!arch_supported(arch)) {
@@ -63,7 +73,7 @@ int main(int argc, char** argv) {
     SampleParams sp{temp, top_p};
     std::mt19937 rng(seed);
 
-    if (mode == BENCHMARK)
+    if (bench->parsed())
         return run_benchmark(model, tok, max_ctx);
     return run_chat(model, tok, sp, rng, think, max_ctx);
 }
