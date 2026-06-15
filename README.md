@@ -305,7 +305,9 @@ whole running set each step. On a varied-length workload it measured ~1.4× fast
 static baseline, so continuous batching is the only serving path kept. Each request carries its
 own sampling params (temperature / top-k / top-p, or greedy); an all-greedy batch takes the GPU
 argmax, while any batch with a sampling request copies the `[B, vocab]` logits back and samples
-per row. Admission still prefills one sequence at a time (interleaved chunked prefill is deferred).
+per row. Admission prefills one prompt at a time but in fixed-size chunks (256 tokens) interleaved
+with decode, so a long prompt no longer stalls the running sequences for its whole prefill — they
+keep decoding between chunks.
 
 Continuous-batching throughput on 32 requests (input 128, output 16–128 random), varying the
 number of KV slots — `slots=1` is sequential serving (one request at a time):

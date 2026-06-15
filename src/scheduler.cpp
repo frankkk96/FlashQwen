@@ -3,6 +3,7 @@
 #include <deque>
 
 static const int EOS1 = 151645, EOS2 = 151643;   // <|im_end|>, <|endoftext|>
+static const int PREFILL_CHUNK = 256;            // tokens prefilled per scheduler iteration
 
 static inline bool finished(const Request& r, bool stop_on_eos, int max_ctx) {
     if ((int)r.output.size() >= r.max_new) return true;
@@ -22,23 +23,36 @@ void run_continuous(Model& model, std::vector<Request>& reqs, int n_slots, bool 
     for (int i = 0; i < (int)reqs.size(); ++i) waiting.push_back(i);
     std::vector<int> running;                      // request indices currently decoding
 
+    // Admission prefills a prompt in PREFILL_CHUNK-sized pieces, one piece per iteration, so a
+    // long prompt no longer stalls the running sequences for its whole prefill — they keep
+    // decoding between pieces (interleaved / "chunked" prefill). One prompt is prefilled at a time.
+    int pf = -1, pf_cursor = 0;                    // request being prefilled, and its prompt cursor
+
     std::vector<int> in_tok, past, slots, out;
-    while (!waiting.empty() || !running.empty()) {
-        // Admit waiting requests into any free slots: prefill, take the first token, and either
-        // finish immediately or join the running set.
-        while (!waiting.empty() && !free_slots.empty()) {
-            int i = waiting.front(); waiting.pop_front();
-            Request& r = reqs[i];
-            r.slot = free_slots.back(); free_slots.pop_back();
-            // clamp an over-long prompt to the slot's capacity (last token predicts the next)
-            if ((int)r.prompt.size() > max_ctx) r.prompt.resize(max_ctx);
-            model.prefill(r.prompt, r.slot, 0);
-            r.cur  = (r.sp.temp <= 0.0f) ? model.argmax_last()
-                                         : sample(model.copy_logits(), r.sp, rng);
-            r.past = (int)r.prompt.size();
-            r.output.push_back(r.cur);
-            if (finished(r, stop_on_eos, max_ctx)) free_slots.push_back(r.slot);
-            else running.push_back(i);
+    while (!waiting.empty() || !running.empty() || pf != -1) {
+        // (a) start prefilling the next waiting request if a slot is free and none is in progress
+        if (pf == -1 && !waiting.empty() && !free_slots.empty()) {
+            pf = waiting.front(); waiting.pop_front();
+            reqs[pf].slot = free_slots.back(); free_slots.pop_back();
+            if ((int)reqs[pf].prompt.size() > max_ctx) reqs[pf].prompt.resize(max_ctx);
+            pf_cursor = 0;
+        }
+        // (b) advance the in-progress prefill by one chunk
+        if (pf != -1) {
+            Request& r = reqs[pf];
+            int chunk = std::min(PREFILL_CHUNK, (int)r.prompt.size() - pf_cursor);
+            std::vector<int> piece(r.prompt.begin() + pf_cursor, r.prompt.begin() + pf_cursor + chunk);
+            model.prefill(piece, r.slot, pf_cursor);
+            pf_cursor += chunk;
+            if (pf_cursor >= (int)r.prompt.size()) {       // prompt fully cached -> take first token
+                r.cur  = (r.sp.temp <= 0.0f) ? model.argmax_last()
+                                             : sample(model.copy_logits(), r.sp, rng);
+                r.past = (int)r.prompt.size();
+                r.output.push_back(r.cur);
+                if (finished(r, stop_on_eos, max_ctx)) free_slots.push_back(r.slot);
+                else running.push_back(pf);
+                pf = -1;
+            }
         }
         if (running.empty()) continue;
 

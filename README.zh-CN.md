@@ -277,8 +277,9 @@ INT8 权重反量化成 BF16 写回(~14 GB、与 batch 无关)的开销占了主
 连续批处理(`src/scheduler.*`)则让 `n_slots` 一直满载:一有槽位空出就立刻接纳等待中的请求,每步把
 整个运行集合一起 decode。在一个变长工作负载上,它比静态基线快约 1.4×,因此只保留连续批处理这一条
 服务路径。每个请求带自己的采样参数(temperature / top-k / top-p,或 greedy):全 greedy 的批走 GPU
-argmax,只要批里有一个要采样就把 `[B, vocab]` logits 拷回主机逐行采样。接纳时仍是单序列 prefill
-(交错的 chunked prefill 留到后续阶段)。
+argmax,只要批里有一个要采样就把 `[B, vocab]` logits 拷回主机逐行采样。接纳时一次只 prefill 一个
+prompt,但按固定大小(256 token)分块、与 decode 交错进行,所以一个长 prompt 不会在整段 prefill 期间
+卡住正在运行的序列——它们在分块之间持续 decode。
 
 连续批处理吞吐(32 请求,input 128,output 16–128 随机),改变 KV 槽位数——`slots=1` 即顺序服务
 (一次一个请求):
