@@ -1,5 +1,6 @@
 #include "benchmark.hpp"
 #include "generate.hpp"
+#include "scheduler.hpp"
 #include "sampler.hpp"
 #include <cstdio>
 #include <algorithm>
@@ -137,6 +138,44 @@ static void batch_sweep(Model& model, int max_ctx, int vocab, std::mt19937& rng)
     }
 }
 
+// Section 3: continuous vs static batching on a workload with VARIED output lengths — the case
+// continuous batching is built for. Same total work both ways; continuous wins by reusing a
+// slot the moment a sequence finishes instead of holding the whole group for its slowest member.
+static void continuous_sweep(Model& model, int max_ctx, int vocab) {
+    const int R = 48, INPUT = 128, LEN_MIN = 16, LEN_MAX = 128;
+    int B = std::min(16, model.max_batch());
+    if (INPUT + LEN_MAX >= max_ctx) {
+        std::fprintf(stderr, "\n[3] continuous vs static batching (skipped: input+output exceeds max-ctx)\n");
+        return;
+    }
+
+    // Build the workload once: R requests, fixed-length prompts, output lengths spread over
+    // [LEN_MIN, LEN_MAX] so sequences finish at very different times.
+    std::mt19937 rng(7);
+    std::uniform_int_distribution<int> len(LEN_MIN, LEN_MAX);
+    std::vector<Request> base(R);
+    long total_tok = 0;
+    for (auto& r : base) { r.prompt = make_prompt(INPUT, vocab, rng); r.max_new = len(rng); total_tok += r.max_new; }
+
+    auto time_run = [&](bool continuous) {
+        std::vector<Request> w = base;                       // fresh copy (base.output stays empty)
+        auto t0 = Clock::now();
+        if (continuous) run_continuous(model, w, B, /*stop_on_eos=*/false);
+        else            run_static(model, w, B, /*stop_on_eos=*/false);
+        return ms_since(t0);
+    };
+
+    time_run(true);                                          // warmup
+    double st = time_run(false), co = time_run(true);
+
+    std::fprintf(stderr, "\n[3] continuous vs static batching (%d requests, input %d, output %d-%d "
+                 "random, %d slots)\n\n", R, INPUT, LEN_MIN, LEN_MAX, B);
+    std::fprintf(stderr, "  method         wall (s)   aggregate tok/s\n");
+    std::fprintf(stderr, "  static         %7.2f      %9.1f\n", st / 1000.0, total_tok / (st / 1000.0));
+    std::fprintf(stderr, "  continuous     %7.2f      %9.1f\n", co / 1000.0, total_tok / (co / 1000.0));
+    std::fprintf(stderr, "  speedup: %.2fx\n", st / co);
+}
+
 int run_benchmark(Model& model, const Tokenizer& tok, int max_ctx) {
     SampleParams sp{0.0f, 1.0f, 0};   // greedy: timing shouldn't depend on sampling
     std::mt19937 rng(1234);
@@ -144,5 +183,6 @@ int run_benchmark(Model& model, const Tokenizer& tok, int max_ctx) {
 
     single_seq_sweep(model, tok, max_ctx, vocab, sp, rng);
     batch_sweep(model, max_ctx, vocab, rng);
+    continuous_sweep(model, max_ctx, vocab);
     return 0;
 }

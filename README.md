@@ -260,7 +260,7 @@ decode is bound by reading the whole model per token, so serving `B` sequences i
 that one weight read be **amortized across `B` tokens** instead of paid per token.
 
 This is staged: **A — batched decode + static batching** (done), **B — continuous batching**
-(dynamic scheduler, in progress), **C — PagedAttention** (paged KV, planned).
+(dynamic scheduler, done), **C — PagedAttention** (paged KV, planned).
 
 **Stage A — slot-based KV cache + batched decode.** The KV cache becomes a
 `[B_max, max_ctx, kv_dim]` pool; `B_max` (the number of concurrent sequence slots) is whatever
@@ -288,12 +288,27 @@ Static-batch decode throughput (RTX 4090, Qwen3-8B INT8, greedy, 128 tok/seq, `i
 So aggregate decode goes **~98 → ~318 tok/s (~3.2×)** at batch 16. It's deliberately
 sublinear for now: `lm_head` is read once per 4-sequence chunk (≈`B/4`× its weight traffic),
 and the batched GEMV loses efficiency at high `B`. A fused batched `lm_head`-argmax and a
-better GEMV tiling are the next throughput items, alongside stages B and C.
+better GEMV tiling are the next throughput items, alongside stage C.
+
+**Stage B — continuous batching.** Static batching processes a fixed group and holds all its
+slots until the group's *slowest* sequence finishes — short requests sit idle behind long ones
+(head-of-line blocking). Because the decode kernels already take an arbitrary running set
+(per-sequence slot + `past_len`), continuous batching is a host-side scheduler (`src/scheduler.*`):
+keep `n_slots` busy, admit a waiting request the instant a slot frees, and decode the whole
+running set each step. On a workload of 48 requests whose output lengths are spread over 16–128
+tokens (16 slots), it is **~1.4× faster than static** (aggregate **151 → 209 tok/s**); the gap
+widens with more length variance. Admission still prefills one sequence at a time (interleaved
+chunked prefill is deferred to a later stage).
+
+| 48 reqs, input 128, output 16–128, 16 slots | wall | aggregate tok/s |
+|---|---:|---:|
+| static batching | 21.5 s | 151 |
+| continuous batching | 15.6 s | **209** |
 
 `feature/batching` is managed as a branch (no per-stage tags). To try it:
 
 ```bash
 git checkout feature/batching
 cmake -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build -j8
-./build/flashqwen benchmark --model models/qwen3-8b   # adds a static-batch sweep section
+./build/flashqwen benchmark --model models/qwen3-8b   # adds static-batch + continuous sweeps
 ```
