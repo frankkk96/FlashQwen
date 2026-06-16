@@ -6,7 +6,7 @@ import (
 	"net/http"
 	"time"
 
-	"flashqwen/internal/chat"
+	"flashqwen/internal/chatml"
 	"flashqwen/internal/engine"
 
 	"github.com/gin-gonic/gin"
@@ -14,18 +14,18 @@ import (
 
 // decode maps an OpenAI chat request into the neutral engine.Request.
 func decode(req ChatRequest) engine.Request {
-	msgs := make([]chat.Message, 0, len(req.Messages))
+	msgs := make([]chatml.Message, 0, len(req.Messages))
 	for _, m := range req.Messages {
-		cm := chat.Message{Role: m.Role, Content: m.Text(), ToolCallID: m.ToolCallID}
+		cm := chatml.Message{Role: m.Role, Content: m.Text(), ToolCallID: m.ToolCallID}
 		for _, tc := range m.ToolCalls {
-			cm.ToolCalls = append(cm.ToolCalls, chat.ToolCall{
+			cm.ToolCalls = append(cm.ToolCalls, chatml.ToolCall{
 				ID: tc.ID, Name: tc.Function.Name, ArgumentsJSON: tc.Function.Arguments})
 		}
 		msgs = append(msgs, cm)
 	}
-	tools := make([]chat.ToolDef, 0, len(req.Tools))
+	tools := make([]chatml.ToolDef, 0, len(req.Tools))
 	for _, t := range req.Tools {
-		tools = append(tools, chat.ToolDef{
+		tools = append(tools, chatml.ToolDef{
 			Name: t.Function.Name, Description: t.Function.Description,
 			ParametersJSON: string(t.Function.Parameters)})
 	}
@@ -56,7 +56,7 @@ func (s *Server) chatCompletions(c *gin.Context) {
 	}
 }
 
-func toolCalls(tcs []chat.ToolCall) []ToolCall {
+func toolCalls(tcs []chatml.ToolCall) []ToolCall {
 	out := make([]ToolCall, len(tcs))
 	for i, tc := range tcs {
 		out[i] = ToolCall{ID: tc.ID, Type: "function",
@@ -111,13 +111,13 @@ func (s *Server) streamChat(c *gin.Context, req engine.Request) {
 	}
 
 	chunk(&RespMessage{Role: "assistant"}, nil) // opening chunk carries the role
-	res, err := s.eng.Generate(c.Request.Context(), req, func(text string, tc *chat.ToolCall) {
+	res, err := s.eng.Generate(c.Request.Context(), req, func(text string, tc *chatml.ToolCall) {
 		if text != "" {
 			d := text
 			chunk(&RespMessage{Content: &d}, nil)
 		}
 		if tc != nil {
-			chunk(&RespMessage{ToolCalls: toolCalls([]chat.ToolCall{*tc})}, nil)
+			chunk(&RespMessage{ToolCalls: toolCalls([]chatml.ToolCall{*tc})}, nil)
 		}
 	})
 	reason := "stop"

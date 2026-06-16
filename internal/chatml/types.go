@@ -1,4 +1,4 @@
-package chat
+package chatml
 
 // Neutral message/tool types (the OpenAI layer maps its own types into these).
 

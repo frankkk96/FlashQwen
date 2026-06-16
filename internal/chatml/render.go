@@ -1,4 +1,4 @@
-package chat
+package chatml
 
 import (
 	"encoding/json"
@@ -26,7 +26,7 @@ func toolJSON(t ToolDef) string {
 
 // Render builds the full Qwen3 ChatML prompt for a conversation (+ tools), ending with the
 // assistant generation header (plus an empty <think></think> block when thinking is off).
-func (m *Model) Render(msgs []Message, tools []ToolDef, enableThinking bool) string {
+func (m *Format) Render(msgs []Message, tools []ToolDef, enableThinking bool) string {
 	var b strings.Builder
 	hasSystem := len(msgs) > 0 && msgs[0].Role == "system"
 

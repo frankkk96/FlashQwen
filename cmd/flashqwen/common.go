@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"time"
 
-	"flashqwen/internal/chat"
+	"flashqwen/internal/chatml"
 	"flashqwen/internal/engine"
 	"flashqwen/internal/supervisor"
 	"flashqwen/internal/tokenizer"
@@ -25,7 +25,7 @@ func open(modelDir string, slots, maxCtx int) (*session, error) {
 	if err != nil {
 		return nil, err
 	}
-	cm := chat.Load(modelDir, tok)
+	cm := chatml.Load(modelDir, tok)
 
 	sup, err := supervisor.Start(modelDir, slots, maxCtx)
 	if err != nil {

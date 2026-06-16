@@ -1,4 +1,4 @@
-package chat
+package chatml
 
 import (
 	"encoding/json"
@@ -9,7 +9,7 @@ import (
 // completed tool calls. Control tokens are hidden from text; ids between <tool_call> and
 // </tool_call> are buffered and parsed into a ToolCall.
 type Stream struct {
-	m       *Model
+	m       *Format
 	ids     []int // visible (non-special) text ids so far
 	prev    string
 	inTool  bool
@@ -17,7 +17,7 @@ type Stream struct {
 	nTools  int
 }
 
-func (m *Model) NewStream() *Stream { return &Stream{m: m} }
+func (m *Format) NewStream() *Stream { return &Stream{m: m} }
 
 // Push feeds one token id. It returns any newly-decoded visible text and/or a completed tool call
 // (either may be empty/nil).

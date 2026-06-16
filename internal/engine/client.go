@@ -14,7 +14,7 @@ import (
 	"fmt"
 	"io"
 
-	"flashqwen/internal/chat"
+	"flashqwen/internal/chatml"
 	pb "flashqwen/internal/enginepb"
 	"flashqwen/internal/tokenizer"
 
@@ -27,13 +27,13 @@ const defaultMaxTokens = 512
 type Client struct {
 	conn   *grpc.ClientConn
 	cli    pb.EngineClient
-	cm     *chat.Model
+	cm     *chatml.Format
 	tok    *tokenizer.Tokenizer
 	maxCtx int
 }
 
 // Dial connects to the engine at addr, binding the model-text layer used by Generate.
-func Dial(addr string, cm *chat.Model, tok *tokenizer.Tokenizer) (*Client, error) {
+func Dial(addr string, cm *chatml.Format, tok *tokenizer.Tokenizer) (*Client, error) {
 	conn, err := grpc.NewClient(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
 		return nil, err
@@ -100,7 +100,7 @@ func (c *Client) stream(ctx context.Context, g *pb.GenerateRequest, onToken func
 // nil and read the returned Result. Either way the Result holds the aggregated text, tool calls,
 // finish reason, and token usage.
 func (c *Client) Generate(ctx context.Context, req Request,
-	onDelta func(text string, tc *chat.ToolCall)) (*Result, error) {
+	onDelta func(text string, tc *chatml.ToolCall)) (*Result, error) {
 
 	g, err := c.buildRequest(req)
 	if err != nil {

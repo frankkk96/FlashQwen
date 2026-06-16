@@ -1,13 +1,13 @@
 package engine
 
-import "flashqwen/internal/chat"
+import "flashqwen/internal/chatml"
 
 // Request is a format-neutral completion request. The HTTP/format layer (internal/server) decodes
 // its wire types into this; everything below — tokenisation, stop ids, pb — is handled inside the
 // Client.
 type Request struct {
-	Messages       []chat.Message
-	Tools          []chat.ToolDef
+	Messages       []chatml.Message
+	Tools          []chatml.ToolDef
 	EnableThinking bool
 	MaxTokens      int      // 0 => default
 	Temperature    *float64 // nil => engine default (greedy)
@@ -18,7 +18,7 @@ type Request struct {
 // incrementally via the onDelta callback to Generate; blocking callers just read this.
 type Result struct {
 	Text             string
-	ToolCalls        []chat.ToolCall
+	ToolCalls        []chatml.ToolCall
 	FinishReason     string // "stop" | "length" | "tool_calls"
 	PromptTokens     int
 	CompletionTokens int

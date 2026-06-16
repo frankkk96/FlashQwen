@@ -1,16 +1,17 @@
-// Package chat owns the model-text layer the C++ engine no longer has: the Qwen3 ChatML prompt
-// format, the stop (eos) token ids, and token-level tool-call detection over the engine's id
-// stream. It sits between the OpenAI HTTP layer and the token engine.
+// Package chatml is the Qwen3 ChatML format layer the C++ engine no longer has: a bidirectional
+// codec sitting between the neutral message types and the token engine. It renders messages +
+// tools into a ChatML prompt (inbound) and decodes the engine's id stream back into text + tool
+// calls (outbound), and it resolves the model's stop (eos) token ids.
 //
-// The package is split by concern: types.go (neutral message/tool model), template.go (ChatML
-// prompt construction), stream.go (token-stream decoding + tool-call detection), and this file
-// (the Model entry point and its load-time constants).
+// The package is split by role: types.go (neutral message/tool vocabulary), render.go (inbound:
+// messages -> ChatML prompt), stream.go (outbound: token stream -> text + tool calls), and this
+// file (the Format entry point and its load-time constants).
 //
-// The ChatML template is hand-ported in template.go rather than rendered from
-// tokenizer_config.json's Jinja: the Qwen3 chat_template uses constructs (namespace, reverse
-// slicing, method chains) that the Go Jinja engines can't parse. It matches the common OpenAI
-// surface (system/user/assistant/tool turns, tool definitions, tool calls, thinking toggle).
-package chat
+// The ChatML template is hand-ported in render.go rather than rendered from tokenizer_config.json's
+// Jinja: the Qwen3 chat_template uses constructs (namespace, reverse slicing, method chains) that
+// the Go Jinja engines can't parse. It matches the common OpenAI surface (system/user/assistant/
+// tool turns, tool definitions, tool calls, thinking toggle).
+package chatml
 
 import (
 	"encoding/json"
@@ -19,7 +20,7 @@ import (
 	"flashqwen/internal/tokenizer"
 )
 
-type Model struct {
+type Format struct {
 	tok       *tokenizer.Tokenizer
 	eosIDs    []int
 	toolOpen  int // id of "<tool_call>"  (-1 if absent)
@@ -28,8 +29,8 @@ type Model struct {
 
 // Load resolves the model-text constants: eos ids (from generation_config.json, falling back to
 // the canonical Qwen3 ids) and the <tool_call> markers.
-func Load(dir string, tok *tokenizer.Tokenizer) *Model {
-	m := &Model{tok: tok, toolOpen: -1, toolClose: -1}
+func Load(dir string, tok *tokenizer.Tokenizer) *Format {
+	m := &Format{tok: tok, toolOpen: -1, toolClose: -1}
 	if id, ok := tok.ID("<tool_call>"); ok {
 		m.toolOpen = id
 	}
@@ -72,7 +73,7 @@ func eosFromGenerationConfig(dir string) []int {
 }
 
 // StopTokenIDs are the ids the engine should stop on.
-func (m *Model) StopTokenIDs() []int32 {
+func (m *Format) StopTokenIDs() []int32 {
 	out := make([]int32, len(m.eosIDs))
 	for i, id := range m.eosIDs {
 		out[i] = int32(id)

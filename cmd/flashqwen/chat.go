@@ -9,7 +9,7 @@ import (
 	"os"
 	"strings"
 
-	"flashqwen/internal/chat"
+	"flashqwen/internal/chatml"
 	"flashqwen/internal/engine"
 )
 
@@ -31,7 +31,7 @@ func runChat(args []string) {
 	thinking := *think
 
 	fmt.Println("\nFlashQwen interactive chat. Commands: /exit /quit /reset /think on|off")
-	var history []chat.Message
+	var history []chatml.Message
 	in := bufio.NewReader(os.Stdin)
 	for {
 		fmt.Print("\n\033[1mYou:\033[0m ")
@@ -60,11 +60,11 @@ func runChat(args []string) {
 			continue
 		}
 
-		history = append(history, chat.Message{Role: "user", Content: line})
+		history = append(history, chatml.Message{Role: "user", Content: line})
 		fmt.Print("\033[1mAssistant:\033[0m ")
 		res, err := s.eng.Generate(context.Background(), engine.Request{
 			Messages: history, EnableThinking: thinking, MaxTokens: 1024,
-		}, func(text string, _ *chat.ToolCall) {
+		}, func(text string, _ *chatml.ToolCall) {
 			fmt.Print(text)
 		})
 		fmt.Println()
@@ -73,6 +73,6 @@ func runChat(args []string) {
 			history = history[:len(history)-1]
 			continue
 		}
-		history = append(history, chat.Message{Role: "assistant", Content: res.Text})
+		history = append(history, chatml.Message{Role: "assistant", Content: res.Text})
 	}
 }
