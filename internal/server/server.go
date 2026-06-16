@@ -15,12 +15,12 @@ import (
 )
 
 type Server struct {
-	eng   *engine.Client
+	gen   *engine.Generator
 	model string
 }
 
-func New(eng *engine.Client, model string) *Server {
-	return &Server{eng: eng, model: model}
+func New(gen *engine.Generator, model string) *Server {
+	return &Server{gen: gen, model: model}
 }
 
 // Run registers the routes and serves on addr (blocking).

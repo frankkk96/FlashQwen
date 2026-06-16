@@ -9,9 +9,11 @@ import (
 	"flashqwen/internal/tokenizer"
 )
 
-// session bundles the embedded engine client plus its lifecycle.
+// session bundles the embedded engine plus its lifecycle. conn is the low-level token transport
+// (used by benchmark); gen is the text tier on top of it (used by serve / chat).
 type session struct {
-	eng  *engine.Client
+	conn *engine.Client
+	gen  *engine.Generator
 	info *engine.ModelInfo
 	stop func()
 }
@@ -30,18 +32,19 @@ func open(modelDir string, slots, maxCtx, maxQueue int) (*session, error) {
 	if err != nil {
 		return nil, err
 	}
-	eng, err := engine.Dial(sup.Addr, cm, tok)
+	conn, err := engine.Dial(sup.Addr)
 	if err != nil {
 		sup.Stop()
 		return nil, err
 	}
-	// Block until the engine serves (arming the client's context window). sup.Exited makes a dying
-	// engine surface its real cause immediately instead of polling until the timeout.
-	info, err := eng.Ready(120*time.Second, sup.Exited)
+	// Block until the engine serves. sup.Exited makes a dying engine surface its real cause
+	// immediately instead of polling until the timeout.
+	info, err := conn.Ready(120*time.Second, sup.Exited)
 	if err != nil {
-		eng.Close()
+		conn.Close()
 		sup.Stop()
 		return nil, err
 	}
-	return &session{eng: eng, info: info, stop: func() { eng.Close(); sup.Stop() }}, nil
+	gen := engine.NewGenerator(conn, cm, tok, info.MaxCtx)
+	return &session{conn: conn, gen: gen, info: info, stop: func() { conn.Close(); sup.Stop() }}, nil
 }

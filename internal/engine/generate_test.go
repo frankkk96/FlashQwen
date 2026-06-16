@@ -5,9 +5,9 @@ import (
 	"testing"
 )
 
-// resolveMaxTokens only reads c.maxCtx, so a bare Client is enough to test the length policy.
+// resolveMaxTokens only reads g.maxCtx, so a bare Generator is enough to test the length policy.
 func TestResolveMaxTokens(t *testing.T) {
-	c := &Client{maxCtx: 100}
+	c := &Generator{maxCtx: 100}
 	cases := []struct {
 		name      string
 		promptLen int

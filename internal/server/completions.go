@@ -81,7 +81,7 @@ func toolCalls(tcs []chatml.ToolCall) []ToolCall {
 }
 
 func (s *Server) blockingChat(c *gin.Context, req engine.Request) {
-	res, err := s.eng.Generate(c.Request.Context(), req, nil)
+	res, err := s.gen.Generate(c.Request.Context(), req, nil)
 	if err != nil {
 		status, typ := classifyError(err)
 		c.JSON(status, gin.H{"error": gin.H{"message": err.Error(), "type": typ}})
@@ -127,7 +127,7 @@ func (s *Server) streamChat(c *gin.Context, req engine.Request) {
 	}
 
 	chunk(&RespMessage{Role: "assistant"}, nil) // opening chunk carries the role
-	res, err := s.eng.Generate(c.Request.Context(), req, func(text string, tc *chatml.ToolCall) {
+	res, err := s.gen.Generate(c.Request.Context(), req, func(text string, tc *chatml.ToolCall) {
 		if text != "" {
 			d := text
 			chunk(&RespMessage{Content: &d}, nil)

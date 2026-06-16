@@ -7,6 +7,7 @@ import (
 
 	"flashqwen/internal/chatml"
 	pb "flashqwen/internal/enginepb"
+	"flashqwen/internal/tokenizer"
 )
 
 // ErrPromptTooLong is returned by Generate when the prompt alone fills the context window, leaving
@@ -14,22 +15,37 @@ import (
 // engine failure — the server maps it to HTTP 400 rather than 502.
 var ErrPromptTooLong = errors.New("prompt exceeds context window")
 
+// Generator is the text tier: it wraps a transport Client with the model-text layer (ChatML
+// rendering, tokeniser, and the length policy) and turns neutral messages into completions.
+type Generator struct {
+	conn   *Client
+	cm     *chatml.Format
+	tok    *tokenizer.Tokenizer
+	maxCtx int // the engine's authoritative context window (from Client.Ready), for length clamping
+}
+
+// NewGenerator builds the text tier over an already-ready transport Client. maxCtx is the engine's
+// context window as reported by Client.Ready.
+func NewGenerator(conn *Client, cm *chatml.Format, tok *tokenizer.Tokenizer, maxCtx int) *Generator {
+	return &Generator{conn: conn, cm: cm, tok: tok, maxCtx: maxCtx}
+}
+
 // Generate runs one text completion — the high-level API for callers above this package. It renders
 // the ChatML prompt, tokenises, drives the engine, and decodes the id stream into text + tool calls.
 // onDelta (may be nil) is invoked for each visible text delta and completed tool call as they
 // arrive — streaming callers forward these; blocking callers pass nil and read the returned Result.
 // Either way the Result holds the aggregated text, tool calls, finish reason, and token usage.
-func (c *Client) Generate(ctx context.Context, req Request,
+func (g *Generator) Generate(ctx context.Context, req Request,
 	onDelta func(text string, tc *chatml.ToolCall)) (*Result, error) {
 
-	g, err := c.buildRequest(req)
+	greq, err := g.buildRequest(req)
 	if err != nil {
 		return nil, err
 	}
 
 	res := &Result{}
-	stream := c.cm.NewStream()
-	stats, err := c.stream(ctx, g, func(id int32) {
+	stream := g.cm.NewStream()
+	stats, err := g.conn.stream(ctx, greq, func(id int32) {
 		text, tc := stream.Push(int(id))
 		if text != "" {
 			res.Text += text
@@ -70,10 +86,10 @@ func (c *Client) Generate(ctx context.Context, req Request,
 //   - requested > the remaining window              -> clamp to the remaining window
 //
 // maxCtx is the engine's authoritative context window, recorded by Ready (from GetModel).
-func (c *Client) resolveMaxTokens(promptLen, requested int) (int, error) {
-	room := c.maxCtx - promptLen
+func (g *Generator) resolveMaxTokens(promptLen, requested int) (int, error) {
+	room := g.maxCtx - promptLen
 	if room < 1 {
-		return 0, fmt.Errorf("%w: prompt is %d tokens, context window is %d", ErrPromptTooLong, promptLen, c.maxCtx)
+		return 0, fmt.Errorf("%w: prompt is %d tokens, context window is %d", ErrPromptTooLong, promptLen, g.maxCtx)
 	}
 	if requested <= 0 || requested > room {
 		return room, nil
@@ -83,13 +99,13 @@ func (c *Client) resolveMaxTokens(promptLen, requested int) (int, error) {
 
 // buildRequest renders the ChatML prompt, tokenises, resolves the output budget, and attaches the
 // stop ids — turning a neutral Request into the engine's token-level request.
-func (c *Client) buildRequest(req Request) (*pb.GenerateRequest, error) {
-	prompt := c.cm.Render(req.Messages, req.Tools, req.EnableThinking)
-	ids, err := c.tok.Encode(prompt)
+func (g *Generator) buildRequest(req Request) (*pb.GenerateRequest, error) {
+	prompt := g.cm.Render(req.Messages, req.Tools, req.EnableThinking)
+	ids, err := g.tok.Encode(prompt)
 	if err != nil {
 		return nil, err
 	}
-	maxTokens, err := c.resolveMaxTokens(len(ids), req.MaxTokens)
+	maxTokens, err := g.resolveMaxTokens(len(ids), req.MaxTokens)
 	if err != nil {
 		return nil, err
 	}
@@ -98,17 +114,17 @@ func (c *Client) buildRequest(req Request) (*pb.GenerateRequest, error) {
 		in[i] = int32(id)
 	}
 
-	g := &pb.GenerateRequest{
+	greq := &pb.GenerateRequest{
 		InputIds:     in,
 		MaxTokens:    int32(maxTokens),
 		TopP:         1.0,
-		StopTokenIds: c.cm.StopTokenIDs(),
+		StopTokenIds: g.cm.StopTokenIDs(),
 	}
 	if req.Temperature != nil {
-		g.Temperature = float32(*req.Temperature)
+		greq.Temperature = float32(*req.Temperature)
 	}
 	if req.TopP != nil {
-		g.TopP = float32(*req.TopP)
+		greq.TopP = float32(*req.TopP)
 	}
-	return g, nil
+	return greq, nil
 }

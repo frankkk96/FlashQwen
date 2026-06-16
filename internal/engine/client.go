@@ -1,10 +1,10 @@
-// Package engine is the Go-side bridge to the C++ token engine (flashqwen-engine) plus the request
-// processing on top of it. A single Client holds the gRPC connection together with the model-text
-// layer (ChatML format + tokenizer) and exposes two tiers, split across two files:
+// Package engine is the Go-side bridge to the C++ token engine (flashqwen-engine). It is two tiers,
+// one composed on top of the other, split across two files:
 //
-//   - client.go:   low-level token API — Dial/GetModel/Stream — talking to the backend in token ids.
-//   - generate.go: high-level text API — Generate — render ChatML, tokenise, drive the engine, and
-//     decode the id stream into text + tool calls.
+//   - client.go:   Client — the transport tier. The gRPC connection + the low-level token API
+//     (Dial/Ready/GetModel/Stream); speaks only token ids, knows nothing about text.
+//   - generate.go: Generator — the text tier. Wraps a Client and adds the model-text layer (ChatML
+//     render + tokeniser + length policy); turns messages into a completion via Generate.
 //
 // enginepb (the generated gRPC stubs) is used only inside this package; nothing above it sees pb.
 package engine
@@ -16,9 +16,7 @@ import (
 	"io"
 	"time"
 
-	"flashqwen/internal/chatml"
 	pb "flashqwen/internal/enginepb"
-	"flashqwen/internal/tokenizer"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
@@ -44,30 +42,28 @@ func errorFor(e *pb.Error) error {
 	}
 }
 
+// Client is the transport tier: the gRPC connection plus the low-level token API. It speaks only
+// token ids — the text layer (ChatML, tokeniser, length policy) lives in Generator on top of it.
 type Client struct {
-	conn   *grpc.ClientConn
-	cli    pb.EngineClient
-	cm     *chatml.Format
-	tok    *tokenizer.Tokenizer
-	maxCtx int
+	conn *grpc.ClientConn
+	cli  pb.EngineClient
 }
 
-// Dial connects to the engine at addr, binding the model-text layer used by Generate.
-func Dial(addr string, cm *chatml.Format, tok *tokenizer.Tokenizer) (*Client, error) {
+// Dial connects to the engine at addr.
+func Dial(addr string) (*Client, error) {
 	conn, err := grpc.NewClient(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
 		return nil, err
 	}
-	return &Client{conn: conn, cli: pb.NewEngineClient(conn), cm: cm, tok: tok}, nil
+	return &Client{conn: conn, cli: pb.NewEngineClient(conn)}, nil
 }
 
 func (c *Client) Close() error { return c.conn.Close() }
 
-// Ready blocks until the engine answers GetModel — which arms the client's context window for
-// prompt clamping — or until aliveCheck reports the engine process died, or the timeout elapses.
-// It must be called once after Dial before Generate, and returns the engine's authoritative
-// metadata. aliveCheck (may be nil) lets the caller fail fast when the engine exits during startup
-// instead of polling a dead process until the timeout.
+// Ready blocks until the engine answers GetModel, or until aliveCheck reports the engine process
+// died, or the timeout elapses; it returns the engine's authoritative metadata (the caller feeds
+// MaxCtx into NewGenerator). aliveCheck (may be nil) lets the caller fail fast when the engine
+// exits during startup instead of polling a dead process until the timeout.
 func (c *Client) Ready(timeout time.Duration, aliveCheck func() error) (*ModelInfo, error) {
 	deadline := time.Now().Add(timeout)
 	for {
@@ -75,7 +71,6 @@ func (c *Client) Ready(timeout time.Duration, aliveCheck func() error) (*ModelIn
 		info, err := c.GetModel(ctx)
 		cancel()
 		if err == nil {
-			c.maxCtx = info.MaxCtx // arm the length policy (the only place maxCtx is set)
 			return info, nil
 		}
 		if aliveCheck != nil {

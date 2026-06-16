@@ -68,7 +68,7 @@ func runBench(args []string) {
 					var first time.Time
 					got := false
 					n := 0
-					_, err := s.eng.Stream(context.Background(), ids, *output,
+					_, err := s.conn.Stream(context.Background(), ids, *output,
 						0, 1.0, nil, // greedy, no nucleus, no stop ids: full length
 						func(int32) {
 							if !got {

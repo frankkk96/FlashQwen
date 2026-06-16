@@ -32,7 +32,7 @@ func runServe(args []string) {
 	go func() { <-sig; s.stop(); os.Exit(0) }()
 
 	log.Printf("flashqwen serve on %s (model %q, max_ctx %d)", *addr, s.info.ID, s.info.MaxCtx)
-	if err := server.New(s.eng, s.info.ID).Run(*addr); err != nil {
+	if err := server.New(s.gen, s.info.ID).Run(*addr); err != nil {
 		s.stop()
 		log.Fatal(err)
 	}
