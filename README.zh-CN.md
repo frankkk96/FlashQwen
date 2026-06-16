@@ -25,14 +25,29 @@ English: [README.md](README.md)
 
 ### 1. 获取模型
 
+`--model` 既可以是 Hugging Face 的 repo id,也可以是本地目录。最省事的方式是直接传 repo id,首次运行时
+自动下载:
+
 ```bash
-git lfs install
-git clone https://huggingface.co/Qwen/Qwen3-8B models/qwen3-8b
+./flashqwen chat --model Qwen/Qwen3-8B   # 下载到 Hugging Face 缓存,然后运行
 ```
 
-模型目录需包含 `config.json`、`*.safetensors` 分片、`model.safetensors.index.json`、`tokenizer.json`、
-`vocab.json`、`merges.txt`、`generation_config.json`。引擎直接读这些 BF16 文件、在加载时把 matmul 权重
-量化成 INT8,Go 侧从 `tokenizer.json`/`vocab.json`/`merges.txt` 加载分词器,因此无需任何离线转换或重打包。
+它只下载需要的文件——`config.json`、`generation_config.json`、分词器文件,以及 safetensors 分片——放进
+标准的 Hugging Face 缓存(`~/.cache/huggingface/hub`,或由 `HF_HOME` / `HF_HUB_CACHE` 指定),已存在的
+文件直接复用,中断后可断点续传。用 `HF_ENDPOINT` 走镜像(如 `https://hf-mirror.com`),用 `HF_TOKEN`
+访问 gated/私有 repo,用 `HF_HUB_OFFLINE=1` 只从缓存解析、不走网络。用
+`--model Qwen/Qwen3-8B@<分支或 commit>` 锁定某个版本。
+
+若模型已经在本地,直接传它的目录:
+
+```bash
+./flashqwen chat --model models/qwen3-8b
+```
+
+无论哪种方式,该目录都需包含 `config.json`、`*.safetensors` 分片、`model.safetensors.index.json`、
+`tokenizer.json`、`vocab.json`、`merges.txt`、`generation_config.json`。引擎直接读这些 BF16 文件、在加载时
+把 matmul 权重量化成 INT8,Go 侧从 `tokenizer.json`/`vocab.json`/`merges.txt` 加载分词器,因此无需任何
+离线转换或重打包。
 
 ### 2. 编译
 

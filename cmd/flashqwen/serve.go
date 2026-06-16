@@ -12,7 +12,7 @@ import (
 
 func runServe(args []string) {
 	fs := flag.NewFlagSet("serve", flag.ExitOnError)
-	model := fs.String("model", "", "model directory (required)")
+	model := fs.String("model", "", "model directory or Hugging Face repo id (required)")
 	addr := fs.String("addr", ":8000", "HTTP listen address")
 	slots := fs.Int("slots", 16, "max concurrent sequences")
 	maxCtx := fs.Int("max-ctx", 4096, "KV / context length")

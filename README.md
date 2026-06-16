@@ -30,15 +30,30 @@ The project has two layers that communicate over gRPC:
 
 ### 1. Get the model
 
+`--model` takes either a Hugging Face repo id or a local directory. The simplest path is to pass the
+repo id and let FlashQwen download it on first run:
+
 ```bash
-git lfs install
-git clone https://huggingface.co/Qwen/Qwen3-8B models/qwen3-8b
+./flashqwen chat --model Qwen/Qwen3-8B   # downloads to the Hugging Face cache, then runs
 ```
 
-The model directory must contain `config.json`, the `*.safetensors` shards,
+It fetches only the files it needs — `config.json`, `generation_config.json`, the tokenizer files,
+and the safetensors shards — into the standard Hugging Face cache (`~/.cache/huggingface/hub`, or
+`HF_HOME` / `HF_HUB_CACHE`), reusing anything already there and resuming interrupted downloads. Set
+`HF_ENDPOINT` to use a mirror (e.g. `https://hf-mirror.com`), `HF_TOKEN` for gated or private repos,
+and `HF_HUB_OFFLINE=1` to resolve from cache with no network call. Pin a revision with
+`--model Qwen/Qwen3-8B@<branch-or-commit>`.
+
+To use a model already on disk, pass its directory instead:
+
+```bash
+./flashqwen chat --model models/qwen3-8b
+```
+
+Either way the directory must contain `config.json`, the `*.safetensors` shards,
 `model.safetensors.index.json`, `tokenizer.json`, `vocab.json`, `merges.txt`, and
-`generation_config.json`. The engine reads these BF16 files directly and quantises the matmul
-weights to INT8 at load time, and the Go side loads the tokenizer from
+`generation_config.json`. The engine reads these BF16 files directly and quantises the matmul weights
+to INT8 at load time, and the Go side loads the tokenizer from
 `tokenizer.json` / `vocab.json` / `merges.txt` — so no offline conversion or repacking is needed.
 
 ### 2. Build

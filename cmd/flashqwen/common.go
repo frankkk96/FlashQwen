@@ -7,6 +7,7 @@ import (
 
 	"flashqwen/internal/chatml"
 	"flashqwen/internal/engine"
+	"flashqwen/internal/hub"
 	"flashqwen/internal/supervisor"
 	"flashqwen/internal/tokenizer"
 )
@@ -18,9 +19,14 @@ type session struct {
 	stop func()
 }
 
-// open loads the tokenizer + chat template, launches the embedded engine against modelDir, and
-// waits for it to serve. The returned stop() tears both down.
-func open(modelDir string, slots, maxCtx int) (*session, error) {
+// open resolves the model argument (a local directory, or a Hugging Face repo id to download), loads
+// the tokenizer + chat template, launches the embedded engine against it, and waits for it to serve.
+// The returned stop() tears both down.
+func open(model string, slots, maxCtx int) (*session, error) {
+	modelDir, err := hub.Resolve(model)
+	if err != nil {
+		return nil, err
+	}
 	tok, err := tokenizer.Load(modelDir)
 	if err != nil {
 		return nil, err
