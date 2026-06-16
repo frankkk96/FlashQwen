@@ -15,7 +15,7 @@ import (
 
 func runChat(args []string) {
 	fs := flag.NewFlagSet("chat", flag.ExitOnError)
-	model := fs.String("model", "", "model directory or Hugging Face repo id (required)")
+	model := fs.String("model", "", "model directory (required)")
 	maxCtx := fs.Int("max-ctx", 4096, "KV / context length")
 	think := fs.Bool("think", false, "enable Qwen3 thinking mode")
 	fs.Parse(args)

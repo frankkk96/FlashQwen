@@ -16,7 +16,7 @@ import (
 // client actually sees.
 func runBench(args []string) {
 	fs := flag.NewFlagSet("benchmark", flag.ExitOnError)
-	model := fs.String("model", "", "model directory or Hugging Face repo id (required)")
+	model := fs.String("model", "", "model directory (required)")
 	slots := fs.Int("slots", 16, "max concurrent sequences")
 	maxCtx := fs.Int("max-ctx", 2048, "KV / context length")
 	input := fs.Int("input", 128, "synthetic prompt length (tokens)")
