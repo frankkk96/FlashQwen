@@ -37,18 +37,20 @@ func open(modelDir string, slots, maxCtx, maxQueue int) (*session, error) {
 		sup.Stop()
 		return nil, err
 	}
-	info, err := waitReady(eng, 120*time.Second)
+	info, err := waitReady(eng, sup, 120*time.Second)
 	if err != nil {
 		eng.Close()
 		sup.Stop()
-		return nil, fmt.Errorf("engine did not become ready: %w", err)
+		return nil, err
 	}
 	eng.SetMaxCtx(info.MaxCtx)
 	return &session{eng: eng, info: info, stop: func() { eng.Close(); sup.Stop() }}, nil
 }
 
-// waitReady polls GetModel until the engine answers or the timeout elapses.
-func waitReady(eng *engine.Client, timeout time.Duration) (*engine.ModelInfo, error) {
+// waitReady polls GetModel until the engine answers, the engine process dies, or the timeout
+// elapses. If the engine exits during startup (bad port bind, model load failure, CUDA error, ...)
+// it returns that detailed cause immediately rather than polling a dead process until the timeout.
+func waitReady(eng *engine.Client, sup *supervisor.Engine, timeout time.Duration) (*engine.ModelInfo, error) {
 	deadline := time.Now().Add(timeout)
 	for {
 		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
@@ -57,8 +59,11 @@ func waitReady(eng *engine.Client, timeout time.Duration) (*engine.ModelInfo, er
 		if err == nil {
 			return info, nil
 		}
+		if exitErr := sup.Exited(); exitErr != nil {
+			return nil, exitErr
+		}
 		if time.Now().After(deadline) {
-			return nil, err
+			return nil, fmt.Errorf("engine did not become ready within %s: %w", timeout, err)
 		}
 		time.Sleep(500 * time.Millisecond)
 	}
