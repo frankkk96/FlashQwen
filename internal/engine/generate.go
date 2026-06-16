@@ -63,12 +63,13 @@ func (c *Client) Generate(ctx context.Context, req Request,
 }
 
 // resolveMaxTokens is the single place that decides how many tokens a request may generate, given
-// the prompt length. It is the only length policy in the codebase — callers never cap themselves:
+// the prompt length. It is the only *active* length policy — callers never cap themselves (the
+// engine keeps a defensive clamp of its own as a backstop, but Go always sends a resolved value):
 //   - the prompt already fills the context window  -> error
 //   - requested <= 0 (omitted)                      -> fill the remaining window (until eos or full)
 //   - requested > the remaining window              -> clamp to the remaining window
 //
-// maxCtx is the engine's authoritative context window, recorded via SetMaxCtx after GetModel.
+// maxCtx is the engine's authoritative context window, recorded by Ready (from GetModel).
 func (c *Client) resolveMaxTokens(promptLen, requested int) (int, error) {
 	room := c.maxCtx - promptLen
 	if room < 1 {

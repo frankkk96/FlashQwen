@@ -1,8 +1,6 @@
 package main
 
 import (
-	"context"
-	"fmt"
 	"time"
 
 	"flashqwen/internal/chatml"
@@ -37,34 +35,13 @@ func open(modelDir string, slots, maxCtx, maxQueue int) (*session, error) {
 		sup.Stop()
 		return nil, err
 	}
-	info, err := waitReady(eng, sup, 120*time.Second)
+	// Block until the engine serves (arming the client's context window). sup.Exited makes a dying
+	// engine surface its real cause immediately instead of polling until the timeout.
+	info, err := eng.Ready(120*time.Second, sup.Exited)
 	if err != nil {
 		eng.Close()
 		sup.Stop()
 		return nil, err
 	}
-	eng.SetMaxCtx(info.MaxCtx)
 	return &session{eng: eng, info: info, stop: func() { eng.Close(); sup.Stop() }}, nil
-}
-
-// waitReady polls GetModel until the engine answers, the engine process dies, or the timeout
-// elapses. If the engine exits during startup (bad port bind, model load failure, CUDA error, ...)
-// it returns that detailed cause immediately rather than polling a dead process until the timeout.
-func waitReady(eng *engine.Client, sup *supervisor.Engine, timeout time.Duration) (*engine.ModelInfo, error) {
-	deadline := time.Now().Add(timeout)
-	for {
-		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-		info, err := eng.GetModel(ctx)
-		cancel()
-		if err == nil {
-			return info, nil
-		}
-		if exitErr := sup.Exited(); exitErr != nil {
-			return nil, exitErr
-		}
-		if time.Now().After(deadline) {
-			return nil, fmt.Errorf("engine did not become ready within %s: %w", timeout, err)
-		}
-		time.Sleep(500 * time.Millisecond)
-	}
 }

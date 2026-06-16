@@ -14,6 +14,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"time"
 
 	"flashqwen/internal/chatml"
 	pb "flashqwen/internal/enginepb"
@@ -62,8 +63,32 @@ func Dial(addr string, cm *chatml.Format, tok *tokenizer.Tokenizer) (*Client, er
 
 func (c *Client) Close() error { return c.conn.Close() }
 
-// SetMaxCtx records the engine's authoritative context window (from GetModel) for prompt clamping.
-func (c *Client) SetMaxCtx(n int) { c.maxCtx = n }
+// Ready blocks until the engine answers GetModel — which arms the client's context window for
+// prompt clamping — or until aliveCheck reports the engine process died, or the timeout elapses.
+// It must be called once after Dial before Generate, and returns the engine's authoritative
+// metadata. aliveCheck (may be nil) lets the caller fail fast when the engine exits during startup
+// instead of polling a dead process until the timeout.
+func (c *Client) Ready(timeout time.Duration, aliveCheck func() error) (*ModelInfo, error) {
+	deadline := time.Now().Add(timeout)
+	for {
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		info, err := c.GetModel(ctx)
+		cancel()
+		if err == nil {
+			c.maxCtx = info.MaxCtx // arm the length policy (the only place maxCtx is set)
+			return info, nil
+		}
+		if aliveCheck != nil {
+			if exitErr := aliveCheck(); exitErr != nil {
+				return nil, exitErr
+			}
+		}
+		if time.Now().After(deadline) {
+			return nil, fmt.Errorf("engine did not become ready within %s: %w", timeout, err)
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+}
 
 // GetModel returns the engine's metadata.
 func (c *Client) GetModel(ctx context.Context) (*ModelInfo, error) {
