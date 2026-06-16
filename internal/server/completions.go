@@ -2,6 +2,7 @@ package server
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"time"
@@ -11,6 +12,20 @@ import (
 
 	"github.com/gin-gonic/gin"
 )
+
+// classifyError maps a Generate error to an OpenAI error type + HTTP status. The error's message
+// (which carries the engine's detailed context) is surfaced to the client separately; this only
+// decides the category.
+func classifyError(err error) (status int, typ string) {
+	switch {
+	case errors.Is(err, engine.ErrPromptTooLong): // prompt overflows the context window — client error
+		return http.StatusBadRequest, "invalid_request_error"
+	case errors.Is(err, engine.ErrOverCapacity): // KV pool / queue full — retryable
+		return http.StatusServiceUnavailable, "overloaded_error"
+	default: // ErrEngineInternal, transport failures, anything else
+		return http.StatusBadGateway, "engine_error"
+	}
+}
 
 // decode maps an OpenAI chat request into the neutral engine.Request.
 func decode(req ChatRequest) engine.Request {
@@ -50,7 +65,8 @@ func (s *Server) chatCompletions(c *gin.Context) {
 		return
 	}
 	if req.Stream {
-		s.streamChat(c, decode(req))
+		includeUsage := req.StreamOptions != nil && req.StreamOptions.IncludeUsage
+		s.streamChat(c, decode(req), includeUsage)
 	} else {
 		s.blockingChat(c, decode(req))
 	}
@@ -66,9 +82,10 @@ func toolCalls(tcs []chatml.ToolCall) []ToolCall {
 }
 
 func (s *Server) blockingChat(c *gin.Context, req engine.Request) {
-	res, err := s.eng.Generate(c.Request.Context(), req, nil)
+	res, err := s.gen.Generate(c.Request.Context(), req, nil)
 	if err != nil {
-		c.JSON(http.StatusBadGateway, gin.H{"error": gin.H{"message": "engine: " + err.Error(), "type": "engine_error"}})
+		status, typ := classifyError(err)
+		c.JSON(status, gin.H{"error": gin.H{"message": err.Error(), "type": typ}})
 		return
 	}
 	msg := RespMessage{Role: "assistant"}
@@ -91,7 +108,7 @@ func (s *Server) blockingChat(c *gin.Context, req engine.Request) {
 	})
 }
 
-func (s *Server) streamChat(c *gin.Context, req engine.Request) {
+func (s *Server) streamChat(c *gin.Context, req engine.Request, includeUsage bool) {
 	c.Header("Content-Type", "text/event-stream")
 	c.Header("Cache-Control", "no-cache")
 	c.Header("Connection", "keep-alive")
@@ -111,7 +128,7 @@ func (s *Server) streamChat(c *gin.Context, req engine.Request) {
 	}
 
 	chunk(&RespMessage{Role: "assistant"}, nil) // opening chunk carries the role
-	res, err := s.eng.Generate(c.Request.Context(), req, func(text string, tc *chatml.ToolCall) {
+	res, err := s.gen.Generate(c.Request.Context(), req, func(text string, tc *chatml.ToolCall) {
 		if text != "" {
 			d := text
 			chunk(&RespMessage{Content: &d}, nil)
@@ -120,11 +137,31 @@ func (s *Server) streamChat(c *gin.Context, req engine.Request) {
 			chunk(&RespMessage{ToolCalls: toolCalls([]chatml.ToolCall{*tc})}, nil)
 		}
 	})
-	reason := "stop"
-	if err == nil && res != nil {
-		reason = res.FinishReason
+	if err != nil {
+		// Client disconnected mid-stream: not a server error, just stop (the connection is gone).
+		if c.Request.Context().Err() != nil {
+			return
+		}
+		// The 200 + SSE headers are already flushed, so we can't switch to an HTTP error status;
+		// surface the failure as an SSE error event rather than a misleading finish_reason.
+		_, typ := classifyError(err)
+		b, _ := json.Marshal(gin.H{"error": gin.H{"message": err.Error(), "type": typ}})
+		fmt.Fprintf(c.Writer, "data: %s\n\n", b)
+		fmt.Fprint(c.Writer, "data: [DONE]\n\n")
+		flusher.Flush()
+		return
 	}
+	reason := res.FinishReason
 	chunk(&RespMessage{}, &reason)
+	if includeUsage {
+		// Per the OpenAI stream_options contract: a final chunk with an empty choices array and the
+		// token usage. Benchmarks (and metering clients) rely on this for an exact output-token count.
+		usage := ChatCompletion{ID: id, Object: "chat.completion.chunk", Created: created, Model: s.model,
+			Choices: []Choice{}, Usage: &Usage{PromptTokens: res.PromptTokens, CompletionTokens: res.CompletionTokens,
+				TotalTokens: res.PromptTokens + res.CompletionTokens}}
+		b, _ := json.Marshal(usage)
+		fmt.Fprintf(c.Writer, "data: %s\n\n", b)
+	}
 	fmt.Fprint(c.Writer, "data: [DONE]\n\n")
 	flusher.Flush()
 }

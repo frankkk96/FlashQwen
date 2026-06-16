@@ -18,6 +18,9 @@ int parse_args(int argc, char** argv, Args& out) {
     app.add_option("--seed", out.seed, "RNG seed for sampling")->capture_default_str();
     app.add_option("--address", out.address, "gRPC listen address (host:port)")->capture_default_str();
     app.add_option("--slots", out.slots, "max concurrent sequences")->capture_default_str();
+    app.add_option("--max-queue", out.max_queue,
+                   "admission cap on waiting requests; over it new requests are rejected as "
+                   "over-capacity (<=0 => 4*slots)")->capture_default_str();
 
     try {
         app.parse(argc, argv);

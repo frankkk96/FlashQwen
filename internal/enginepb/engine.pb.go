@@ -21,6 +21,112 @@ const (
 	_ = protoimpl.EnforceVersion(protoimpl.MaxVersion - 20)
 )
 
+// Request-level failure taxonomy. These are errors the engine raises while serving a single
+// request (not startup/load failures, which abort the process before any RPC). The message field
+// carries human-readable detail (counts, limits) that the Go layer surfaces verbatim to the client.
+type ErrorCode int32
+
+const (
+	ErrorCode_ERROR_CODE_UNSPECIFIED   ErrorCode = 0
+	ErrorCode_ERROR_CODE_OVER_CAPACITY ErrorCode = 1 // KV pool / request queue is full — retryable (maps to HTTP 503)
+	ErrorCode_ERROR_CODE_INTERNAL      ErrorCode = 2 // unexpected engine failure (maps to HTTP 502)
+)
+
+// Enum value maps for ErrorCode.
+var (
+	ErrorCode_name = map[int32]string{
+		0: "ERROR_CODE_UNSPECIFIED",
+		1: "ERROR_CODE_OVER_CAPACITY",
+		2: "ERROR_CODE_INTERNAL",
+	}
+	ErrorCode_value = map[string]int32{
+		"ERROR_CODE_UNSPECIFIED":   0,
+		"ERROR_CODE_OVER_CAPACITY": 1,
+		"ERROR_CODE_INTERNAL":      2,
+	}
+)
+
+func (x ErrorCode) Enum() *ErrorCode {
+	p := new(ErrorCode)
+	*p = x
+	return p
+}
+
+func (x ErrorCode) String() string {
+	return protoimpl.X.EnumStringOf(x.Descriptor(), protoreflect.EnumNumber(x))
+}
+
+func (ErrorCode) Descriptor() protoreflect.EnumDescriptor {
+	return file_engine_proto_enumTypes[0].Descriptor()
+}
+
+func (ErrorCode) Type() protoreflect.EnumType {
+	return &file_engine_proto_enumTypes[0]
+}
+
+func (x ErrorCode) Number() protoreflect.EnumNumber {
+	return protoreflect.EnumNumber(x)
+}
+
+// Deprecated: Use ErrorCode.Descriptor instead.
+func (ErrorCode) EnumDescriptor() ([]byte, []int) {
+	return file_engine_proto_rawDescGZIP(), []int{0}
+}
+
+// Engine startup lifecycle. The process binds its gRPC port immediately and loads the model on a
+// background thread, so the client can poll GetStatus to drive a progress bar and a stall watchdog.
+type EngineState int32
+
+const (
+	EngineState_ENGINE_STATE_UNSPECIFIED EngineState = 0
+	EngineState_ENGINE_STATE_LOADING     EngineState = 1 // binding done; weights / KV pool loading
+	EngineState_ENGINE_STATE_READY       EngineState = 2 // serving (GetModel/Generate now answer)
+	EngineState_ENGINE_STATE_FAILED      EngineState = 3 // load failed, terminal — see message
+)
+
+// Enum value maps for EngineState.
+var (
+	EngineState_name = map[int32]string{
+		0: "ENGINE_STATE_UNSPECIFIED",
+		1: "ENGINE_STATE_LOADING",
+		2: "ENGINE_STATE_READY",
+		3: "ENGINE_STATE_FAILED",
+	}
+	EngineState_value = map[string]int32{
+		"ENGINE_STATE_UNSPECIFIED": 0,
+		"ENGINE_STATE_LOADING":     1,
+		"ENGINE_STATE_READY":       2,
+		"ENGINE_STATE_FAILED":      3,
+	}
+)
+
+func (x EngineState) Enum() *EngineState {
+	p := new(EngineState)
+	*p = x
+	return p
+}
+
+func (x EngineState) String() string {
+	return protoimpl.X.EnumStringOf(x.Descriptor(), protoreflect.EnumNumber(x))
+}
+
+func (EngineState) Descriptor() protoreflect.EnumDescriptor {
+	return file_engine_proto_enumTypes[1].Descriptor()
+}
+
+func (EngineState) Type() protoreflect.EnumType {
+	return &file_engine_proto_enumTypes[1]
+}
+
+func (x EngineState) Number() protoreflect.EnumNumber {
+	return protoreflect.EnumNumber(x)
+}
+
+// Deprecated: Use EngineState.Descriptor instead.
+func (EngineState) EnumDescriptor() ([]byte, []int) {
+	return file_engine_proto_rawDescGZIP(), []int{1}
+}
+
 type GenerateRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	InputIds      []int32                `protobuf:"varint,1,rep,packed,name=input_ids,json=inputIds,proto3" json:"input_ids,omitempty"`               // prompt token ids
@@ -157,12 +263,65 @@ func (x *Done) GetCompletionTokens() int32 {
 	return 0
 }
 
+type Error struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Code          ErrorCode              `protobuf:"varint,1,opt,name=code,proto3,enum=flashqwen.ErrorCode" json:"code,omitempty"`
+	Message       string                 `protobuf:"bytes,2,opt,name=message,proto3" json:"message,omitempty"` // detailed, human-readable; surfaced to the client as-is
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *Error) Reset() {
+	*x = Error{}
+	mi := &file_engine_proto_msgTypes[2]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *Error) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*Error) ProtoMessage() {}
+
+func (x *Error) ProtoReflect() protoreflect.Message {
+	mi := &file_engine_proto_msgTypes[2]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use Error.ProtoReflect.Descriptor instead.
+func (*Error) Descriptor() ([]byte, []int) {
+	return file_engine_proto_rawDescGZIP(), []int{2}
+}
+
+func (x *Error) GetCode() ErrorCode {
+	if x != nil {
+		return x.Code
+	}
+	return ErrorCode_ERROR_CODE_UNSPECIFIED
+}
+
+func (x *Error) GetMessage() string {
+	if x != nil {
+		return x.Message
+	}
+	return ""
+}
+
 type GenerateEvent struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// Types that are valid to be assigned to Event:
 	//
 	//	*GenerateEvent_TokenId
 	//	*GenerateEvent_Done
+	//	*GenerateEvent_Error
 	Event         isGenerateEvent_Event `protobuf_oneof:"event"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
@@ -170,7 +329,7 @@ type GenerateEvent struct {
 
 func (x *GenerateEvent) Reset() {
 	*x = GenerateEvent{}
-	mi := &file_engine_proto_msgTypes[2]
+	mi := &file_engine_proto_msgTypes[3]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -182,7 +341,7 @@ func (x *GenerateEvent) String() string {
 func (*GenerateEvent) ProtoMessage() {}
 
 func (x *GenerateEvent) ProtoReflect() protoreflect.Message {
-	mi := &file_engine_proto_msgTypes[2]
+	mi := &file_engine_proto_msgTypes[3]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -195,7 +354,7 @@ func (x *GenerateEvent) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GenerateEvent.ProtoReflect.Descriptor instead.
 func (*GenerateEvent) Descriptor() ([]byte, []int) {
-	return file_engine_proto_rawDescGZIP(), []int{2}
+	return file_engine_proto_rawDescGZIP(), []int{3}
 }
 
 func (x *GenerateEvent) GetEvent() isGenerateEvent_Event {
@@ -223,6 +382,15 @@ func (x *GenerateEvent) GetDone() *Done {
 	return nil
 }
 
+func (x *GenerateEvent) GetError() *Error {
+	if x != nil {
+		if x, ok := x.Event.(*GenerateEvent_Error); ok {
+			return x.Error
+		}
+	}
+	return nil
+}
+
 type isGenerateEvent_Event interface {
 	isGenerateEvent_Event()
 }
@@ -232,12 +400,18 @@ type GenerateEvent_TokenId struct {
 }
 
 type GenerateEvent_Done struct {
-	Done *Done `protobuf:"bytes,2,opt,name=done,proto3,oneof"` // terminal event (always last)
+	Done *Done `protobuf:"bytes,2,opt,name=done,proto3,oneof"` // terminal event on success (always last)
+}
+
+type GenerateEvent_Error struct {
+	Error *Error `protobuf:"bytes,3,opt,name=error,proto3,oneof"` // terminal event on failure (mutually exclusive with done)
 }
 
 func (*GenerateEvent_TokenId) isGenerateEvent_Event() {}
 
 func (*GenerateEvent_Done) isGenerateEvent_Event() {}
+
+func (*GenerateEvent_Error) isGenerateEvent_Event() {}
 
 type ModelRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
@@ -247,7 +421,7 @@ type ModelRequest struct {
 
 func (x *ModelRequest) Reset() {
 	*x = ModelRequest{}
-	mi := &file_engine_proto_msgTypes[3]
+	mi := &file_engine_proto_msgTypes[4]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -259,7 +433,7 @@ func (x *ModelRequest) String() string {
 func (*ModelRequest) ProtoMessage() {}
 
 func (x *ModelRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_engine_proto_msgTypes[3]
+	mi := &file_engine_proto_msgTypes[4]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -272,7 +446,7 @@ func (x *ModelRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ModelRequest.ProtoReflect.Descriptor instead.
 func (*ModelRequest) Descriptor() ([]byte, []int) {
-	return file_engine_proto_rawDescGZIP(), []int{3}
+	return file_engine_proto_rawDescGZIP(), []int{4}
 }
 
 type ModelInfo struct {
@@ -286,7 +460,7 @@ type ModelInfo struct {
 
 func (x *ModelInfo) Reset() {
 	*x = ModelInfo{}
-	mi := &file_engine_proto_msgTypes[4]
+	mi := &file_engine_proto_msgTypes[5]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -298,7 +472,7 @@ func (x *ModelInfo) String() string {
 func (*ModelInfo) ProtoMessage() {}
 
 func (x *ModelInfo) ProtoReflect() protoreflect.Message {
-	mi := &file_engine_proto_msgTypes[4]
+	mi := &file_engine_proto_msgTypes[5]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -311,7 +485,7 @@ func (x *ModelInfo) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ModelInfo.ProtoReflect.Descriptor instead.
 func (*ModelInfo) Descriptor() ([]byte, []int) {
-	return file_engine_proto_rawDescGZIP(), []int{4}
+	return file_engine_proto_rawDescGZIP(), []int{5}
 }
 
 func (x *ModelInfo) GetId() string {
@@ -335,6 +509,118 @@ func (x *ModelInfo) GetVocabSize() int32 {
 	return 0
 }
 
+type StatusRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *StatusRequest) Reset() {
+	*x = StatusRequest{}
+	mi := &file_engine_proto_msgTypes[6]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *StatusRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*StatusRequest) ProtoMessage() {}
+
+func (x *StatusRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_engine_proto_msgTypes[6]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use StatusRequest.ProtoReflect.Descriptor instead.
+func (*StatusRequest) Descriptor() ([]byte, []int) {
+	return file_engine_proto_rawDescGZIP(), []int{6}
+}
+
+type StatusResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	State         EngineState            `protobuf:"varint,1,opt,name=state,proto3,enum=flashqwen.EngineState" json:"state,omitempty"`
+	Phase         string                 `protobuf:"bytes,2,opt,name=phase,proto3" json:"phase,omitempty"`     // human-readable step, e.g. "loading weights" / "allocating kv pool"
+	Done          int32                  `protobuf:"varint,3,opt,name=done,proto3" json:"done,omitempty"`      // units completed in this phase (e.g. layers uploaded); 0 if not countable
+	Total         int32                  `protobuf:"varint,4,opt,name=total,proto3" json:"total,omitempty"`    // units in this phase (e.g. layer count); 0 if not countable
+	Message       string                 `protobuf:"bytes,5,opt,name=message,proto3" json:"message,omitempty"` // detailed failure cause when state == FAILED
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *StatusResponse) Reset() {
+	*x = StatusResponse{}
+	mi := &file_engine_proto_msgTypes[7]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *StatusResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*StatusResponse) ProtoMessage() {}
+
+func (x *StatusResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_engine_proto_msgTypes[7]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use StatusResponse.ProtoReflect.Descriptor instead.
+func (*StatusResponse) Descriptor() ([]byte, []int) {
+	return file_engine_proto_rawDescGZIP(), []int{7}
+}
+
+func (x *StatusResponse) GetState() EngineState {
+	if x != nil {
+		return x.State
+	}
+	return EngineState_ENGINE_STATE_UNSPECIFIED
+}
+
+func (x *StatusResponse) GetPhase() string {
+	if x != nil {
+		return x.Phase
+	}
+	return ""
+}
+
+func (x *StatusResponse) GetDone() int32 {
+	if x != nil {
+		return x.Done
+	}
+	return 0
+}
+
+func (x *StatusResponse) GetTotal() int32 {
+	if x != nil {
+		return x.Total
+	}
+	return 0
+}
+
+func (x *StatusResponse) GetMessage() string {
+	if x != nil {
+		return x.Message
+	}
+	return ""
+}
+
 var File_engine_proto protoreflect.FileDescriptor
 
 const file_engine_proto_rawDesc = "" +
@@ -350,20 +636,41 @@ const file_engine_proto_rawDesc = "" +
 	"\x04Done\x12#\n" +
 	"\rfinish_reason\x18\x01 \x01(\tR\ffinishReason\x12#\n" +
 	"\rprompt_tokens\x18\x02 \x01(\x05R\fpromptTokens\x12+\n" +
-	"\x11completion_tokens\x18\x03 \x01(\x05R\x10completionTokens\"\\\n" +
+	"\x11completion_tokens\x18\x03 \x01(\x05R\x10completionTokens\"K\n" +
+	"\x05Error\x12(\n" +
+	"\x04code\x18\x01 \x01(\x0e2\x14.flashqwen.ErrorCodeR\x04code\x12\x18\n" +
+	"\amessage\x18\x02 \x01(\tR\amessage\"\x86\x01\n" +
 	"\rGenerateEvent\x12\x1b\n" +
 	"\btoken_id\x18\x01 \x01(\x05H\x00R\atokenId\x12%\n" +
-	"\x04done\x18\x02 \x01(\v2\x0f.flashqwen.DoneH\x00R\x04doneB\a\n" +
+	"\x04done\x18\x02 \x01(\v2\x0f.flashqwen.DoneH\x00R\x04done\x12(\n" +
+	"\x05error\x18\x03 \x01(\v2\x10.flashqwen.ErrorH\x00R\x05errorB\a\n" +
 	"\x05event\"\x0e\n" +
 	"\fModelRequest\"S\n" +
 	"\tModelInfo\x12\x0e\n" +
 	"\x02id\x18\x01 \x01(\tR\x02id\x12\x17\n" +
 	"\amax_ctx\x18\x02 \x01(\x05R\x06maxCtx\x12\x1d\n" +
 	"\n" +
-	"vocab_size\x18\x03 \x01(\x05R\tvocabSize2\x87\x01\n" +
+	"vocab_size\x18\x03 \x01(\x05R\tvocabSize\"\x0f\n" +
+	"\rStatusRequest\"\x98\x01\n" +
+	"\x0eStatusResponse\x12,\n" +
+	"\x05state\x18\x01 \x01(\x0e2\x16.flashqwen.EngineStateR\x05state\x12\x14\n" +
+	"\x05phase\x18\x02 \x01(\tR\x05phase\x12\x12\n" +
+	"\x04done\x18\x03 \x01(\x05R\x04done\x12\x14\n" +
+	"\x05total\x18\x04 \x01(\x05R\x05total\x12\x18\n" +
+	"\amessage\x18\x05 \x01(\tR\amessage*^\n" +
+	"\tErrorCode\x12\x1a\n" +
+	"\x16ERROR_CODE_UNSPECIFIED\x10\x00\x12\x1c\n" +
+	"\x18ERROR_CODE_OVER_CAPACITY\x10\x01\x12\x17\n" +
+	"\x13ERROR_CODE_INTERNAL\x10\x02*v\n" +
+	"\vEngineState\x12\x1c\n" +
+	"\x18ENGINE_STATE_UNSPECIFIED\x10\x00\x12\x18\n" +
+	"\x14ENGINE_STATE_LOADING\x10\x01\x12\x16\n" +
+	"\x12ENGINE_STATE_READY\x10\x02\x12\x17\n" +
+	"\x13ENGINE_STATE_FAILED\x10\x032\xc9\x01\n" +
 	"\x06Engine\x12B\n" +
 	"\bGenerate\x12\x1a.flashqwen.GenerateRequest\x1a\x18.flashqwen.GenerateEvent0\x01\x129\n" +
-	"\bGetModel\x12\x17.flashqwen.ModelRequest\x1a\x14.flashqwen.ModelInfoB\x1dZ\x1bflashqwen/internal/enginepbb\x06proto3"
+	"\bGetModel\x12\x17.flashqwen.ModelRequest\x1a\x14.flashqwen.ModelInfo\x12@\n" +
+	"\tGetStatus\x12\x18.flashqwen.StatusRequest\x1a\x19.flashqwen.StatusResponseB\x1dZ\x1bflashqwen/internal/enginepbb\x06proto3"
 
 var (
 	file_engine_proto_rawDescOnce sync.Once
@@ -377,25 +684,36 @@ func file_engine_proto_rawDescGZIP() []byte {
 	return file_engine_proto_rawDescData
 }
 
-var file_engine_proto_msgTypes = make([]protoimpl.MessageInfo, 5)
+var file_engine_proto_enumTypes = make([]protoimpl.EnumInfo, 2)
+var file_engine_proto_msgTypes = make([]protoimpl.MessageInfo, 8)
 var file_engine_proto_goTypes = []any{
-	(*GenerateRequest)(nil), // 0: flashqwen.GenerateRequest
-	(*Done)(nil),            // 1: flashqwen.Done
-	(*GenerateEvent)(nil),   // 2: flashqwen.GenerateEvent
-	(*ModelRequest)(nil),    // 3: flashqwen.ModelRequest
-	(*ModelInfo)(nil),       // 4: flashqwen.ModelInfo
+	(ErrorCode)(0),          // 0: flashqwen.ErrorCode
+	(EngineState)(0),        // 1: flashqwen.EngineState
+	(*GenerateRequest)(nil), // 2: flashqwen.GenerateRequest
+	(*Done)(nil),            // 3: flashqwen.Done
+	(*Error)(nil),           // 4: flashqwen.Error
+	(*GenerateEvent)(nil),   // 5: flashqwen.GenerateEvent
+	(*ModelRequest)(nil),    // 6: flashqwen.ModelRequest
+	(*ModelInfo)(nil),       // 7: flashqwen.ModelInfo
+	(*StatusRequest)(nil),   // 8: flashqwen.StatusRequest
+	(*StatusResponse)(nil),  // 9: flashqwen.StatusResponse
 }
 var file_engine_proto_depIdxs = []int32{
-	1, // 0: flashqwen.GenerateEvent.done:type_name -> flashqwen.Done
-	0, // 1: flashqwen.Engine.Generate:input_type -> flashqwen.GenerateRequest
-	3, // 2: flashqwen.Engine.GetModel:input_type -> flashqwen.ModelRequest
-	2, // 3: flashqwen.Engine.Generate:output_type -> flashqwen.GenerateEvent
-	4, // 4: flashqwen.Engine.GetModel:output_type -> flashqwen.ModelInfo
-	3, // [3:5] is the sub-list for method output_type
-	1, // [1:3] is the sub-list for method input_type
-	1, // [1:1] is the sub-list for extension type_name
-	1, // [1:1] is the sub-list for extension extendee
-	0, // [0:1] is the sub-list for field type_name
+	0, // 0: flashqwen.Error.code:type_name -> flashqwen.ErrorCode
+	3, // 1: flashqwen.GenerateEvent.done:type_name -> flashqwen.Done
+	4, // 2: flashqwen.GenerateEvent.error:type_name -> flashqwen.Error
+	1, // 3: flashqwen.StatusResponse.state:type_name -> flashqwen.EngineState
+	2, // 4: flashqwen.Engine.Generate:input_type -> flashqwen.GenerateRequest
+	6, // 5: flashqwen.Engine.GetModel:input_type -> flashqwen.ModelRequest
+	8, // 6: flashqwen.Engine.GetStatus:input_type -> flashqwen.StatusRequest
+	5, // 7: flashqwen.Engine.Generate:output_type -> flashqwen.GenerateEvent
+	7, // 8: flashqwen.Engine.GetModel:output_type -> flashqwen.ModelInfo
+	9, // 9: flashqwen.Engine.GetStatus:output_type -> flashqwen.StatusResponse
+	7, // [7:10] is the sub-list for method output_type
+	4, // [4:7] is the sub-list for method input_type
+	4, // [4:4] is the sub-list for extension type_name
+	4, // [4:4] is the sub-list for extension extendee
+	0, // [0:4] is the sub-list for field type_name
 }
 
 func init() { file_engine_proto_init() }
@@ -403,22 +721,24 @@ func file_engine_proto_init() {
 	if File_engine_proto != nil {
 		return
 	}
-	file_engine_proto_msgTypes[2].OneofWrappers = []any{
+	file_engine_proto_msgTypes[3].OneofWrappers = []any{
 		(*GenerateEvent_TokenId)(nil),
 		(*GenerateEvent_Done)(nil),
+		(*GenerateEvent_Error)(nil),
 	}
 	type x struct{}
 	out := protoimpl.TypeBuilder{
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_engine_proto_rawDesc), len(file_engine_proto_rawDesc)),
-			NumEnums:      0,
-			NumMessages:   5,
+			NumEnums:      2,
+			NumMessages:   8,
 			NumExtensions: 0,
 			NumServices:   1,
 		},
 		GoTypes:           file_engine_proto_goTypes,
 		DependencyIndexes: file_engine_proto_depIdxs,
+		EnumInfos:         file_engine_proto_enumTypes,
 		MessageInfos:      file_engine_proto_msgTypes,
 	}.Build()
 	File_engine_proto = out.File

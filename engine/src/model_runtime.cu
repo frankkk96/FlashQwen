@@ -77,7 +77,7 @@ ModelRuntime::QWeight ModelRuntime::upload_int8(const std::string& name) {
     return qw;
 }
 
-ModelRuntime::ModelRuntime(const ModelSpec& spec, int max_ctx)
+ModelRuntime::ModelRuntime(const ModelSpec& spec, int max_ctx, ProgressFn on_progress)
     : spec_(spec) {
     max_ctx_ = ((max_ctx + 15) / 16) * 16;   // round up so WMMA tiles never read past buffers
     std::fprintf(stderr, "[model] loading weights from %s ...\n", spec_.dir.c_str());
@@ -104,6 +104,7 @@ ModelRuntime::ModelRuntime(const ModelSpec& spec, int max_ctx)
         L.post_norm = upload_norm(p + "post_attention_layernorm.weight");
         if ((l + 1) % 8 == 0 || l + 1 == spec_.num_layers)
             std::fprintf(stderr, "[model] uploaded layer %d/%d\n", l + 1, spec_.num_layers);
+        if (on_progress) on_progress(l + 1, spec_.num_layers);
     }
 
     // activation scratch (sized to max_ctx tokens; a decode batch is at most MAX_DECODE_B <= that)

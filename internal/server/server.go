@@ -5,6 +5,7 @@ package server
 
 import (
 	"fmt"
+	"math/rand/v2"
 	"net/http"
 	"time"
 
@@ -14,13 +15,12 @@ import (
 )
 
 type Server struct {
-	eng   *engine.Client
+	gen   *engine.Generator
 	model string
-	idSeq int
 }
 
-func New(eng *engine.Client, model string) *Server {
-	return &Server{eng: eng, model: model}
+func New(gen *engine.Generator, model string) *Server {
+	return &Server{gen: gen, model: model}
 }
 
 // Run registers the routes and serves on addr (blocking).
@@ -33,9 +33,12 @@ func (s *Server) Run(addr string) error {
 	return r.Run(addr)
 }
 
+// newID returns a unique completion id. Random rather than an incrementing counter: there is no
+// shared mutable state to race on under concurrent requests, and it matches OpenAI's opaque
+// `chatcmpl-…` form. 128 random bits make collisions negligible; math/rand/v2's top-level funcs
+// are concurrency-safe (and an id needs uniqueness, not cryptographic strength).
 func (s *Server) newID() string {
-	s.idSeq++
-	return fmt.Sprintf("chatcmpl-%d-%d", time.Now().UnixNano(), s.idSeq)
+	return fmt.Sprintf("chatcmpl-%016x%016x", rand.Uint64(), rand.Uint64())
 }
 
 func (s *Server) listModels(c *gin.Context) {

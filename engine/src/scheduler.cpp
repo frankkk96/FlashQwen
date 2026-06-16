@@ -5,9 +5,10 @@
 
 static const int PREFILL_CHUNK = 256;            // tokens prefilled per scheduler iteration
 
-Scheduler::Scheduler(ModelRuntime& model, const KVCache& kv, int n_slots, std::mt19937& rng)
+Scheduler::Scheduler(ModelRuntime& model, const KVCache& kv, int n_slots, int max_queue, std::mt19937& rng)
     : model_(model), kv_(kv), rng_(rng) {
-    n_slots_ = std::min(n_slots, model_.max_batch());
+    n_slots_   = std::min(n_slots, model_.max_batch());
+    max_queue_ = max_queue;
     max_ctx_ = model_.max_ctx();
     V_       = model_.spec().vocab_size;
     bsz_     = kv_.block_size();
@@ -52,7 +53,7 @@ bool Scheduler::preempt_one(int protect) {
     return false;
 }
 
-void Scheduler::step(const TokenFn& on_token, const FinishFn& on_finish) {
+void Scheduler::step(const TokenFn& on_token, const FinishFn& on_finish, const ErrorFn& on_error) {
     // (a) start prefilling the next waiting request if there is room for another sequence.
     if (pf_ == nullptr && !waiting_.empty() && (int)running_.size() < n_slots_) {
         pf_ = waiting_.front(); waiting_.pop_front();
@@ -70,7 +71,17 @@ void Scheduler::step(const TokenFn& on_token, const FinishFn& on_finish) {
         int need = blocks_for(pf_cursor_ + chunk);
         while ((int)r->block_table.size() < need) {
             if (free_blocks_.empty() && !preempt_one(-1)) {
-                std::fprintf(stderr, "scheduler: out of KV blocks during prefill\n"); std::exit(1);
+                // The pool can't fit even this single prefill after preempting everyone. Fail just
+                // this request instead of taking down the whole engine (see issue #4).
+                std::string msg = "out of KV cache: pool has " + std::to_string(kv_.num_blocks()) +
+                    " blocks of " + std::to_string(bsz_) + " tokens (" +
+                    std::to_string(kv_.num_blocks() * bsz_) + " total), cannot reserve " +
+                    std::to_string(need) + " blocks for a " + std::to_string((int)pf_tokens_.size()) +
+                    "-token prefill";
+                release(r);
+                if (on_error) on_error(r, EngineErrc::OverCapacity, std::move(msg));
+                pf_ = nullptr;
+                return;   // abort this step; running sequences (if any) decode on the next one
             }
             if (free_blocks_.empty()) continue;
             r->block_table.push_back(free_blocks_.back()); free_blocks_.pop_back();
@@ -105,7 +116,16 @@ void Scheduler::step(const TokenFn& on_token, const FinishFn& on_finish) {
             while ((int)r->block_table.size() < need) {
                 if (free_blocks_.empty()) {
                     if (!preempt_one((int)k)) {
-                        std::fprintf(stderr, "scheduler: out of KV blocks during decode\n"); std::exit(1);
+                        // Only this sequence is running and the pool still can't grow it. Fail it
+                        // rather than crashing the engine (see issue #4).
+                        std::string msg = "out of KV cache during decode: pool has " +
+                            std::to_string(kv_.num_blocks()) + " blocks of " + std::to_string(bsz_) +
+                            " tokens, sequence at " + std::to_string(r->past) +
+                            " tokens cannot grow further";
+                        release(r);
+                        if (on_error) on_error(r, EngineErrc::OverCapacity, std::move(msg));
+                        running_.erase(running_.begin() + k);
+                        rescan = true; break;
                     }
                     rescan = true; break;
                 }

@@ -6,11 +6,14 @@ package supervisor
 
 import (
 	_ "embed"
+	"errors"
 	"fmt"
 	"net"
 	"os"
 	"os/exec"
 	"strconv"
+	"strings"
+	"sync"
 	"syscall"
 )
 
@@ -21,11 +24,41 @@ type Engine struct {
 	Addr string // host:port the engine's gRPC server listens on
 	cmd  *exec.Cmd
 	path string // extracted binary path (removed on Stop)
+
+	tail    *tailBuffer   // last few KB of engine stderr (for error reporting)
+	done    chan struct{} // closed once the process has been reaped
+	waitErr error         // result of cmd.Wait(); set before done is closed
+}
+
+// tailBuffer is an io.Writer that retains only the last `max` bytes written — used to keep the
+// tail of engine stderr around so a startup failure can be reported with its actual cause.
+type tailBuffer struct {
+	mu  sync.Mutex
+	buf []byte
+	max int
+}
+
+func (t *tailBuffer) Write(p []byte) (int, error) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.buf = append(t.buf, p...)
+	if len(t.buf) > t.max {
+		t.buf = t.buf[len(t.buf)-t.max:]
+	}
+	return len(p), nil
+}
+
+func (t *tailBuffer) String() string {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return string(t.buf)
 }
 
 // Start extracts and launches the engine against modelDir, returning once the process has been
 // spawned (call WaitReady on a client to block until it serves). Engine stderr is forwarded.
-func Start(modelDir string, slots, maxCtx int) (*Engine, error) {
+// maxQueue caps how many requests may wait for admission before the engine rejects new ones as
+// over-capacity; <=0 lets the engine pick its default (4*slots).
+func Start(modelDir string, slots, maxCtx, maxQueue int) (*Engine, error) {
 	f, err := os.CreateTemp("", "flashqwen-engine-*")
 	if err != nil {
 		return nil, err
@@ -49,20 +82,47 @@ func Start(modelDir string, slots, maxCtx int) (*Engine, error) {
 		"--model", modelDir,
 		"--address", addr,
 		"--slots", strconv.Itoa(slots),
-		"--max-ctx", strconv.Itoa(maxCtx))
-	cmd.Stderr = os.Stderr
+		"--max-ctx", strconv.Itoa(maxCtx),
+		"--max-queue", strconv.Itoa(maxQueue))
+	// Capture engine stderr into a rolling tail buffer rather than the terminal: during startup the
+	// Go side shows a load progress bar (driven by GetStatus) and owns the line, and on any failure
+	// the tail is surfaced in the returned error / Exited(). This keeps the engine's verbose per-layer
+	// logging from interleaving with the bar.
+	tail := &tailBuffer{max: 8 << 10}
+	cmd.Stderr = tail
 	if err := cmd.Start(); err != nil {
 		os.Remove(f.Name())
 		return nil, fmt.Errorf("start engine: %w", err)
 	}
-	return &Engine{Addr: addr, cmd: cmd, path: f.Name()}, nil
+	e := &Engine{Addr: addr, cmd: cmd, path: f.Name(), tail: tail, done: make(chan struct{})}
+	go func() { e.waitErr = cmd.Wait(); close(e.done) }() // reap; Exited()/Stop() observe via done
+	return e, nil
+}
+
+// Exited reports nil while the engine is still running, or a detailed error once it has terminated:
+// the exit status plus the tail of its stderr. waitReady polls this so a dying engine surfaces its
+// real cause immediately instead of after the readiness timeout.
+func (e *Engine) Exited() error {
+	select {
+	case <-e.done:
+		msg := "engine process exited"
+		if e.waitErr != nil {
+			msg += " (" + e.waitErr.Error() + ")"
+		}
+		if t := strings.TrimSpace(e.tail.String()); t != "" {
+			msg += "; engine stderr:\n" + t
+		}
+		return errors.New(msg)
+	default:
+		return nil
+	}
 }
 
 // Stop signals the engine to terminate and cleans up the extracted binary.
 func (e *Engine) Stop() {
 	if e.cmd.Process != nil {
 		_ = e.cmd.Process.Signal(syscall.SIGTERM)
-		_ = e.cmd.Wait()
+		<-e.done // the reaper goroutine owns cmd.Wait(); block until the process is gone
 	}
 	os.Remove(e.path)
 }

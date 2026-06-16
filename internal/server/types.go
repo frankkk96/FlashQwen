@@ -5,15 +5,22 @@ import "encoding/json"
 // ---- OpenAI request types ----------------------------------------------------------------
 
 type ChatRequest struct {
-	Model       string        `json:"model"`
-	Messages    []ChatMessage `json:"messages"`
-	Tools       []Tool        `json:"tools,omitempty"`
-	Stream      bool          `json:"stream"`
-	MaxTokens   int           `json:"max_tokens"`
-	Temperature *float64      `json:"temperature"`
-	TopP        *float64      `json:"top_p"`
+	Model         string         `json:"model"`
+	Messages      []ChatMessage  `json:"messages"`
+	Tools         []Tool         `json:"tools,omitempty"`
+	Stream        bool           `json:"stream"`
+	StreamOptions *StreamOptions `json:"stream_options"`
+	MaxTokens     int            `json:"max_tokens"`
+	Temperature   *float64       `json:"temperature"`
+	TopP          *float64       `json:"top_p"`
 	// FlashQwen extension: Qwen3 thinking mode (default off).
 	EnableThinking *bool `json:"enable_thinking"`
+}
+
+// StreamOptions mirrors OpenAI's stream_options. When IncludeUsage is set, the stream ends with an
+// extra chunk carrying token usage and an empty choices array, before the final [DONE].
+type StreamOptions struct {
+	IncludeUsage bool `json:"include_usage"`
 }
 
 type ChatMessage struct {
