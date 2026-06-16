@@ -67,36 +67,61 @@ gRPC/protobuf,以及一块显存 ≥20 GB 的 NVIDIA GPU。默认按 `sm_89`(RTX
 
 ---
 
-## 代码结构
+## 技术路线
 
-外层 Go 应用(根模块)的各个包:
+### Go 与 C++ 的桥接
 
-| 路径 | 负责 | 行数 |
-|---|---|---:|
-| `cmd/flashqwen/` | 程序入口,分发 `serve` / `chat` / `benchmark` 三个子命令 | 346 |
-| `internal/engine/` | 对接内层引擎:底层是 token 级 gRPC 客户端,高层是文本级 `Generate`(渲染→分词→驱动引擎→解码);gRPC 桩 `enginepb` 只在此包内使用 | 225 |
-| `internal/server/` | 把引擎暴露为 OpenAI 兼容 HTTP 服务,负责 OpenAI 格式的解析/编码与 SSE 流式输出 | 293 |
-| `internal/chatml/` | Qwen3 ChatML 格式的双向 codec:把消息渲染成 prompt,把引擎的 token 流解码成文本并识别工具调用 | 266 |
-| `internal/tokenizer/` | 从零实现的 byte-level BPE 分词器,读取 vocab / merges / tokenizer.json | 483 |
-| `internal/supervisor/` | 用 `//go:embed` 内嵌引擎二进制,负责释放、拉起、健康检查与退出时收尾 | 78 |
+编译好的 C++ 引擎二进制通过 `//go:embed` 打包进 Go 二进制。启动时 Go 侧的 supervisor 把它写到临时
+目录,选一个空闲的本地端口,作为子进程拉起,轮询 `GetModel` 直到引擎应答,退出时给它发 `SIGTERM`——
+所以只有一个二进制要跑,没有引擎进程需要手动管理。
 
-内层 C++/CUDA token 引擎(`engine/src/`)的源文件,按行数降序:
+两层通过 gRPC 通信,接口由 `proto/engine.proto` 定义。线上只传 token id:Go 把 prompt 分词后发送
+`GenerateRequest{input_ids, max_tokens, temperature, top_p, stop_token_ids}`;`Generate` 是
+server-streaming,引擎先流式返回一串 `token_id` 事件,最后给一个
+`Done{finish_reason, prompt_tokens, completion_tokens}`。`GetModel` 回报引擎权威的上下文窗口与词表
+大小。客户端断开会取消该 RPC,引擎据此中止对应序列并释放它的 KV。
 
-| 文件 | 负责 | 行数 |
-|---|---|---:|
-| `kernels.*` | 全部 CUDA kernel:INT8 GEMV、WMMA matmul、attention、split-K decode | 529 |
-| `model_runtime.*` | 加载权重并在显存里量化成 INT8,执行前向计算 | 435 |
-| `scheduler.*` | 连续批处理调度器:分块 prefill、序列接纳与抢占 | 215 |
-| `grpc_server.*` | token 级 gRPC 服务:接收 token id,流式返回采样出的 token id | 181 |
-| `kv_cache.*` | PagedAttention 的分页 KV 池 | 127 |
-| `safetensors.*` | mmap 并用 RapidJSON 解析 `.safetensors` 文件头 | 111 |
-| `model_spec.hpp` | 从 `config.json` 读取模型维度与架构(声明层,不碰 GPU) | 64 |
-| `sampler.*` | 采样:greedy、temperature、top-p | 54 |
-| `main.cpp` / `args.*` | 引擎进程入口与命令行参数解析 | 88 |
+### 权重加载与 INT8 量化
 
-两层之间的接口由 `proto/engine.proto` 定义。完整的单流优化历程(标量 matmul → WMMA → split-K →
-INT8,49.7 → 104 tok/s)和批处理的分阶段实现分别保存在 `optimization-study` 与 `feature/batching`
-两个分支。
+引擎 mmap `.safetensors` 分片、用 RapidJSON 解析文件头,以 BF16 读入权重。加载时把每个 matmul 权重
+(注意力的 q/k/v/o 投影、MLP 的 gate/up/down,以及 `lm_head`)量化成 INT8,**每个输出行一个 scale**
+(对称,夹到 [-127, 127]);embedding 与 norm 保持 BF16。这把权重显存大致减半(~16 GB → ~9 GB)。
+prefill 会把 INT8 权重反量化回 BF16 喂给 tensor core,decode 则直接读 INT8 字节——decode 是访存瓶颈,
+这一点才是关键。
+
+### 前向:prefill 与 decode
+
+一次前向分两条路径。**prefill**(一次过很多 prompt token)是计算瓶颈,matmul 用 WMMA 走 tensor
+core。**decode**(每步一个 token)是访存瓶颈,用向量化的 INT8 GEMV;固定的单 token kernel 序列只捕获
+一次成 CUDA graph、每步重放(token id、位置、`past_len` 都放在设备 buffer 里,所以上下文增长时 graph
+依然有效)。贪心解码在 GPU 上做 argmax、只回传一个 int;temperature / top-p 采样则把 logits 拷回主机。
+
+### 注意力:flash-decoding split-K
+
+prefill 的 attention 是一个 warp 负责一个 (head, query),online softmax 全在寄存器里完成,没有块内
+barrier。decode 在 batch 1 时这种划分只有 ~32 个并行单元(每 head 一个),所以把每个 head 的 key 区间
+切成 `ATTN_SPLITS`(16)块,交给不同 block 各算一个 partial online-softmax,再 combine 归并——并行度
+约 16×,于是 decode 延迟几乎不随上下文增长。
+
+### Paged KV cache(PagedAttention)
+
+每层的 KV 是一个 `[num_blocks, BLOCK=16, kv_dim]` 的 BF16 池,大小由权重和激活之后剩余的显存决定。
+每个序列持有一张**块表**(物理块 id 列表),逻辑位置 `p` 映射到物理行
+`block_table[p/BLOCK]*BLOCK + p%BLOCK`(寻址公式共享在 `kv_cache.cuh`)。块按需分配,所以显存随**实际**
+序列长度增长,并发序列数与 `max_ctx` 解耦:在 24 GB 的 4090 上,同样的显存变成一个共享的 ~8.7 万 token
+池,而不是每序列预留固定一段。三个 KV kernel 都经块表寻址:`store_kv_paged`(prefill 与 decode 共用)、
+`attention_paged`(prefill)、以及 split-K 的 `attention_decode_paged`。
+
+### 连续批处理与抢占
+
+调度器(`engine/src/scheduler.*`)让所有 `n_slots` 一直满载:一有槽位空出就接纳一个等待中的请求,每次
+迭代把整个运行集合一起 decode。prefill 按固定大小分块(`PREFILL_CHUNK` = 每次迭代 256 token)、与 decode
+交错进行,所以长 prompt 不会卡住正在运行的序列。块池耗尽时,抢占最年轻的运行序列——释放其块并重新
+排队——待恢复时从 prompt + output **重算** KV(vLLM 的策略),从而在显存压力下保持正确而非死锁。每个请求
+带自己的采样参数:全 greedy 的批走 GPU argmax,只要有一个请求要采样,整批就回退到主机侧逐行采样。
+
+这些背后的分阶段历程——单流优化(标量 matmul → WMMA → split-K → INT8,49.7 → 104 tok/s)与批处理实现
+——保存在 `optimization-study` 与 `feature/batching` 两个分支。
 
 ---
 

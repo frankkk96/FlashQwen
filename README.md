@@ -79,36 +79,73 @@ Each subcommand extracts and launches the embedded engine itself; `--model` is r
 
 ---
 
-## Code structure
+## How it works
 
-The packages of the outer Go application (root module):
+### Bridging Go and C++
 
-| Path | Responsibility | Lines |
-|---|---|---:|
-| `cmd/flashqwen/` | program entry point; dispatches the `serve` / `chat` / `benchmark` subcommands | 346 |
-| `internal/engine/` | talks to the inner engine: a low-level token-stream gRPC client, and a high-level text `Generate` (render → tokenise → drive the engine → decode); the gRPC stubs `enginepb` are used only here | 225 |
-| `internal/server/` | exposes the engine as an OpenAI-compatible HTTP service — OpenAI request/response decode/encode and SSE streaming | 293 |
-| `internal/chatml/` | the bidirectional Qwen3 ChatML codec: renders messages into a prompt, and decodes the engine's token stream into text while detecting tool calls | 266 |
-| `internal/tokenizer/` | a from-scratch byte-level BPE tokenizer; reads vocab / merges / tokenizer.json | 483 |
-| `internal/supervisor/` | embeds the engine binary via `//go:embed`; extracts, launches, health-checks, and tears it down | 78 |
+The compiled C++ engine binary is bundled into the Go binary with `//go:embed`. At startup the Go
+supervisor writes it to a temp directory, picks a free localhost port, launches it as a child
+process, polls `GetModel` until it answers, and sends it `SIGTERM` on exit — so there is one binary
+to run and no engine process to manage by hand.
 
-The source files of the inner C++/CUDA token engine (`engine/src/`), by descending line count:
+The two sides talk over gRPC, defined by `proto/engine.proto`. Only token ids cross the wire: Go
+tokenises the prompt and sends `GenerateRequest{input_ids, max_tokens, temperature, top_p,
+stop_token_ids}`; `Generate` is server-streaming, so the engine replies with a stream of `token_id`
+events followed by a `Done{finish_reason, prompt_tokens, completion_tokens}`. `GetModel` reports the
+engine's authoritative context window and vocab size. A client disconnect cancels the RPC, which the
+engine turns into a sequence abort that frees the sequence's KV.
 
-| File | Responsibility | Lines |
-|---|---|---:|
-| `kernels.*` | all CUDA kernels: INT8 GEMV, WMMA matmul, attention, split-K decode | 529 |
-| `model_runtime.*` | loads weights and quantises them to INT8 in VRAM; runs the forward pass | 435 |
-| `scheduler.*` | the continuous-batching scheduler: chunked prefill, sequence admission, and preemption | 215 |
-| `grpc_server.*` | the token-level gRPC service: takes token ids, streams back sampled token ids | 181 |
-| `kv_cache.*` | the paged KV pool for PagedAttention | 127 |
-| `safetensors.*` | mmaps and parses the `.safetensors` header with RapidJSON | 111 |
-| `model_spec.hpp` | reads model dimensions and architecture from `config.json` (declarative, no GPU) | 64 |
-| `sampler.*` | sampling: greedy, temperature, top-p | 54 |
-| `main.cpp` / `args.*` | the engine process entry point and CLI argument parsing | 88 |
+### Weight loading and INT8 quantisation
 
-The interface between the two layers is defined by `proto/engine.proto`. The full single-stream
-optimisation journey (scalar matmul → WMMA → split-K → INT8, 49.7 → 104 tok/s) and the staged
-batching implementation live on the `optimization-study` and `feature/batching` branches.
+The engine mmaps the `.safetensors` shards and parses their header with RapidJSON, reading the
+weights as BF16. At load time it quantises every matmul weight (the attention q/k/v/o projections,
+the MLP gate/up/down, and `lm_head`) to INT8 with one scale per output row (symmetric, clamped to
+[-127, 127]); embeddings and norms stay BF16. This roughly halves weight memory (~16 GB → ~9 GB).
+Prefill dequantises the INT8 weights back to BF16 to feed the tensor cores; decode reads the INT8
+bytes directly, which is what matters since decode is memory-bound.
+
+### Prefill vs decode
+
+A forward pass takes one of two paths. **Prefill** (many prompt tokens at once) is compute-bound, so
+its matmuls run on the tensor cores via WMMA. **Decode** (one token per step) is memory-bound, so it
+uses a vectorised INT8 GEMV; the fixed single-token kernel sequence is captured once into a CUDA
+graph and replayed each step (the token id, position, and `past_len` live in device buffers, so the
+graph stays valid as the context grows). Greedy decoding does the argmax on the GPU and returns just
+one int; temperature / top-p sampling copies the logits to the host instead.
+
+### Attention: flash-decoding split-K
+
+Prefill attention assigns one warp per (head, query) and runs an online softmax entirely in
+registers, with no block barriers. At decode time with batch 1 that scheme exposes only ~32 parallel
+units (one per head), so each head's key range is split into `ATTN_SPLITS` (16) chunks computed by
+separate blocks as partial online-softmaxes and then combined — about 16× more parallelism, which
+keeps decode latency nearly flat as the context grows.
+
+### Paged KV cache (PagedAttention)
+
+Each layer's KV is a single `[num_blocks, BLOCK=16, kv_dim]` BF16 pool sized from the VRAM left after
+weights and activations. A sequence owns a *block table* — a list of physical block ids — and a
+logical position `p` maps to physical row `block_table[p/BLOCK]*BLOCK + p%BLOCK` (the addressing is
+shared in `kv_cache.cuh`). Blocks are handed out on demand, so VRAM grows with the actual sequence
+length and the number of concurrent sequences is decoupled from `max_ctx`: on a 24 GB 4090 the same
+memory becomes one shared ~87k-token pool instead of a fixed per-sequence reservation. Three KV
+kernels address through the block table: `store_kv_paged` (prefill and decode), `attention_paged`
+(prefill), and the split-K `attention_decode_paged`.
+
+### Continuous batching and preemption
+
+The scheduler (`engine/src/scheduler.*`) keeps all `n_slots` busy: as soon as a slot frees it admits
+a waiting request, and each iteration decodes the whole running set together. Prefill is chunked
+(`PREFILL_CHUNK` = 256 tokens per iteration) and interleaved with decode, so a long prompt never
+stalls the running sequences. When the block pool runs dry it preempts the youngest running sequence
+— freeing its blocks and requeuing it — and recomputes its KV from prompt + output on resume (the
+vLLM strategy), which keeps the engine correct under memory pressure rather than deadlocking. Each
+request carries its own sampling parameters; an all-greedy batch uses the GPU argmax, and a single
+sampling request makes the batch fall back to host-side per-row sampling.
+
+The staged history behind these — the single-stream optimisation journey (scalar matmul → WMMA →
+split-K → INT8, 49.7 → 104 tok/s) and the batching work — lives on the `optimization-study` and
+`feature/batching` branches.
 
 ---
 
