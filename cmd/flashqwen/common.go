@@ -7,17 +7,14 @@ import (
 
 	"flashqwen/internal/chat"
 	"flashqwen/internal/engine"
-	pb "flashqwen/internal/enginepb"
 	"flashqwen/internal/supervisor"
 	"flashqwen/internal/tokenizer"
 )
 
-// session bundles the embedded engine plus the Go-side model-text layer.
+// session bundles the embedded engine client plus its lifecycle.
 type session struct {
 	eng  *engine.Client
-	cm   *chat.Model
-	tok  *tokenizer.Tokenizer
-	info *pb.ModelInfo
+	info *engine.ModelInfo
 	stop func()
 }
 
@@ -34,26 +31,27 @@ func open(modelDir string, slots, maxCtx int) (*session, error) {
 	if err != nil {
 		return nil, err
 	}
-	cli, err := engine.Dial(sup.Addr)
+	eng, err := engine.Dial(sup.Addr, cm, tok)
 	if err != nil {
 		sup.Stop()
 		return nil, err
 	}
-	info, err := waitReady(cli, 120*time.Second)
+	info, err := waitReady(eng, 120*time.Second)
 	if err != nil {
-		cli.Close()
+		eng.Close()
 		sup.Stop()
 		return nil, fmt.Errorf("engine did not become ready: %w", err)
 	}
-	return &session{eng: cli, cm: cm, tok: tok, info: info, stop: func() { cli.Close(); sup.Stop() }}, nil
+	eng.SetMaxCtx(info.MaxCtx)
+	return &session{eng: eng, info: info, stop: func() { eng.Close(); sup.Stop() }}, nil
 }
 
 // waitReady polls GetModel until the engine answers or the timeout elapses.
-func waitReady(cli *engine.Client, timeout time.Duration) (*pb.ModelInfo, error) {
+func waitReady(eng *engine.Client, timeout time.Duration) (*engine.ModelInfo, error) {
 	deadline := time.Now().Add(timeout)
 	for {
 		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-		info, err := cli.GetModel(ctx)
+		info, err := eng.GetModel(ctx)
 		cancel()
 		if err == nil {
 			return info, nil
@@ -64,5 +62,3 @@ func waitReady(cli *engine.Client, timeout time.Duration) (*pb.ModelInfo, error)
 		time.Sleep(500 * time.Millisecond)
 	}
 }
-
-func (s *session) maxCtx() int { return int(s.info.MaxCtx) }

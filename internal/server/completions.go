@@ -1,8 +1,4 @@
-// Package openai is the OpenAI-compatible HTTP adapter: it decodes OpenAI chat requests into the
-// neutral llm.Request, delegates generation to llm.Service, and encodes the result back into
-// OpenAI JSON / SSE. It owns only the OpenAI wire format and its transport framing; all generation
-// (prompt rendering, tokenisation, the token engine, stream decoding) lives in internal/llm.
-package openai
+package server
 
 import (
 	"encoding/json"
@@ -11,42 +7,13 @@ import (
 	"time"
 
 	"flashqwen/internal/chat"
-	"flashqwen/internal/llm"
+	"flashqwen/internal/engine"
 
 	"github.com/gin-gonic/gin"
 )
 
-type Server struct {
-	svc   *llm.Service
-	model string
-	idSeq int
-}
-
-func NewServer(svc *llm.Service, model string) *Server {
-	return &Server{svc: svc, model: model}
-}
-
-// Routes registers the OpenAI endpoints on a gin engine.
-func (s *Server) Routes(r *gin.Engine) {
-	r.GET("/v1/models", s.listModels)
-	r.POST("/v1/chat/completions", s.chatCompletions)
-	r.GET("/healthz", func(c *gin.Context) { c.String(200, "ok") })
-}
-
-func (s *Server) newID() string {
-	s.idSeq++
-	return fmt.Sprintf("chatcmpl-%d-%d", time.Now().UnixNano(), s.idSeq)
-}
-
-func (s *Server) listModels(c *gin.Context) {
-	c.JSON(http.StatusOK, ModelList{
-		Object: "list",
-		Data:   []Model{{ID: s.model, Object: "model", Created: time.Now().Unix(), OwnedBy: "flashqwen"}},
-	})
-}
-
-// decode maps an OpenAI chat request into the neutral llm.Request.
-func decode(req ChatRequest) llm.Request {
+// decode maps an OpenAI chat request into the neutral engine.Request.
+func decode(req ChatRequest) engine.Request {
 	msgs := make([]chat.Message, 0, len(req.Messages))
 	for _, m := range req.Messages {
 		cm := chat.Message{Role: m.Role, Content: m.Text(), ToolCallID: m.ToolCallID}
@@ -62,7 +29,7 @@ func decode(req ChatRequest) llm.Request {
 			Name: t.Function.Name, Description: t.Function.Description,
 			ParametersJSON: string(t.Function.Parameters)})
 	}
-	return llm.Request{
+	return engine.Request{
 		Messages:       msgs,
 		Tools:          tools,
 		EnableThinking: req.EnableThinking != nil && *req.EnableThinking,
@@ -98,8 +65,8 @@ func toolCalls(tcs []chat.ToolCall) []ToolCall {
 	return out
 }
 
-func (s *Server) blockingChat(c *gin.Context, req llm.Request) {
-	res, err := s.svc.Generate(c.Request.Context(), req, nil)
+func (s *Server) blockingChat(c *gin.Context, req engine.Request) {
+	res, err := s.eng.Generate(c.Request.Context(), req, nil)
 	if err != nil {
 		c.JSON(http.StatusBadGateway, gin.H{"error": gin.H{"message": "engine: " + err.Error(), "type": "engine_error"}})
 		return
@@ -124,7 +91,7 @@ func (s *Server) blockingChat(c *gin.Context, req llm.Request) {
 	})
 }
 
-func (s *Server) streamChat(c *gin.Context, req llm.Request) {
+func (s *Server) streamChat(c *gin.Context, req engine.Request) {
 	c.Header("Content-Type", "text/event-stream")
 	c.Header("Cache-Control", "no-cache")
 	c.Header("Connection", "keep-alive")
@@ -144,7 +111,7 @@ func (s *Server) streamChat(c *gin.Context, req llm.Request) {
 	}
 
 	chunk(&RespMessage{Role: "assistant"}, nil) // opening chunk carries the role
-	res, err := s.svc.Generate(c.Request.Context(), req, func(text string, tc *chat.ToolCall) {
+	res, err := s.eng.Generate(c.Request.Context(), req, func(text string, tc *chat.ToolCall) {
 		if text != "" {
 			d := text
 			chunk(&RespMessage{Content: &d}, nil)

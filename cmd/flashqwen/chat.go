@@ -10,7 +10,7 @@ import (
 	"strings"
 
 	"flashqwen/internal/chat"
-	pb "flashqwen/internal/enginepb"
+	"flashqwen/internal/engine"
 )
 
 func runChat(args []string) {
@@ -61,45 +61,18 @@ func runChat(args []string) {
 		}
 
 		history = append(history, chat.Message{Role: "user", Content: line})
-		prompt := s.cm.Render(history, nil, thinking)
-		ids, err := s.tok.Encode(prompt)
-		if err != nil {
-			fmt.Printf("[tokenise error: %v]\n", err)
-			history = history[:len(history)-1]
-			continue
-		}
-		room := s.maxCtx() - len(ids)
-		if room < 1 {
-			fmt.Println("[context full - type /reset to clear history]")
-			history = history[:len(history)-1]
-			continue
-		}
-		maxNew := room
-		if maxNew > 1024 {
-			maxNew = 1024
-		}
-		in32 := make([]int32, len(ids))
-		for i, id := range ids {
-			in32[i] = int32(id)
-		}
-
 		fmt.Print("\033[1mAssistant:\033[0m ")
-		stream := s.cm.NewStream()
-		var sb strings.Builder
-		_, err = s.eng.Generate(context.Background(), &pb.GenerateRequest{
-			InputIds: in32, MaxTokens: int32(maxNew), TopP: 1.0, StopTokenIds: s.cm.StopTokenIDs(),
-		}, func(id int32) {
-			if text, _ := stream.Push(int(id)); text != "" {
-				fmt.Print(text)
-				sb.WriteString(text)
-			}
+		res, err := s.eng.Generate(context.Background(), engine.Request{
+			Messages: history, EnableThinking: thinking, MaxTokens: 1024,
+		}, func(text string, _ *chat.ToolCall) {
+			fmt.Print(text)
 		})
 		fmt.Println()
 		if err != nil {
-			fmt.Printf("[engine error: %v]\n", err)
+			fmt.Printf("[error: %v]\n", err)
 			history = history[:len(history)-1]
 			continue
 		}
-		history = append(history, chat.Message{Role: "assistant", Content: sb.String()})
+		history = append(history, chat.Message{Role: "assistant", Content: res.Text})
 	}
 }

@@ -8,8 +8,6 @@ import (
 	"math/rand"
 	"sync"
 	"time"
-
-	pb "flashqwen/internal/enginepb"
 )
 
 // runBench is an end-to-end throughput driver: it fires synthetic requests (random token ids) at
@@ -35,7 +33,7 @@ func runBench(args []string) {
 	}
 	defer s.stop()
 
-	vocab := int(s.info.VocabSize)
+	vocab := s.info.VocabSize
 	rng := rand.New(rand.NewSource(1234))
 	makePrompt := func() []int32 {
 		ids := make([]int32, *input)
@@ -70,15 +68,15 @@ func runBench(args []string) {
 					var first time.Time
 					got := false
 					n := 0
-					_, err := s.eng.Generate(context.Background(), &pb.GenerateRequest{
-						InputIds: ids, MaxTokens: int32(*output), TopP: 1.0, // no stop ids: full length
-					}, func(int32) {
-						if !got {
-							first = time.Now()
-							got = true
-						}
-						n++
-					})
+					_, err := s.eng.Stream(context.Background(), ids, *output,
+						0, 1.0, nil, // greedy, no nucleus, no stop ids: full length
+						func(int32) {
+							if !got {
+								first = time.Now()
+								got = true
+							}
+							n++
+						})
 					results <- result{ttft: first.Sub(t0), completion: n, err: err}
 				}
 			}()
@@ -112,7 +110,7 @@ func runBench(args []string) {
 	}
 
 	fmt.Printf("\nend-to-end throughput (input %d, output %d, %d requests/level, model %s)\n\n",
-		*input, *output, *requests, s.info.Id)
+		*input, *output, *requests, s.info.ID)
 	fmt.Println("  conc  requests   wall (s)   aggregate t/s   TTFT (ms)")
 	for _, c := range []int{1, 8, 16} {
 		if c > *slots {

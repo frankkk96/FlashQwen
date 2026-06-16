@@ -7,10 +7,7 @@ import (
 	"os/signal"
 	"syscall"
 
-	"flashqwen/internal/llm"
-	"flashqwen/internal/openai"
-
-	"github.com/gin-gonic/gin"
+	"flashqwen/internal/server"
 )
 
 func runServe(args []string) {
@@ -33,13 +30,8 @@ func runServe(args []string) {
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
 	go func() { <-sig; s.stop(); os.Exit(0) }()
 
-	gin.SetMode(gin.ReleaseMode)
-	r := gin.Default()
-	svc := llm.NewService(s.eng, s.cm, s.tok, s.maxCtx())
-	openai.NewServer(svc, s.info.Id).Routes(r)
-
-	log.Printf("flashqwen serve on %s (model %q, max_ctx %d)", *addr, s.info.Id, s.maxCtx())
-	if err := r.Run(*addr); err != nil {
+	log.Printf("flashqwen serve on %s (model %q, max_ctx %d)", *addr, s.info.ID, s.info.MaxCtx)
+	if err := server.New(s.eng, s.info.ID).Run(*addr); err != nil {
 		s.stop()
 		log.Fatal(err)
 	}
