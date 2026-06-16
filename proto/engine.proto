@@ -29,10 +29,25 @@ message Done {
   int32  completion_tokens = 3;
 }
 
+// Request-level failure taxonomy. These are errors the engine raises while serving a single
+// request (not startup/load failures, which abort the process before any RPC). The message field
+// carries human-readable detail (counts, limits) that the Go layer surfaces verbatim to the client.
+enum ErrorCode {
+  ERROR_CODE_UNSPECIFIED   = 0;
+  ERROR_CODE_OVER_CAPACITY = 1;   // KV pool / request queue is full — retryable (maps to HTTP 503)
+  ERROR_CODE_INTERNAL      = 2;   // unexpected engine failure (maps to HTTP 502)
+}
+
+message Error {
+  ErrorCode code    = 1;
+  string    message = 2;          // detailed, human-readable; surfaced to the client as-is
+}
+
 message GenerateEvent {
   oneof event {
     int32 token_id = 1;     // one generated token id
-    Done  done     = 2;     // terminal event (always last)
+    Done  done     = 2;     // terminal event on success (always last)
+    Error error    = 3;     // terminal event on failure (mutually exclusive with done)
   }
 }
 

@@ -10,6 +10,7 @@ struct Args {
     unsigned seed          = 1234;                // RNG seed for sampling
     std::string address    = "127.0.0.1:50051";   // gRPC listen address
     int   slots            = 16;                   // max concurrent sequences
+    int   max_queue        = 0;                    // admission cap on waiting requests (<=0 => 4*slots)
 };
 
 // Parse argv into `out`. Returns <0 to continue running; returns >=0 when the program should exit

@@ -8,4 +8,4 @@
 #include <random>
 
 int run_grpc_server(ModelRuntime& model, const KVCache& kv, const std::string& address,
-                    int n_slots, const std::string& model_id, std::mt19937& rng);
+                    int n_slots, int max_queue, const std::string& model_id, std::mt19937& rng);

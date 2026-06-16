@@ -11,6 +11,8 @@ package engine
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"io"
 
 	"flashqwen/internal/chatml"
@@ -20,6 +22,26 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 )
+
+// Engine request-path errors, mirroring the proto ErrorCode taxonomy. Callers classify with
+// errors.Is; the wrapped message carries the engine's detailed, human-readable context so the
+// server can surface it to the client verbatim. (ErrPromptTooLong, a pre-flight check, is in
+// generate.go.)
+var (
+	ErrOverCapacity   = errors.New("engine over capacity")  // KV pool / queue full — retryable (HTTP 503)
+	ErrEngineInternal = errors.New("engine internal error") // unexpected engine failure (HTTP 502)
+)
+
+// errorFor turns a structured engine Error event into a typed Go error, preserving the engine's
+// detailed message verbatim.
+func errorFor(e *pb.Error) error {
+	switch e.GetCode() {
+	case pb.ErrorCode_ERROR_CODE_OVER_CAPACITY:
+		return fmt.Errorf("%w: %s", ErrOverCapacity, e.GetMessage())
+	default: // INTERNAL or an unknown/future code — treat as an engine failure, keep the detail
+		return fmt.Errorf("%w: %s", ErrEngineInternal, e.GetMessage())
+	}
+}
 
 type Client struct {
 	conn   *grpc.ClientConn
@@ -90,6 +112,8 @@ func (c *Client) stream(ctx context.Context, g *pb.GenerateRequest, onToken func
 		case *pb.GenerateEvent_Done:
 			return &Stats{FinishReason: x.Done.FinishReason,
 				PromptTokens: int(x.Done.PromptTokens), CompletionTokens: int(x.Done.CompletionTokens)}, nil
+		case *pb.GenerateEvent_Error:
+			return nil, errorFor(x.Error)
 		}
 	}
 }

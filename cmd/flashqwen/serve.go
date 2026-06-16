@@ -16,12 +16,13 @@ func runServe(args []string) {
 	addr := fs.String("addr", ":8000", "HTTP listen address")
 	slots := fs.Int("slots", 16, "max concurrent sequences")
 	maxCtx := fs.Int("max-ctx", 4096, "KV / context length")
+	maxQueue := fs.Int("max-queue", 0, "max requests waiting for admission before new ones are rejected as over-capacity (0 => 4*slots)")
 	fs.Parse(args)
 	if *model == "" {
 		log.Fatal("serve: --model is required")
 	}
 
-	s, err := open(*model, *slots, *maxCtx)
+	s, err := open(*model, *slots, *maxCtx, *maxQueue)
 	if err != nil {
 		log.Fatalf("serve: %v", err)
 	}

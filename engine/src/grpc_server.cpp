@@ -1,5 +1,6 @@
 #include "grpc_server.hpp"
 #include "scheduler.hpp"
+#include "errors.hpp"
 #include "engine.grpc.pb.h"
 #include <grpcpp/grpcpp.h>
 #include <algorithm>
@@ -16,6 +17,15 @@ using flashqwen::GenerateRequest;
 using flashqwen::GenerateEvent;
 using flashqwen::ModelRequest;
 using flashqwen::ModelInfo;
+
+// The single place that maps the engine's domain error taxonomy to the proto wire codes.
+static flashqwen::ErrorCode to_proto(EngineErrc e) {
+    switch (e) {
+        case EngineErrc::OverCapacity: return flashqwen::ERROR_CODE_OVER_CAPACITY;
+        case EngineErrc::Internal:     return flashqwen::ERROR_CODE_INTERNAL;
+    }
+    return flashqwen::ERROR_CODE_UNSPECIFIED;
+}
 
 // ---- per-request server-side state ------------------------------------------------------
 // Owned by a shared_ptr held jointly by the gRPC handler thread (writes the stream) and the
@@ -44,7 +54,7 @@ struct RequestCtx {
 
 // ---- the engine: the single thread that touches the model / GPU -------------------------
 struct EngineLoop {
-    ModelRuntime& model; const KVCache& kv; std::mt19937& rng; int n_slots;
+    ModelRuntime& model; const KVCache& kv; std::mt19937& rng; int n_slots; int max_queue;
     std::mutex mu; std::condition_variable cv;
     std::deque<std::shared_ptr<RequestCtx>> inbound;
     std::deque<Request*> cancel_q;
@@ -59,13 +69,29 @@ struct EngineLoop {
     }
 
     void run() {
-        Scheduler sched(model, kv, n_slots, rng);
+        Scheduler sched(model, kv, n_slots, max_queue, rng);
         std::unordered_map<Request*, std::shared_ptr<RequestCtx>> conns;
+
+        // Terminate a request's stream with a structured error event (its blocks are already freed
+        // by the scheduler). The detailed message rides through to the client unchanged.
+        auto fail = [&](RequestCtx* c, EngineErrc code, const std::string& msg) {
+            GenerateEvent ev;
+            auto* e = ev.mutable_error();
+            e->set_code(to_proto(code));
+            e->set_message(msg);
+            c->queue.push(std::move(ev));
+            c->queue.close();
+        };
 
         auto on_token = [&](Request* r, int t) {
             auto it = conns.find(r); if (it == conns.end()) return;
             GenerateEvent ev; ev.set_token_id(t);
             it->second->queue.push(std::move(ev));
+        };
+        auto on_error = [&](Request* r, EngineErrc code, std::string msg) {
+            auto it = conns.find(r); if (it == conns.end()) return;
+            fail(it->second.get(), code, msg);
+            conns.erase(it);
         };
         auto on_finish = [&](Request* r) {
             auto it = conns.find(r); if (it == conns.end()) return;
@@ -90,6 +116,14 @@ struct EngineLoop {
                     cv.wait(lk, [&] { return !inbound.empty() || !cancel_q.empty(); });
                 while (!inbound.empty()) {
                     auto c = std::move(inbound.front()); inbound.pop_front();
+                    if (!sched.can_admit()) {   // admission control: queue full -> reject as over-capacity
+                        fail(c.get(), EngineErrc::OverCapacity,
+                             "request queue full: " + std::to_string(sched.queue_depth()) +
+                             " requests already waiting (limit " + std::to_string(sched.max_queue()) +
+                             "), engine running up to " + std::to_string(n_slots) +
+                             " concurrent sequences; retry shortly");
+                        continue;
+                    }
                     Request* rp = &c->req; conns[rp] = c; sched.add(rp);
                 }
                 while (!cancel_q.empty()) {
@@ -98,7 +132,7 @@ struct EngineLoop {
                     if (it != conns.end()) { sched.remove(rp); it->second->queue.close(); conns.erase(it); }
                 }
             }
-            if (sched.busy()) sched.step(on_token, on_finish);
+            if (sched.busy()) sched.step(on_token, on_finish, on_error);
         }
     }
 };
@@ -134,7 +168,9 @@ public:
             GenerateEvent ev;
             if (c->queue.pop(ev, 100)) {
                 if (!writer->Write(ev)) { eng_.request_cancel(rp); break; }   // client write failed
-                if (ev.event_case() == GenerateEvent::kDone) break;
+                // Done and Error are both terminal; the client decodes Error into a typed failure.
+                if (ev.event_case() == GenerateEvent::kDone ||
+                    ev.event_case() == GenerateEvent::kError) break;
             } else {
                 if (ctx->IsCancelled()) { eng_.request_cancel(rp); break; }   // client went away
                 if (c->queue.is_closed()) break;                             // cancelled by engine
@@ -150,9 +186,10 @@ private:
 };
 
 int run_grpc_server(ModelRuntime& model, const KVCache& kv, const std::string& address,
-                    int n_slots, const std::string& model_id, std::mt19937& rng) {
+                    int n_slots, int max_queue, const std::string& model_id, std::mt19937& rng) {
     if (n_slots > model.max_batch()) n_slots = model.max_batch();
-    EngineLoop engine{model, kv, rng, n_slots};
+    if (max_queue <= 0) max_queue = 4 * n_slots;   // default admission depth
+    EngineLoop engine{model, kv, rng, n_slots, max_queue};
     std::thread engine_thread([&] { engine.run(); });
     engine_thread.detach();
 
@@ -163,8 +200,8 @@ int run_grpc_server(ModelRuntime& model, const KVCache& kv, const std::string& a
     builder.SetMaxReceiveMessageSize(64 * 1024 * 1024);
     std::unique_ptr<grpc::Server> server(builder.BuildAndStart());
     if (!server) { std::fprintf(stderr, "[engine] failed to bind %s\n", address.c_str()); return 1; }
-    std::fprintf(stderr, "[engine] gRPC listening on %s (%d slots, model %s)\n",
-                 address.c_str(), n_slots, model_id.c_str());
+    std::fprintf(stderr, "[engine] gRPC listening on %s (%d slots, max_queue %d, model %s)\n",
+                 address.c_str(), n_slots, max_queue, model_id.c_str());
     server->Wait();
     return 0;
 }

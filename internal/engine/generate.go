@@ -2,11 +2,17 @@ package engine
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	"flashqwen/internal/chatml"
 	pb "flashqwen/internal/enginepb"
 )
+
+// ErrPromptTooLong is returned by Generate when the prompt alone fills the context window, leaving
+// no room to generate. It is a client/request error (the caller sent too much), distinct from an
+// engine failure — the server maps it to HTTP 400 rather than 502.
+var ErrPromptTooLong = errors.New("prompt exceeds context window")
 
 // Generate runs one text completion — the high-level API for callers above this package. It renders
 // the ChatML prompt, tokenises, drives the engine, and decodes the id stream into text + tool calls.
@@ -38,6 +44,14 @@ func (c *Client) Generate(ctx context.Context, req Request,
 	if err != nil {
 		return nil, err
 	}
+	// Emit any trailing partial rune the stream held back (e.g. max_tokens hit mid-character), so
+	// the aggregated text matches a whole-list decode.
+	if tail := stream.Flush(); tail != "" {
+		res.Text += tail
+		if onDelta != nil {
+			onDelta(tail, nil)
+		}
+	}
 
 	res.FinishReason = stats.FinishReason
 	res.PromptTokens = stats.PromptTokens
@@ -58,7 +72,7 @@ func (c *Client) Generate(ctx context.Context, req Request,
 func (c *Client) resolveMaxTokens(promptLen, requested int) (int, error) {
 	room := c.maxCtx - promptLen
 	if room < 1 {
-		return 0, fmt.Errorf("prompt is %d tokens, exceeds context window %d", promptLen, c.maxCtx)
+		return 0, fmt.Errorf("%w: prompt is %d tokens, context window is %d", ErrPromptTooLong, promptLen, c.maxCtx)
 	}
 	if requested <= 0 || requested > room {
 		return room, nil

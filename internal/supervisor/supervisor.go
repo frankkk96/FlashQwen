@@ -25,7 +25,9 @@ type Engine struct {
 
 // Start extracts and launches the engine against modelDir, returning once the process has been
 // spawned (call WaitReady on a client to block until it serves). Engine stderr is forwarded.
-func Start(modelDir string, slots, maxCtx int) (*Engine, error) {
+// maxQueue caps how many requests may wait for admission before the engine rejects new ones as
+// over-capacity; <=0 lets the engine pick its default (4*slots).
+func Start(modelDir string, slots, maxCtx, maxQueue int) (*Engine, error) {
 	f, err := os.CreateTemp("", "flashqwen-engine-*")
 	if err != nil {
 		return nil, err
@@ -49,7 +51,8 @@ func Start(modelDir string, slots, maxCtx int) (*Engine, error) {
 		"--model", modelDir,
 		"--address", addr,
 		"--slots", strconv.Itoa(slots),
-		"--max-ctx", strconv.Itoa(maxCtx))
+		"--max-ctx", strconv.Itoa(maxCtx),
+		"--max-queue", strconv.Itoa(maxQueue))
 	cmd.Stderr = os.Stderr
 	if err := cmd.Start(); err != nil {
 		os.Remove(f.Name())

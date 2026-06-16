@@ -1,6 +1,9 @@
 package engine
 
-import "testing"
+import (
+	"errors"
+	"testing"
+)
 
 // resolveMaxTokens only reads c.maxCtx, so a bare Client is enough to test the length policy.
 func TestResolveMaxTokens(t *testing.T) {
@@ -27,6 +30,9 @@ func TestResolveMaxTokens(t *testing.T) {
 			if tc.wantErr {
 				if err == nil {
 					t.Fatalf("expected error, got %d", got)
+				}
+				if !errors.Is(err, ErrPromptTooLong) {
+					t.Errorf("error %v is not ErrPromptTooLong", err)
 				}
 				return
 			}

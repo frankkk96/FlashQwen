@@ -19,15 +19,16 @@ type session struct {
 }
 
 // open loads the tokenizer + chat template from the model directory, launches the embedded engine
-// against it, and waits for it to serve. The returned stop() tears both down.
-func open(modelDir string, slots, maxCtx int) (*session, error) {
+// against it, and waits for it to serve. The returned stop() tears both down. maxQueue caps the
+// engine's admission queue (<=0 => engine default of 4*slots).
+func open(modelDir string, slots, maxCtx, maxQueue int) (*session, error) {
 	tok, err := tokenizer.Load(modelDir)
 	if err != nil {
 		return nil, err
 	}
 	cm := chatml.Load(modelDir, tok)
 
-	sup, err := supervisor.Start(modelDir, slots, maxCtx)
+	sup, err := supervisor.Start(modelDir, slots, maxCtx, maxQueue)
 	if err != nil {
 		return nil, err
 	}

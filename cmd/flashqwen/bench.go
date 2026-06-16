@@ -27,7 +27,7 @@ func runBench(args []string) {
 		log.Fatal("benchmark: --model is required")
 	}
 
-	s, err := open(*model, *slots, *maxCtx)
+	s, err := open(*model, *slots, *maxCtx, 0)
 	if err != nil {
 		log.Fatalf("benchmark: %v", err)
 	}

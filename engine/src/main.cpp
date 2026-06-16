@@ -39,5 +39,5 @@ int main(int argc, char** argv) {
     if (auto p = id.find_last_of('/'); p != std::string::npos) id = id.substr(p + 1);
     if (id.empty()) id = "flashqwen";
 
-    return run_grpc_server(model, kv, a.address, a.slots, id, rng);
+    return run_grpc_server(model, kv, a.address, a.slots, a.max_queue, id, rng);
 }
