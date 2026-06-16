@@ -1,34 +1,29 @@
-// Package openai is the OpenAI-compatible HTTP layer. It renders the prompt + tokenises (chat,
-// tokenizer), drives the token engine over gRPC, and turns the returned id stream back into
-// OpenAI text deltas / tool calls.
+// Package openai is the OpenAI-compatible HTTP adapter: it decodes OpenAI chat requests into the
+// neutral llm.Request, delegates generation to llm.Service, and encodes the result back into
+// OpenAI JSON / SSE. It owns only the OpenAI wire format and its transport framing; all generation
+// (prompt rendering, tokenisation, the token engine, stream decoding) lives in internal/llm.
 package openai
 
 import (
 	"encoding/json"
 	"fmt"
 	"net/http"
-	"strings"
 	"time"
 
 	"flashqwen/internal/chat"
-	"flashqwen/internal/engine"
-	pb "flashqwen/internal/enginepb"
-	"flashqwen/internal/tokenizer"
+	"flashqwen/internal/llm"
 
 	"github.com/gin-gonic/gin"
 )
 
 type Server struct {
-	eng    *engine.Client
-	cm     *chat.Model
-	tok    *tokenizer.Tokenizer
-	model  string
-	maxCtx int
-	idSeq  int
+	svc   *llm.Service
+	model string
+	idSeq int
 }
 
-func NewServer(eng *engine.Client, cm *chat.Model, tok *tokenizer.Tokenizer, model string, maxCtx int) *Server {
-	return &Server{eng: eng, cm: cm, tok: tok, model: model, maxCtx: maxCtx}
+func NewServer(svc *llm.Service, model string) *Server {
+	return &Server{svc: svc, model: model}
 }
 
 // Routes registers the OpenAI endpoints on a gin engine.
@@ -50,9 +45,8 @@ func (s *Server) listModels(c *gin.Context) {
 	})
 }
 
-// buildRequest maps an OpenAI chat request into the engine's token-level request: render the
-// ChatML prompt, tokenise, clamp max_tokens to the context window, attach the stop ids.
-func (s *Server) buildRequest(req ChatRequest) (*pb.GenerateRequest, error) {
+// decode maps an OpenAI chat request into the neutral llm.Request.
+func decode(req ChatRequest) llm.Request {
 	msgs := make([]chat.Message, 0, len(req.Messages))
 	for _, m := range req.Messages {
 		cm := chat.Message{Role: m.Role, Content: m.Text(), ToolCallID: m.ToolCallID}
@@ -68,39 +62,14 @@ func (s *Server) buildRequest(req ChatRequest) (*pb.GenerateRequest, error) {
 			Name: t.Function.Name, Description: t.Function.Description,
 			ParametersJSON: string(t.Function.Parameters)})
 	}
-	enableThinking := req.EnableThinking != nil && *req.EnableThinking
-
-	prompt := s.cm.Render(msgs, tools, enableThinking)
-	ids, err := s.tok.Encode(prompt)
-	if err != nil {
-		return nil, err
+	return llm.Request{
+		Messages:       msgs,
+		Tools:          tools,
+		EnableThinking: req.EnableThinking != nil && *req.EnableThinking,
+		MaxTokens:      req.MaxTokens,
+		Temperature:    req.Temperature,
+		TopP:           req.TopP,
 	}
-	in := make([]int32, len(ids))
-	for i, id := range ids {
-		in[i] = int32(id)
-	}
-
-	maxTokens := req.MaxTokens
-	if maxTokens <= 0 {
-		maxTokens = 512
-	}
-	if room := s.maxCtx - len(ids); room > 0 && maxTokens > room {
-		maxTokens = room
-	}
-
-	g := &pb.GenerateRequest{
-		InputIds:     in,
-		MaxTokens:    int32(maxTokens),
-		TopP:         1.0,
-		StopTokenIds: s.cm.StopTokenIDs(),
-	}
-	if req.Temperature != nil {
-		g.Temperature = float32(*req.Temperature)
-	}
-	if req.TopP != nil {
-		g.TopP = float32(*req.TopP)
-	}
-	return g, nil
 }
 
 func (s *Server) chatCompletions(c *gin.Context) {
@@ -113,57 +82,49 @@ func (s *Server) chatCompletions(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": gin.H{"message": "messages is required", "type": "invalid_request_error"}})
 		return
 	}
-	g, err := s.buildRequest(req)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": gin.H{"message": err.Error(), "type": "tokenize_error"}})
-		return
-	}
 	if req.Stream {
-		s.streamChat(c, g)
+		s.streamChat(c, decode(req))
 	} else {
-		s.blockingChat(c, g)
+		s.blockingChat(c, decode(req))
 	}
 }
 
-func (s *Server) blockingChat(c *gin.Context, g *pb.GenerateRequest) {
-	stream := s.cm.NewStream()
-	var sb strings.Builder
-	var calls []ToolCall
-	done, err := s.eng.Generate(c.Request.Context(), g, func(id int32) {
-		if text, tc := stream.Push(int(id)); text != "" || tc != nil {
-			sb.WriteString(text)
-			if tc != nil {
-				calls = append(calls, ToolCall{ID: tc.ID, Type: "function",
-					Function: ToolCallFunction{Name: tc.Name, Arguments: tc.ArgumentsJSON}})
-			}
-		}
-	})
+func toolCalls(tcs []chat.ToolCall) []ToolCall {
+	out := make([]ToolCall, len(tcs))
+	for i, tc := range tcs {
+		out[i] = ToolCall{ID: tc.ID, Type: "function",
+			Function: ToolCallFunction{Name: tc.Name, Arguments: tc.ArgumentsJSON}}
+	}
+	return out
+}
+
+func (s *Server) blockingChat(c *gin.Context, req llm.Request) {
+	res, err := s.svc.Generate(c.Request.Context(), req, nil)
 	if err != nil {
 		c.JSON(http.StatusBadGateway, gin.H{"error": gin.H{"message": "engine: " + err.Error(), "type": "engine_error"}})
 		return
 	}
 	msg := RespMessage{Role: "assistant"}
-	reason := done.FinishReason
-	if len(calls) > 0 {
-		msg.ToolCalls = calls
-		reason = "tool_calls"
-		if sb.Len() > 0 {
-			t := sb.String()
+	if len(res.ToolCalls) > 0 {
+		msg.ToolCalls = toolCalls(res.ToolCalls)
+		if res.Text != "" {
+			t := res.Text
 			msg.Content = &t
 		}
 	} else {
-		t := sb.String()
+		t := res.Text
 		msg.Content = &t
 	}
+	reason := res.FinishReason
 	c.JSON(http.StatusOK, ChatCompletion{
 		ID: s.newID(), Object: "chat.completion", Created: time.Now().Unix(), Model: s.model,
 		Choices: []Choice{{Index: 0, Message: &msg, FinishReason: &reason}},
-		Usage: &Usage{PromptTokens: int(done.PromptTokens), CompletionTokens: int(done.CompletionTokens),
-			TotalTokens: int(done.PromptTokens + done.CompletionTokens)},
+		Usage: &Usage{PromptTokens: res.PromptTokens, CompletionTokens: res.CompletionTokens,
+			TotalTokens: res.PromptTokens + res.CompletionTokens},
 	})
 }
 
-func (s *Server) streamChat(c *gin.Context, g *pb.GenerateRequest) {
+func (s *Server) streamChat(c *gin.Context, req llm.Request) {
 	c.Header("Content-Type", "text/event-stream")
 	c.Header("Cache-Control", "no-cache")
 	c.Header("Connection", "keep-alive")
@@ -183,26 +144,18 @@ func (s *Server) streamChat(c *gin.Context, g *pb.GenerateRequest) {
 	}
 
 	chunk(&RespMessage{Role: "assistant"}, nil) // opening chunk carries the role
-	stream := s.cm.NewStream()
-	sawTool := false
-	done, err := s.eng.Generate(c.Request.Context(), g, func(tid int32) {
-		text, tc := stream.Push(int(tid))
+	res, err := s.svc.Generate(c.Request.Context(), req, func(text string, tc *chat.ToolCall) {
 		if text != "" {
 			d := text
 			chunk(&RespMessage{Content: &d}, nil)
 		}
 		if tc != nil {
-			sawTool = true
-			chunk(&RespMessage{ToolCalls: []ToolCall{{ID: tc.ID, Type: "function",
-				Function: ToolCallFunction{Name: tc.Name, Arguments: tc.ArgumentsJSON}}}}, nil)
+			chunk(&RespMessage{ToolCalls: toolCalls([]chat.ToolCall{*tc})}, nil)
 		}
 	})
 	reason := "stop"
-	if err == nil && done != nil {
-		reason = done.FinishReason
-	}
-	if sawTool {
-		reason = "tool_calls"
+	if err == nil && res != nil {
+		reason = res.FinishReason
 	}
 	chunk(&RespMessage{}, &reason)
 	fmt.Fprint(c.Writer, "data: [DONE]\n\n")

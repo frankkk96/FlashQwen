@@ -6,8 +6,8 @@ import (
 	"time"
 
 	"flashqwen/internal/chat"
-	pb "flashqwen/internal/enginepb"
 	"flashqwen/internal/engine"
+	pb "flashqwen/internal/enginepb"
 	"flashqwen/internal/supervisor"
 	"flashqwen/internal/tokenizer"
 )
