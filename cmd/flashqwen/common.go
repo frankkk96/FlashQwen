@@ -9,6 +9,11 @@ import (
 	"flashqwen/internal/tokenizer"
 )
 
+// startupStallTimeout is how long WaitReady tolerates no load progress (process still alive) before
+// giving up. It is a watchdog against a stuck load, not a cap on total load time — a model that
+// keeps making progress, however slowly, is never killed.
+const startupStallTimeout = 120 * time.Second
+
 // session bundles the embedded engine plus its lifecycle. gen is the text tier (used by serve /
 // chat); tok is the same tokenizer, exposed so the benchmark can synthesise prompts of a target
 // length without loading it a second time.
@@ -38,9 +43,12 @@ func open(modelDir string, slots, maxCtx, maxQueue int) (*session, error) {
 		sup.Stop()
 		return nil, err
 	}
-	// Block until the engine serves. sup.Exited makes a dying engine surface its real cause
-	// immediately instead of polling until the timeout.
-	info, err := conn.Ready(120*time.Second, sup.Exited)
+	// Block until the engine serves, showing a load progress bar. sup.Exited makes a dying engine
+	// surface its real cause immediately; WaitReady's stall watchdog tolerates a slow load of a large
+	// model (it only gives up if progress stops advancing for startupStallTimeout).
+	var bar startupBar
+	info, err := conn.WaitReady(startupStallTimeout, sup.Exited, bar.update)
+	bar.finish()
 	if err != nil {
 		conn.Close()
 		sup.Stop()

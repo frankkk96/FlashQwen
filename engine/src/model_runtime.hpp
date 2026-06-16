@@ -8,14 +8,17 @@
 #include "kv_cache.hpp"
 #include <vector>
 #include <string>
+#include <functional>
 
 class ModelRuntime {
 public:
     // Load the weights described by `spec` (safetensors, from spec.dir). max_ctx bounds the
     // per-sequence KV cache and the prefill batch size. Allocates weights + activation scratch only
     // — the paged KV pool lives in a separate KVCache; attach one (sized from the VRAM left after
-    // construction) before any prefill/decode call.
-    ModelRuntime(const ModelSpec& spec, int max_ctx);
+    // construction) before any prefill/decode call. on_progress (may be empty) is called as each
+    // transformer layer's weights upload, with (layers_done, layers_total), for a startup progress bar.
+    using ProgressFn = std::function<void(int done, int total)>;
+    ModelRuntime(const ModelSpec& spec, int max_ctx, ProgressFn on_progress = {});
     void attach_kv(const KVCache& kv) { kv_ = &kv; }   // non-owning; storage for the attention kernels
     ~ModelRuntime();
 

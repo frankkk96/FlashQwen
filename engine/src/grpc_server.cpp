@@ -1,6 +1,10 @@
 #include "grpc_server.hpp"
+#include "model_spec.hpp"
+#include "model_runtime.hpp"
+#include "kv_cache.hpp"
 #include "scheduler.hpp"
 #include "errors.hpp"
+#include "startup.hpp"
 #include "engine.grpc.pb.h"
 #include <grpcpp/grpcpp.h>
 #include <algorithm>
@@ -11,12 +15,15 @@
 #include <thread>
 #include <unordered_map>
 #include <cstdio>
+#include <exception>
 
 using flashqwen::Engine;
 using flashqwen::GenerateRequest;
 using flashqwen::GenerateEvent;
 using flashqwen::ModelRequest;
 using flashqwen::ModelInfo;
+using flashqwen::StatusRequest;
+using flashqwen::StatusResponse;
 
 // The single place that maps the engine's domain error taxonomy to the proto wire codes.
 static flashqwen::ErrorCode to_proto(EngineErrc e) {
@@ -25,6 +32,16 @@ static flashqwen::ErrorCode to_proto(EngineErrc e) {
         case EngineErrc::Internal:     return flashqwen::ERROR_CODE_INTERNAL;
     }
     return flashqwen::ERROR_CODE_UNSPECIFIED;
+}
+
+// Maps the startup lifecycle to the proto state enum.
+static flashqwen::EngineState to_proto(LoadState s) {
+    switch (s) {
+        case LoadState::Loading: return flashqwen::ENGINE_STATE_LOADING;
+        case LoadState::Ready:   return flashqwen::ENGINE_STATE_READY;
+        case LoadState::Failed:  return flashqwen::ENGINE_STATE_FAILED;
+    }
+    return flashqwen::ENGINE_STATE_UNSPECIFIED;
 }
 
 // ---- per-request server-side state ------------------------------------------------------
@@ -138,12 +155,32 @@ struct EngineLoop {
 };
 
 // ---- gRPC service -----------------------------------------------------------------------
+// GetStatus answers from the moment the port binds (driven by the loader thread through
+// StartupStatus). GetModel/Generate are gated on readiness: until the loader calls set_ready they
+// return UNAVAILABLE, so a client that connects mid-load gets a clear, retryable signal.
 class ServiceImpl final : public Engine::Service {
 public:
-    ServiceImpl(EngineLoop& eng, std::string model_id, int max_ctx, int vocab)
-        : eng_(eng), model_id_(std::move(model_id)), max_ctx_(max_ctx), vocab_(vocab) {}
+    explicit ServiceImpl(StartupStatus& status) : status_(status) {}
+
+    // Published once by the loader thread when the model is resident and the engine loop is running.
+    void set_ready(EngineLoop* eng, std::string model_id, int max_ctx, int vocab) {
+        std::lock_guard<std::mutex> lk(rmu_);
+        eng_ = eng; model_id_ = std::move(model_id); max_ctx_ = max_ctx; vocab_ = vocab;
+    }
+
+    grpc::Status GetStatus(grpc::ServerContext*, const StatusRequest*, StatusResponse* out) override {
+        StartupStatus::Snapshot s = status_.snapshot();
+        out->set_state(to_proto(s.state));
+        out->set_phase(s.phase);
+        out->set_done(s.done);
+        out->set_total(s.total);
+        out->set_message(s.message);
+        return grpc::Status::OK;
+    }
 
     grpc::Status GetModel(grpc::ServerContext*, const ModelRequest*, ModelInfo* out) override {
+        std::lock_guard<std::mutex> lk(rmu_);
+        if (!eng_) return grpc::Status(grpc::StatusCode::UNAVAILABLE, "engine is still loading the model");
         out->set_id(model_id_);
         out->set_max_ctx(max_ctx_);
         out->set_vocab_size(vocab_);
@@ -152,27 +189,31 @@ public:
 
     grpc::Status Generate(grpc::ServerContext* ctx, const GenerateRequest* req,
                           grpc::ServerWriter<GenerateEvent>* writer) override {
+        EngineLoop* eng; int max_ctx;
+        { std::lock_guard<std::mutex> lk(rmu_); eng = eng_; max_ctx = max_ctx_; }
+        if (!eng) return grpc::Status(grpc::StatusCode::UNAVAILABLE, "engine is still loading the model");
+
         auto c = std::make_shared<RequestCtx>();
         c->req.prompt.assign(req->input_ids().begin(), req->input_ids().end());
         c->req.stop_ids.assign(req->stop_token_ids().begin(), req->stop_token_ids().end());
         c->prompt_tokens = (int)c->req.prompt.size();
         int max_new = req->max_tokens() > 0 ? req->max_tokens() : 512;
-        int room = max_ctx_ - c->prompt_tokens; if (room < 1) room = 1;
+        int room = max_ctx - c->prompt_tokens; if (room < 1) room = 1;
         c->req.max_new = std::min(max_new, room);
         c->req.sp = SampleParams{req->temperature(), req->top_p() > 0.f ? req->top_p() : 1.0f};
 
         Request* rp = &c->req;
-        eng_.submit(c);   // hands a shared ref to the engine; we keep `c` for the stream
+        eng->submit(c);   // hands a shared ref to the engine; we keep `c` for the stream
 
         while (true) {
             GenerateEvent ev;
             if (c->queue.pop(ev, 100)) {
-                if (!writer->Write(ev)) { eng_.request_cancel(rp); break; }   // client write failed
+                if (!writer->Write(ev)) { eng->request_cancel(rp); break; }   // client write failed
                 // Done and Error are both terminal; the client decodes Error into a typed failure.
                 if (ev.event_case() == GenerateEvent::kDone ||
                     ev.event_case() == GenerateEvent::kError) break;
             } else {
-                if (ctx->IsCancelled()) { eng_.request_cancel(rp); break; }   // client went away
+                if (ctx->IsCancelled()) { eng->request_cancel(rp); break; }   // client went away
                 if (c->queue.is_closed()) break;                             // cancelled by engine
             }
         }
@@ -180,28 +221,64 @@ public:
     }
 
 private:
-    EngineLoop& eng_;
+    StartupStatus& status_;
+    std::mutex rmu_;                 // guards the fields published by set_ready
+    EngineLoop* eng_ = nullptr;
     std::string model_id_;
-    int max_ctx_, vocab_;
+    int max_ctx_ = 0, vocab_ = 0;
 };
 
-int run_grpc_server(ModelRuntime& model, const KVCache& kv, const std::string& address,
-                    int n_slots, int max_queue, const std::string& model_id, std::mt19937& rng) {
-    if (n_slots > model.max_batch()) n_slots = model.max_batch();
-    if (max_queue <= 0) max_queue = 4 * n_slots;   // default admission depth
-    EngineLoop engine{model, kv, rng, n_slots, max_queue};
-    std::thread engine_thread([&] { engine.run(); });
-    engine_thread.detach();
+// Bind the port first, then load the model on a background thread reporting progress through
+// StartupStatus, so the Go client can poll GetStatus to drive a progress bar + stall watchdog.
+// Catchable load failures become an ENGINE_STATE_FAILED status (the client reads the cause and tears
+// the process down); hard failures (CUDA_CHECK -> exit, bad_alloc that escapes) kill the process and
+// are surfaced by the supervisor's process-death detection instead.
+int run_engine(const Args& a, const std::string& model_id, std::mt19937& rng) {
+    StartupStatus status;
+    ServiceImpl service(status);
 
-    ServiceImpl service(engine, model_id, model.max_ctx(), model.spec().vocab_size);
     grpc::ServerBuilder builder;
-    builder.AddListeningPort(address, grpc::InsecureServerCredentials());
+    builder.AddListeningPort(a.address, grpc::InsecureServerCredentials());
     builder.RegisterService(&service);
     builder.SetMaxReceiveMessageSize(64 * 1024 * 1024);
     std::unique_ptr<grpc::Server> server(builder.BuildAndStart());
-    if (!server) { std::fprintf(stderr, "[engine] failed to bind %s\n", address.c_str()); return 1; }
-    std::fprintf(stderr, "[engine] gRPC listening on %s (%d slots, max_queue %d, model %s)\n",
-                 address.c_str(), n_slots, max_queue, model_id.c_str());
+    if (!server) { std::fprintf(stderr, "[engine] failed to bind %s\n", a.address.c_str()); return 1; }
+    std::fprintf(stderr, "[engine] gRPC listening on %s; loading model %s ...\n",
+                 a.address.c_str(), model_id.c_str());
+
+    std::thread loader([&] {
+        try {
+            ModelSpec spec = ModelSpec::load(a.model_dir);
+            if (!spec.supported()) {
+                status.mark_failed(
+                    "unsupported model at '" + a.model_dir + "': architecture '" +
+                    (spec.arch.empty() ? "unknown" : spec.arch) +
+                    "'. --model must point at a dir with config.json + *.safetensors; the engine "
+                    "supports dense Qwen3 (Qwen3ForCausalLM).");
+                return;
+            }
+            status.set_phase("loading weights", spec.num_layers);
+            ModelRuntime model(spec, a.max_ctx, [&](int done, int total) { status.advance(done, total); });
+
+            status.set_phase("allocating kv pool");
+            KVCache kv(spec, a.max_ctx, a.gpu_mem_fraction);
+            model.attach_kv(kv);
+
+            int n_slots = a.slots;
+            if (n_slots > model.max_batch()) n_slots = model.max_batch();
+            int max_queue = a.max_queue <= 0 ? 4 * n_slots : a.max_queue;
+            EngineLoop engine{model, kv, rng, n_slots, max_queue};
+            service.set_ready(&engine, model_id, model.max_ctx(), spec.vocab_size);
+            status.mark_ready();
+            std::fprintf(stderr, "[engine] ready: %d slots, max_queue %d, model %s\n",
+                         n_slots, max_queue, model_id.c_str());
+            engine.run();   // becomes the engine thread; blocks for the process lifetime
+        } catch (const std::exception& e) {
+            status.mark_failed(std::string("model load failed: ") + e.what());
+        }
+    });
+    loader.detach();
+
     server->Wait();
     return 0;
 }
