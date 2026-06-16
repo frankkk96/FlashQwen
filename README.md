@@ -72,7 +72,7 @@ Each subcommand extracts and launches the embedded engine itself; `--model` is r
 ```bash
 ./flashqwen serve     --model models/qwen3-8b   # start the OpenAI-compatible server (default :8000)
 ./flashqwen chat      --model models/qwen3-8b   # enter an interactive multi-turn chat
-./flashqwen benchmark --model models/qwen3-8b   # run the end-to-end throughput benchmark (1/8/16)
+./flashqwen benchmark --model models/qwen3-8b   # run the end-to-end serving benchmark (latency + throughput)
 ./flashqwen --help
 ```
 
@@ -161,21 +161,47 @@ split-K → INT8, 49.7 → 104 tok/s) and the batching work — lives on the `op
 
 ## Benchmark
 
-The table below is the end-to-end throughput measured by `./flashqwen benchmark`, over the real path
-through gRPC and including tokenisation and sampling.
+`./flashqwen benchmark` is an end-to-end serving benchmark, modelled on vLLM's `vllm bench serve`.
+It fires synthetic OpenAI chat requests at the server over HTTP — the full path through
+tokenisation, ChatML, gRPC, and sampling, i.e. what a real client sees — and reports the standard
+latency and throughput metrics. With no `--base-url` it spawns the embedded engine and an in-process
+server; with `--base-url http://host:port` it benchmarks an already-running `serve`.
+
+It measures, per request: **TTFT** (time to first token), **TPOT** (time per output token,
+`(E2EL − TTFT) / (output_tokens − 1)`), **ITL** (inter-token latency), and **E2EL** (end-to-end
+latency) — each reported as mean / median / configurable percentiles — plus request and token
+throughput. Load is either saturation (`--request-rate inf`, the default) or a Poisson arrival
+process (`--request-rate` + `--burstiness`), capped by `--max-concurrency`. Optional `--goodput`
+SLOs (e.g. `ttft:1000,tpot:50`, in ms) report the rate of requests that met every target, and
+`--output-json` writes the full report for tracking across runs.
 
 **Setup:** NVIDIA RTX 4090 (24 GB), Qwen3-8B with INT8-quantised matmul weights, continuous batching
 + PagedAttention.
-**Config:** default flags — synthetic requests of 128 input / 128 output tokens, 32 requests per
-concurrency level, greedy decoding.
+**Config:** `--num-prompts 64 --input-len 512 --output-len 128 --max-concurrency 16` (saturation,
+greedy), goodput SLOs `ttft:1000,tpot:50`.
 
-| Concurrency | Requests | Wall | Aggregate throughput | Mean TTFT |
-|---:|---:|---:|---:|---:|
-| 1  | 32 | 44.9 s | 91 tok/s  | 99 ms  |
-| 8  | 32 | 18.0 s | 228 tok/s | 286 ms |
-| 16 | 32 | 16.7 s | **245 tok/s** | 647 ms |
+```
+================ FlashQwen Serving Benchmark =================
+Successful requests:                       64
+Benchmark duration (s):                    53.98
+Maximum request concurrency:               16
+Total input tokens:                        34384
+Total generated tokens:                    7382
+Request throughput (req/s):                1.19
+Request goodput (req/s):                   0.02
+Output token throughput (tok/s):           136.76
+Total token throughput (tok/s):            773.76
+-------------------- Time to First Token ---------------------
+Mean TTFT (ms):     1742.29   Median: 787.07   P99: 8082.02
+------------- Time per Output Token (excl. 1st) --------------
+Mean TPOT (ms):       98.74   Median: 106.44   P99:  123.86
+--------------------- End-to-end Latency ---------------------
+Mean E2EL (ms):    13053.17   Median: 14174.81 P99: 20440.08
+==============================================================
+```
 
-Single-stream is about 91 tok/s: decode is memory-bound (every generated token reads the whole
-model), and INT8 weights raise that ceiling to roughly this level. At concurrency 16, continuous
-batching amortises one weight read across the sequences in a batch, lifting aggregate throughput to
-about 245 tok/s (~2.7×); the cost is that time-to-first-token rises under load.
+At 16-way saturation, continuous batching pushes aggregate output to ~137 tok/s (~774 tok/s
+including prompt tokens). Median TTFT is 0.79 s but the P90 climbs to ~4.8 s as requests queue for an
+admission slot — which is what `goodput` captures: throughput counts every token produced, while
+goodput (here near zero, against a 1 s TTFT target) counts only requests served within the latency
+SLO. The two diverging is the signal that the system is past its latency-bounded capacity.

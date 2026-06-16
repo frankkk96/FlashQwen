@@ -9,11 +9,12 @@ import (
 	"flashqwen/internal/tokenizer"
 )
 
-// session bundles the embedded engine plus its lifecycle. conn is the low-level token transport
-// (used by benchmark); gen is the text tier on top of it (used by serve / chat).
+// session bundles the embedded engine plus its lifecycle. gen is the text tier (used by serve /
+// chat); tok is the same tokenizer, exposed so the benchmark can synthesise prompts of a target
+// length without loading it a second time.
 type session struct {
-	conn *engine.Client
 	gen  *engine.Generator
+	tok  *tokenizer.Tokenizer
 	info *engine.ModelInfo
 	stop func()
 }
@@ -46,5 +47,5 @@ func open(modelDir string, slots, maxCtx, maxQueue int) (*session, error) {
 		return nil, err
 	}
 	gen := engine.NewGenerator(conn, cm, tok, info.MaxCtx)
-	return &session{conn: conn, gen: gen, info: info, stop: func() { conn.Close(); sup.Stop() }}, nil
+	return &session{gen: gen, tok: tok, info: info, stop: func() { conn.Close(); sup.Stop() }}, nil
 }

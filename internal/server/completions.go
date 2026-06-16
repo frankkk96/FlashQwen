@@ -65,7 +65,8 @@ func (s *Server) chatCompletions(c *gin.Context) {
 		return
 	}
 	if req.Stream {
-		s.streamChat(c, decode(req))
+		includeUsage := req.StreamOptions != nil && req.StreamOptions.IncludeUsage
+		s.streamChat(c, decode(req), includeUsage)
 	} else {
 		s.blockingChat(c, decode(req))
 	}
@@ -107,7 +108,7 @@ func (s *Server) blockingChat(c *gin.Context, req engine.Request) {
 	})
 }
 
-func (s *Server) streamChat(c *gin.Context, req engine.Request) {
+func (s *Server) streamChat(c *gin.Context, req engine.Request, includeUsage bool) {
 	c.Header("Content-Type", "text/event-stream")
 	c.Header("Cache-Control", "no-cache")
 	c.Header("Connection", "keep-alive")
@@ -152,6 +153,15 @@ func (s *Server) streamChat(c *gin.Context, req engine.Request) {
 	}
 	reason := res.FinishReason
 	chunk(&RespMessage{}, &reason)
+	if includeUsage {
+		// Per the OpenAI stream_options contract: a final chunk with an empty choices array and the
+		// token usage. Benchmarks (and metering clients) rely on this for an exact output-token count.
+		usage := ChatCompletion{ID: id, Object: "chat.completion.chunk", Created: created, Model: s.model,
+			Choices: []Choice{}, Usage: &Usage{PromptTokens: res.PromptTokens, CompletionTokens: res.CompletionTokens,
+				TotalTokens: res.PromptTokens + res.CompletionTokens}}
+		b, _ := json.Marshal(usage)
+		fmt.Fprintf(c.Writer, "data: %s\n\n", b)
+	}
 	fmt.Fprint(c.Writer, "data: [DONE]\n\n")
 	flusher.Flush()
 }
