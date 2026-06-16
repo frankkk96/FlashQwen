@@ -1,0 +1,44 @@
+syntax = "proto3";
+
+package flashqwen;
+
+option go_package = "flashqwen/internal/enginepb";
+
+// The token-level inference engine. The Go app owns all model-text concerns (chat template,
+// tokenisation, special tokens, tool-call detection); the C++ engine is a pure executor —
+// token ids in, sampled token ids out. It stops when it samples one of stop_token_ids or hits
+// max_tokens, and is otherwise unaware of token semantics.
+service Engine {
+  // One prompt (token ids) -> a stream of generated token ids, then a final Done.
+  rpc Generate(GenerateRequest) returns (stream GenerateEvent);
+  // Engine metadata (authoritative max_ctx after rounding/KV limits, vocab) for clamping + /v1/models.
+  rpc GetModel(ModelRequest) returns (ModelInfo);
+}
+
+message GenerateRequest {
+  repeated int32 input_ids = 1;        // prompt token ids
+  int32 max_tokens = 2;                // cap on generated tokens
+  float temperature = 3;               // <=0 => greedy
+  float top_p = 4;                     // nucleus cutoff (1.0 => off)
+  repeated int32 stop_token_ids = 5;   // stop as soon as one of these is sampled
+}
+
+message Done {
+  string finish_reason = 1;     // "stop" (hit a stop id) | "length" (max_tokens / context full)
+  int32  prompt_tokens = 2;
+  int32  completion_tokens = 3;
+}
+
+message GenerateEvent {
+  oneof event {
+    int32 token_id = 1;     // one generated token id
+    Done  done     = 2;     // terminal event (always last)
+  }
+}
+
+message ModelRequest {}
+message ModelInfo {
+  string id = 1;
+  int32  max_ctx = 2;
+  int32  vocab_size = 3;
+}

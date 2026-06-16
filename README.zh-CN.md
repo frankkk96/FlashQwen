@@ -1,233 +1,158 @@
 # FlashQwen
 
-从零实现、**零外部依赖的 Qwen3-8B C++/CUDA 推理引擎**(没有 PyTorch、没有 cuBLAS、没有
-tokenizers),主要面向学习。支持多轮流式对话,以及 benchmark 模式(TTFT / TPOT / tok/s)。
+从零实现的 **Qwen3-8B 推理栈**(C++/CUDA + Go)。
+
+> **FlashQwen 刻意保持精简,以模型适配的广度换取代码的干净。** 我们相信:在 AI 编程的时代,
+> 为 AI 提供干净的上下文与高效的反馈循环,比堆砌复杂的依赖、抽象、适配层与妥协更有价值。
+> 因此这里没有通用框架、没有重型依赖,只有一条窄而完整、读得懂也跑得动的推理路径。
 
 English: [README.md](README.md)
+
+该项目分为两层,二者通过 gRPC 通信:
+
+- **外层是 Go 应用**(根模块,编译产物 `./flashqwen`),负责一切与文本相关的工作:分词、渲染
+  Qwen3 ChatML 模板、在 token 流中识别工具调用,并对外提供 OpenAI 兼容 HTTP API 和交互式 CLI。
+  它通过 `//go:embed` 把编译好的 C++ 引擎打包进自身,运行时释放到临时目录、作为子进程拉起,所以
+  使用者只需启动这一个二进制,无需单独管理引擎进程。
+- **内层是 C++/CUDA token 引擎**(`engine/`),负责 GPU 上的全部计算:加载权重、prefill、decode、
+  采样。它只接收 token id、返回采样出的 token id,不做分词、不认识任何文本格式。它的模型栈不依赖
+  任何机器学习库(没有 PyTorch、cuBLAS、HuggingFace tokenizers),INT8 权重量化、连续批处理、
+  PagedAttention 都是自己实现的。
 
 ---
 
 ## 用法
 
-### 获取模型
+### 1. 获取模型
 
-用 `git clone` 把模型仓库拉到一个目录,然后把 `--model` 指向它:
-
-```bash
-git lfs install
-git clone https://huggingface.co/Qwen/Qwen3-8B models/qwen3-8b
-```
-
-这个目录需要包含 `config.json`、`*.safetensors` 分片、`model.safetensors.index.json`、
-`vocab.json` 和 `merges.txt`。无需离线转换或重打包——FlashQwen 直接读 BF16 文件,并在加载时
-把 matmul 权重在显存里量化成 INT8。
-
-### 编译
+`--model` 既可以是 Hugging Face 的 repo id,也可以是本地目录。最省事的方式是直接传 repo id,首次运行时
+自动下载:
 
 ```bash
-cmake -B build -DCMAKE_BUILD_TYPE=Release
-cmake --build build -j
+./flashqwen chat --model Qwen/Qwen3-8B   # 下载到 Hugging Face 缓存,然后运行
 ```
 
-需要 CUDA toolkit(建议 12.x)和一块 ≥20 GB 显存的 NVIDIA GPU。默认按 `sm_89`(RTX 4090 /
-Ada)编译;其他显卡用 `-DCMAKE_CUDA_ARCHITECTURES=<arch>` 覆盖(如 Hopper 用 `90`)。
+它只下载需要的文件——`config.json`、`generation_config.json`、分词器文件,以及 safetensors 分片——放进
+标准的 Hugging Face 缓存(`~/.cache/huggingface/hub`,或由 `HF_HOME` / `HF_HUB_CACHE` 指定),已存在的
+文件直接复用,中断后可断点续传。用 `HF_ENDPOINT` 走镜像(如 `https://hf-mirror.com`),用 `HF_TOKEN`
+访问 gated/私有 repo,用 `HF_HUB_OFFLINE=1` 只从缓存解析、不走网络。用
+`--model Qwen/Qwen3-8B@<分支或 commit>` 锁定某个版本。
 
-### 运行
-
-`--model` 是**必填项**,指向模型目录(比如上面建好的 `models/qwen3-8b`;直接传 HF hub
-缓存目录也可以)。`--help` 会列出支持的模型,并扫描本地 hub 缓存看有哪些可用。
+若模型已经在本地,直接传它的目录:
 
 ```bash
-# 交互式多轮对话(默认模式),KV cache 跨轮保留
-./build/flashqwen --model models/qwen3-8b
-
-# 用 Qwen 推荐的采样参数对话
-./build/flashqwen --model models/qwen3-8b --temperature 0.6 --top-p 0.95 --top-k 20
-
-# benchmark(内置的固定输入长度扫描)
-./build/flashqwen benchmark --model models/qwen3-8b
-
-./build/flashqwen --help
+./flashqwen chat --model models/qwen3-8b
 ```
 
-**模式:** 不带子命令(或写 `chat`)→ 交互对话;`benchmark` → 跑指标。
+无论哪种方式,该目录都需包含 `config.json`、`*.safetensors` 分片、`model.safetensors.index.json`、
+`tokenizer.json`、`vocab.json`、`merges.txt`、`generation_config.json`。引擎直接读这些 BF16 文件、在加载时
+把 matmul 权重量化成 INT8,Go 侧从 `tokenizer.json`/`vocab.json`/`merges.txt` 加载分词器,因此无需任何
+离线转换或重打包。
 
-**对话内命令:** `/exit`  `/quit`  `/reset`(清空上下文)  `/think on|off`。
+### 2. 编译
 
-**常用参数:** `--max-ctx N`(KV cache 大小,默认 4096)、`--temperature`、`--top-p`、
-`--top-k`、`--seed`、`--think`(开启 Qwen3 思考模式)。
+```bash
+make            # 编译 C++ 引擎 → 嵌入 → go build,产出 ./flashqwen
+```
 
-**支持的模型:** 任意 dense 的 Qwen3 模型(架构为 `Qwen3ForCausalLM`):Qwen3-0.6B / 1.7B /
-4B / 8B / 14B / 32B,各维度从 `config.json` 读取。**不支持:** Qwen3.5(混合线性注意力 +
-多模态)、Qwen3 MoE 变体,以及非 Qwen 架构。
+`make` 按固定顺序执行三步:cmake 编译 C++ 引擎、把引擎二进制拷进 `internal/supervisor/bin/`(供
+`//go:embed` 打包)、`go build` 产出最终二进制。编译需要 CUDA toolkit(建议 12.x)、Go 1.26+、
+gRPC/protobuf,以及一块显存 ≥20 GB 的 NVIDIA GPU。默认按 `sm_89`(RTX 4090 / Ada 架构)编译,其他
+显卡需在 `make engine` 前设置 `-DCMAKE_CUDA_ARCHITECTURES=<arch>`。最终二进制虽是单文件,运行时仍
+需目标机器装有 CUDA 与 libgrpc++ 共享库(`//go:embed` 进去的是可执行文件,不含其 `.so` 依赖)。
 
-> 首次启动会从磁盘加载 ~16 GB 权重(网络盘上较慢);之后命中操作系统页缓存,几秒就能启动。
+### 3. 运行
+
+三个子命令各自会释放并拉起内嵌的引擎,`--model` 为必填项:
+
+```bash
+./flashqwen serve     --model models/qwen3-8b   # 启动 OpenAI 兼容服务(默认监听 :8000)
+./flashqwen chat      --model models/qwen3-8b   # 进入交互式多轮对话
+./flashqwen benchmark --model models/qwen3-8b   # 跑端到端吞吐基准(并发 1/8/16)
+./flashqwen --help
+```
+
+- **对话内命令:** `/exit` 与 `/quit` 退出,`/reset` 清空上下文,`/think on|off` 开关思考模式。
+- **常用参数:** `--max-ctx N` 设 KV cache 容量(决定最大上下文),`--slots N` 设最大并发序列数,
+  `--addr` 设 serve 的 HTTP 监听地址;temperature、top_p 等采样参数按每条 OpenAI 请求传入。
+- **OpenAI 端点:** `POST /v1/chat/completions`(支持流式、非流式与 tools)、`GET /v1/models`、
+  `GET /healthz`。
+- **支持的模型:** 任意 dense 的 Qwen3(`config.json` 中架构为 `Qwen3ForCausalLM`,各维度从该文件读取)。
+  不支持 Qwen3 MoE、多模态模型,以及非 Qwen 架构。
 
 ---
 
-## 本地 Benchmark
+## 技术路线
 
-**硬件:** NVIDIA GeForce RTX 4090(24 GB)· 驱动 580.76.05(CUDA 13.0)· 用 CUDA 12.8 编译(原生 sm_89)
-**模型:** Qwen3-8B —— matmul 权重量化为 INT8(每行一个 scale),BF16 embedding,FP32 激活;
-prefill 走 tensor core(WMMA),decode attention 用 flash-decoding split-K,单 token decode
-由 CUDA graph 重放。
-**方法:** 单流(batch=1)、贪心、固定 128 token 输出(忽略 EOS)、1 次 warmup + 3 次测量取
-中位数。扫描逻辑内置 —— 直接 `flashqwen benchmark --model <DIR>` 即可。
+### Go 与 C++ 的桥接
 
-按输入长度扫描(合成 prompt),输出固定 128 token:
+编译好的 C++ 引擎二进制通过 `//go:embed` 打包进 Go 二进制。启动时 Go 侧的 supervisor 把它写到临时
+目录,选一个空闲的本地端口,作为子进程拉起,轮询 `GetModel` 直到引擎应答,退出时给它发 `SIGTERM`——
+所以只有一个二进制要跑,没有引擎进程需要手动管理。
 
-| 输入 tok | TTFT | TPOT | decode tok/s | output tok/s | peak tok/s |
-|---:|---:|---:|---:|---:|---:|
-| 16   | 69 ms  | 9.6 ms  | 104.2 | 98.7 | 105.1 |
-| 128  | 97 ms  | 9.7 ms  | 102.6 | 95.3 | 103.5 |
-| 512  | 0.40 s | 10.2 ms |  97.8 | 74.8 |  98.5 |
-| 1024 | 0.95 s | 10.9 ms |  91.9 | 54.6 |  92.6 |
+两层通过 gRPC 通信,接口由 `proto/engine.proto` 定义。线上只传 token id:Go 把 prompt 分词后发送
+`GenerateRequest{input_ids, max_tokens, temperature, top_p, stop_token_ids}`;`Generate` 是
+server-streaming,引擎先流式返回一串 `token_id` 事件,最后给一个
+`Done{finish_reason, prompt_tokens, completion_tokens}`。`GetModel` 回报引擎权威的上下文窗口与词表
+大小。客户端断开会取消该 RPC,引擎据此中止对应序列并释放它的 KV。
 
-**指标定义:**
-- **TTFT** — time to first token = 整个 prompt 的 prefill + 采样第 1 个 token。
-- **TPOT** — time per output token,decode 阶段(第 1 个之后)每 token 的平均延迟。
-- **decode 吞吐** — 仅 decode 阶段的 tok/s。
-- **output 吞吐** — 含 prefill 的 tok/s(`n_out / total_time`)。
-- **peak output 吞吐** — `1 / 最快单 token 延迟`。
+### 权重加载与 INT8 量化
 
-**怎么看这些数字。** decode 是访存瓶颈——每个 token 都要读完整个模型——所以 INT8 权重
-(~9 GB,bf16 是 ~16 GB)把它推到 **~100 tok/s**,而 flash-decoding split-K 让它几乎不随上下文
-变化(TPOT 从 16 token 的 9.6 ms 到 1024 token 的 10.9 ms)。prefill 走 tensor core(WMMA);
-INT8 权重要先反量化成 BF16,所以 TTFT 比纯 BF16 版略高。这些是下面「优化历程」**之后**的数字——
-历程从 49.7 tok/s 的标量 baseline 开始,逐步展示每一处提升的来源。
+引擎 mmap `.safetensors` 分片、用 RapidJSON 解析文件头,以 BF16 读入权重。加载时把每个 matmul 权重
+(注意力的 q/k/v/o 投影、MLP 的 gate/up/down,以及 `lm_head`)量化成 INT8,**每个输出行一个 scale**
+(对称,夹到 [-127, 127]);embedding 与 norm 保持 BF16。这把权重显存大致减半(~16 GB → ~9 GB)。
+prefill 会把 INT8 权重反量化回 BF16 喂给 tensor core,decode 则直接读 INT8 字节——decode 是访存瓶颈,
+这一点才是关键。
+
+### 前向:prefill 与 decode
+
+一次前向分两条路径。**prefill**(一次过很多 prompt token)是计算瓶颈,matmul 用 WMMA 走 tensor
+core。**decode**(每步一个 token)是访存瓶颈,用向量化的 INT8 GEMV;固定的单 token kernel 序列只捕获
+一次成 CUDA graph、每步重放(token id、位置、`past_len` 都放在设备 buffer 里,所以上下文增长时 graph
+依然有效)。贪心解码在 GPU 上做 argmax、只回传一个 int;temperature / top-p 采样则把 logits 拷回主机。
+
+### 注意力:flash-decoding split-K
+
+prefill 的 attention 是一个 warp 负责一个 (head, query),online softmax 全在寄存器里完成,没有块内
+barrier。decode 在 batch 1 时这种划分只有 ~32 个并行单元(每 head 一个),所以把每个 head 的 key 区间
+切成 `ATTN_SPLITS`(16)块,交给不同 block 各算一个 partial online-softmax,再 combine 归并——并行度
+约 16×,于是 decode 延迟几乎不随上下文增长。
+
+### Paged KV cache(PagedAttention)
+
+每层的 KV 是一个 `[num_blocks, BLOCK=16, kv_dim]` 的 BF16 池,大小由权重和激活之后剩余的显存决定。
+每个序列持有一张**块表**(物理块 id 列表),逻辑位置 `p` 映射到物理行
+`block_table[p/BLOCK]*BLOCK + p%BLOCK`(寻址公式共享在 `kv_cache.cuh`)。块按需分配,所以显存随**实际**
+序列长度增长,并发序列数与 `max_ctx` 解耦:在 24 GB 的 4090 上,同样的显存变成一个共享的 ~8.7 万 token
+池,而不是每序列预留固定一段。三个 KV kernel 都经块表寻址:`store_kv_paged`(prefill 与 decode 共用)、
+`attention_paged`(prefill)、以及 split-K 的 `attention_decode_paged`。
+
+### 连续批处理与抢占
+
+调度器(`engine/src/scheduler.*`)让所有 `n_slots` 一直满载:一有槽位空出就接纳一个等待中的请求,每次
+迭代把整个运行集合一起 decode。prefill 按固定大小分块(`PREFILL_CHUNK` = 每次迭代 256 token)、与 decode
+交错进行,所以长 prompt 不会卡住正在运行的序列。块池耗尽时,抢占最年轻的运行序列——释放其块并重新
+排队——待恢复时从 prompt + output **重算** KV(vLLM 的策略),从而在显存压力下保持正确而非死锁。每个请求
+带自己的采样参数:全 greedy 的批走 GPU argmax,只要有一个请求要采样,整批就回退到主机侧逐行采样。
+
+这些背后的分阶段历程——单流优化(标量 matmul → WMMA → split-K → INT8,49.7 → 104 tok/s)与批处理实现
+——保存在 `optimization-study` 与 `feature/batching` 两个分支。
 
 ---
 
-## 依赖的库 & 代码结构
+## Benchmark
 
-### 依赖——没有任何第三方库
+下表是 `./flashqwen benchmark` 测得的端到端吞吐,走的是经 gRPC 的真实路径,包含分词与采样。
 
-只用了 **C++ 标准库**、**CUDA Runtime**(toolkit 自带,不算第三方库)和 **POSIX** 系统调用。
-`CMakeLists.txt` 里没有任何 `target_link_libraries`。
+**环境:** NVIDIA RTX 4090(24 GB),Qwen3-8B,matmul 权重 INT8 量化,连续批处理 + PagedAttention。
+**配置:** 默认参数 —— 合成请求,每条 128 token 输入、128 token 输出,每个并发档位 32 条请求,贪心解码。
 
-由于没有任何依赖需要编译,一次干净编译(`-j8`)约 **9 秒**,产物二进制约 **1.8 MB**
-(strip 后 1.6 MB)。模型权重是运行时从磁盘加载的,不打进二进制里。
+| 并发 | 请求数 | 墙钟 | 聚合吞吐 | 平均 TTFT |
+|---:|---:|---:|---:|---:|
+| 1  | 32 | 44.9 s | 91 tok/s  | 99 ms  |
+| 8  | 32 | 18.0 s | 228 tok/s | 286 ms |
+| 16 | 32 | 16.7 s | **245 tok/s** | 647 ms |
 
-| 通常要用的库 | 这里的做法 |
-|---|---|
-| nlohmann/json、rapidjson | 手写 `src/json.hpp` |
-| HF tokenizers / sentencepiece | 手写 byte-level BPE `src/tokenizer.*` |
-| safetensors C++ 库 | 手写 `src/safetensors.*`(mmap + 解析头) |
-| cuBLAS / CUTLASS | 手写 matmul(prefill 用 tensor core WMMA,decode 用 GEMV) |
-| PyTorch(任意深度学习框架) | 完全没用 |
-
-- C++ 标准库:`<vector> <string> <unordered_map> <chrono> <random> <cmath> <fstream>` 等
-- CUDA:`<cuda_runtime.h>`、`<cuda_bf16.h>` —— **没有** cuBLAS / cuDNN / cuRAND / Thrust
-- POSIX:`<sys/mman.h>`(mmap)、`<fcntl.h>`、`<unistd.h>`
-
-### 代码结构与行数
-
-每个文件只做一件事;`main.cpp` 是个很薄的入口,只负责解析参数和分发。总共约 1940 行。
-
-**应用层**
-
-| 文件 | 作用 | 行数 |
-|---|---|---:|
-| `src/main.cpp` | 入口:参数解析 + 分发 | 69 |
-| `src/cli.cpp` / `.hpp` | 架构检查 + `--help` | 63 |
-| `src/chat.cpp` / `.hpp` | 交互式多轮对话 | 55 |
-| `src/benchmark.cpp` / `.hpp` | benchmark 模式(扫描输入长度) | 92 |
-| `src/generate.cpp` / `.hpp` | 共用的 prefill + decode 循环 | 66 |
-| `src/sampler.cpp` / `.hpp` | 采样(greedy / temp / top-k / top-p) | 50 |
-
-**核心引擎**
-
-| 文件 | 作用 | 行数 |
-|---|---|---:|
-| `src/model.cu` / `.hpp` | 权重加载(INT8 量化)+ 前向 + KV cache + CUDA graph | 331 |
-| `src/kernels.cu` / `.cuh` | CUDA kernel(INT8 GEMV / WMMA matmul、attention、split-K…) | 431 |
-| `src/tokenizer.cpp` / `.hpp` | byte-level BPE 编码/解码 | 394 |
-| `src/safetensors.cpp` / `.hpp` | mmap + 解析 `.safetensors` 头 | 105 |
-| `src/json.hpp` | 极简 JSON 解析器 | 203 |
-| `src/config.hpp` | 解析 `config.json` | 45 |
-| `CMakeLists.txt` | 构建 | 35 |
-
-值得一提:那些"通常靠库"的胶水代码——分词器(394)+ JSON(203)——约 600 行,占了快一半。
-真正的神经网络部分——CUDA kernel(431)+ 前向(331)——约 760 行,增长主要来自下面的优化阶段
-(INT8、split-K、CUDA graph),而不是 Qwen3 本身——它结构小而规整。
-
-## 优化历程
-
-matmul / decode 路径分阶段优化过。每个阶段都是 **`optimization-study` 分支上的一个 tag
-commit**,可以 checkout 出来重新测。**阶段 0(标量 matmul)是 baseline**,下面所有都跟它对比。
-
-测试环境 RTX 4090(Qwen3-8B,BF16)——单流、batch 1、贪心、输出固定 128 token、扫描输入长度、
-取 3 次中位数:
-
-| 阶段 | 分支 tag | TTFT@128 | TTFT@1024 | TPOT@1024 | decode@16 (tok/s) |
-|---|---|---:|---:|---:|---:|
-| **0 · 标量 matmul(baseline)** | `bench-0-scalar` | 1531 ms | 12585 ms | 40.1 ms | 49.7 |
-| 1 · Tensor Core (WMMA) prefill | `bench-1-wmma` | 89 ms | 1234 ms | 40.1 ms | 49.7 |
-| 2 · BF16 KV cache | `bench-2-bf16kv` | 89 ms | 1233 ms | 40.0 ms | 49.7 |
-| 3 · warp attention(无 barrier) | `bench-3-attn` | 83 ms | 908 ms | 39.4 ms | 49.8 |
-| 4 · 向量化 GEMV decode | `bench-4-gemv` | 83 ms | 907 ms | 38.8 ms | 51.1 |
-| 5 · GPU argmax(greedy) | `bench-5-argmax` | 83 ms | 909 ms | 38.5 ms | 51.7 |
-| 6 · CUDA graph(decode) | `bench-6-cudagraph` | 83 ms | 909 ms | 38.1 ms | 52.9 |
-| 7 · flash-decoding split-K | `bench-7-splitk` | 83 ms | 910 ms | 18.9 ms | 56.9 |
-| 8 · INT8 权重量化 | `bench-8-int8` | 97 ms | 954 ms | 10.9 ms | **104.2** |
-
-相比 baseline:**prefill 快约 13–16×**,**decode 快约 2×**且几乎不随上下文变化——
-decode@16 49.7 → 104.2 tok/s,TPOT@1024 40.1 → 10.9 ms。(INT8 用一点 prefill TTFT 换 decode
-的大提升。)复现任一阶段:
-
-```bash
-git checkout bench-1-wmma     # 或 bench-0-scalar … bench-4-gemv
-cmake -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build -j8
-./build/flashqwen benchmark --model models/qwen3-8b
-```
-
-**阶段 0 — 标量 matmul(baseline),`bench-0-scalar`。** 每个 matmul(prefill 和 decode 都是)
-都用"一个 warp 算一个输出元素"的点积,没有 tensor core。prefill 很惨:1024 token 的 prompt
-要 ~12.6 s 才出第一个 token,因为 prefill 的 GEMM 是计算瓶颈又没用 tensor core。
-
-**阶段 1 — Tensor Core (WMMA) prefill,`bench-1-wmma`。** prefill(多 token)把激活转成 BF16,
-用 WMMA(16×16×16、FP32 累加)在 tensor core 上算 matmul;decode(单 token)保留 GEMV。
-**prefill 暴降 ~14×(TTFT@1024 12585 → 1234 ms)。** decode 不动——它是访存瓶颈,tensor core 帮不上。
-
-**阶段 2 — BF16 KV cache,`bench-2-bf16kv`。** KV cache 从 FP32 改存 BF16。这一步速度没变——
-因为此时 attention kernel 是延迟瓶颈(每个 key 串行 `__syncthreads` 归约),不是带宽瓶颈——
-但 cache 减半(4096 ctx 下 ~1.2 GB → ~0.6 GB),即最大上下文 ~2×。字节减半的收益要到阶段 3 才兑现。
-
-**阶段 3 — warp attention,`bench-3-attn`。** attention 从"一个 block 管一个 (head,query)、每个
-key 做块内归约"改成 **一个 warp 管一个 (head,query)**:每个 lane 负责 4 个维度,每个 key 的 q·k
-用 warp shuffle 归约,online softmax 全在寄存器里——没有 barrier。**prefill attention 降 ~26%
-(TTFT@1024 1233 → 908 ms)。** decode TPOT 基本持平:batch 1 时只有 32 个并行单元(每 head 一个),
-所以 decode attention 是并行度瓶颈,不是单 key 成本瓶颈(真要快得上 flash-decoding split-K)。
-
-**阶段 4 — 向量化 GEMV decode,`bench-4-gemv`。** decode 的 GEMV 改成每步用 16 字节向量化加载
-读 8 个元素,而不是一次一个标量 BF16。提升不大(decode@16 49.8 → 51.1 tok/s)——标量版本已经到
-~80% 显存带宽了。
-
-**阶段 5 — GPU argmax(greedy),`bench-5-argmax`。** 贪心解码不再每个 token 把 151936 维 logits
-全拷回主机再扫,而是在 GPU 上做 argmax 归约、只回传一个 int。省 ~0.2–0.3 ms/token
-(decode@16 51.1 → 51.7 tok/s)。temperature 采样仍走完整 logits 拷贝。
-
-**阶段 6 — CUDA graph(decode),`bench-6-cudagraph`。** 一个 decode step 要 launch ~430 个小
-kernel(36 层 × ~12 个);有些 kernel 太短,launch 开销盖不住、暴露出来了。把固定的单 token
-序列捕获成一个 CUDA graph、每步重放(token id / 位置 / `past_len` 都放在 kernel 读取的设备
-buffer 里,所以上下文增长时 graph 依然有效)。稳定省 ~0.4–0.5 ms/token(decode@16 51.7 → 52.9
-tok/s,peak 55.2 → 56.5)。prefill(长度可变)仍然 eager 执行。
-
-**阶段 7 — flash-decoding split-K,`bench-7-splitk`。** M=1 时 warp attention(阶段 3)只有 32 个
-并行单元(每 head 一个),所以 decode attention 受并行度限制、TPOT 随上下文增长(18.9 ms@16 →
-38.1 ms@1024)。现在把每个 head 的 key 区间切成 `ATTN_SPLITS`(16)块,交给不同 block 各算一个
-partial online-softmax,再用一个 combine pass 归并,等于对 KV cache 多了 16× 的并行度。
-**TPOT@1024 从 38.1 暴降到 18.9 ms(decode 26.3 → 53.0 tok/s,约 2×)**,而且 decode 现在几乎
-不随上下文变化(各长度都 ~18–19 ms),也就是又回到被权重读取(GEMV)主导,而不是 attention。
-prefill 仍用阶段 3 的 kernel(并行度本来就够)。
-
-**阶段 8 — INT8 权重量化,`bench-8-int8`。** decode 之前卡在 bf16 带宽天花板(每 token 读完整
-~16 GB 权重 → ~60 tok/s 上限)。把 matmul 权重(注意力 + MLP 投影 + lm_head)量化成
-**INT8 + 每输出行一个 scale**(对称,load 时计算);embedding/norm 保持原样。decode 读 1 字节
-权重、kernel 内反量化 → **decode@16 56.9 → 104.2 tok/s(~1.8×),TPOT@1024 18.9 → 10.9 ms**,
-权重显存大致减半(~16 → ~9 GB)。prefill 会先把权重反量化成 BF16 再走 WMMA,因此 TTFT 略升
-(如 @128 83 → 97 ms)——这是划算的:prefill 只跑一次,decode 每个 token 都跑。输出依然连贯
-(8B 模型上 per-channel INT8 影响很小)。
-
-**仍待优化:** INT4 / 分组量化拿更多 decode 余量、激活也量化用 INT8 tensor core 加速 prefill、
-以及给 prefill WMMA 加 shared-memory tiling。
+单流约 91 tok/s:decode 阶段是访存瓶颈(每生成一个 token 都要把整个模型读一遍),INT8 权重把上限推到
+这个量级。并发提到 16 时,连续批处理把一次权重读取摊薄到同批的多个序列上,聚合吞吐升到约 245 tok/s
+(约 2.7×);代价是首 token 延迟(TTFT)随并发升高。

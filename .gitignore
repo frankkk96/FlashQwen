@@ -11,3 +11,8 @@ models/
 compile_commands.json
 .vscode/
 .cache/
+
+# Go build artifacts
+/flashqwen
+# Embedded engine binary (produced by `make`, copied here for //go:embed)
+internal/supervisor/bin/flashqwen-engine
