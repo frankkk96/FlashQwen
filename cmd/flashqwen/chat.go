@@ -63,7 +63,7 @@ func runChat(args []string) {
 		history = append(history, chatml.Message{Role: "user", Content: line})
 		fmt.Print("\033[1mAssistant:\033[0m ")
 		res, err := s.eng.Generate(context.Background(), engine.Request{
-			Messages: history, EnableThinking: thinking, MaxTokens: 1024,
+			Messages: history, EnableThinking: thinking, // MaxTokens 0: fill the remaining context
 		}, func(text string, _ *chatml.ToolCall) {
 			fmt.Print(text)
 		})

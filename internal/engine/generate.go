@@ -8,8 +8,6 @@ import (
 	pb "flashqwen/internal/enginepb"
 )
 
-const defaultMaxTokens = 512
-
 // Generate runs one text completion — the high-level API for callers above this package. It renders
 // the ChatML prompt, tokenises, drives the engine, and decodes the id stream into text + tool calls.
 // onDelta (may be nil) is invoked for each visible text delta and completed tool call as they
@@ -50,29 +48,39 @@ func (c *Client) Generate(ctx context.Context, req Request,
 	return res, nil
 }
 
-// buildRequest renders the ChatML prompt, tokenises, clamps max_tokens to the context window, and
-// attaches the stop ids — turning a neutral Request into the engine's token-level request. It
-// errors if the prompt alone fills the context window.
+// resolveMaxTokens is the single place that decides how many tokens a request may generate, given
+// the prompt length. It is the only length policy in the codebase — callers never cap themselves:
+//   - the prompt already fills the context window  -> error
+//   - requested <= 0 (omitted)                      -> fill the remaining window (until eos or full)
+//   - requested > the remaining window              -> clamp to the remaining window
+//
+// maxCtx is the engine's authoritative context window, recorded via SetMaxCtx after GetModel.
+func (c *Client) resolveMaxTokens(promptLen, requested int) (int, error) {
+	room := c.maxCtx - promptLen
+	if room < 1 {
+		return 0, fmt.Errorf("prompt is %d tokens, exceeds context window %d", promptLen, c.maxCtx)
+	}
+	if requested <= 0 || requested > room {
+		return room, nil
+	}
+	return requested, nil
+}
+
+// buildRequest renders the ChatML prompt, tokenises, resolves the output budget, and attaches the
+// stop ids — turning a neutral Request into the engine's token-level request.
 func (c *Client) buildRequest(req Request) (*pb.GenerateRequest, error) {
 	prompt := c.cm.Render(req.Messages, req.Tools, req.EnableThinking)
 	ids, err := c.tok.Encode(prompt)
 	if err != nil {
 		return nil, err
 	}
-	if c.maxCtx > 0 && len(ids) >= c.maxCtx {
-		return nil, fmt.Errorf("prompt is %d tokens, exceeds context window %d", len(ids), c.maxCtx)
+	maxTokens, err := c.resolveMaxTokens(len(ids), req.MaxTokens)
+	if err != nil {
+		return nil, err
 	}
 	in := make([]int32, len(ids))
 	for i, id := range ids {
 		in[i] = int32(id)
-	}
-
-	maxTokens := req.MaxTokens
-	if maxTokens <= 0 {
-		maxTokens = defaultMaxTokens
-	}
-	if room := c.maxCtx - len(ids); room > 0 && maxTokens > room {
-		maxTokens = room
 	}
 
 	g := &pb.GenerateRequest{

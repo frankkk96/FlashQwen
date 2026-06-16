@@ -9,7 +9,7 @@ type Request struct {
 	Messages       []chatml.Message
 	Tools          []chatml.ToolDef
 	EnableThinking bool
-	MaxTokens      int      // 0 => default
+	MaxTokens      int      // 0 => fill the remaining context window
 	Temperature    *float64 // nil => engine default (greedy)
 	TopP           *float64 // nil => off (1.0)
 }
