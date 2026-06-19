@@ -13,8 +13,39 @@ type ChatRequest struct {
 	MaxTokens     int            `json:"max_tokens"`
 	Temperature   *float64       `json:"temperature"`
 	TopP          *float64       `json:"top_p"`
+	// vLLM extension: generate exactly max_tokens, ignoring EOS / stop tokens (benchmarking).
+	IgnoreEOS bool `json:"ignore_eos"`
 	// FlashQwen extension: Qwen3 thinking mode (default off).
 	EnableThinking *bool `json:"enable_thinking"`
+}
+
+// CompletionRequest is the OpenAI /v1/completions wire type — raw text in, raw text out, no chat
+// template. prompt is a string or an array of token ids (arrays of prompts are not supported).
+// ignore_eos is a vLLM extension used by benchmarks to force exactly max_tokens of output.
+type CompletionRequest struct {
+	Model         string          `json:"model"`
+	Prompt        json.RawMessage `json:"prompt"`
+	MaxTokens     int             `json:"max_tokens"`
+	Temperature   *float64        `json:"temperature"`
+	TopP          *float64        `json:"top_p"`
+	Stream        bool            `json:"stream"`
+	StreamOptions *StreamOptions  `json:"stream_options"`
+	IgnoreEOS     bool            `json:"ignore_eos"`
+}
+
+type CompletionChoice struct {
+	Index        int     `json:"index"`
+	Text         string  `json:"text"`
+	FinishReason *string `json:"finish_reason"`
+}
+
+type Completion struct {
+	ID      string             `json:"id"`
+	Object  string             `json:"object"` // "text_completion"
+	Created int64              `json:"created"`
+	Model   string             `json:"model"`
+	Choices []CompletionChoice `json:"choices"`
+	Usage   *Usage             `json:"usage,omitempty"`
 }
 
 // StreamOptions mirrors OpenAI's stream_options. When IncludeUsage is set, the stream ends with an

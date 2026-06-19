@@ -12,6 +12,13 @@ type Request struct {
 	MaxTokens      int      // 0 => fill the remaining context window
 	Temperature    *float64 // nil => engine default (greedy)
 	TopP           *float64 // nil => off (1.0)
+	IgnoreEOS      bool     // suppress stop tokens (incl. EOS): generate until MaxTokens (benchmarking)
+
+	// Raw text-completion inputs (used by /v1/completions instead of Messages). InputIDs, if set,
+	// is the pre-tokenised prompt and takes precedence over RawPrompt; RawPrompt is tokenised as-is
+	// (no ChatML template). When both are empty, Messages are rendered through the ChatML template.
+	RawPrompt string
+	InputIDs  []int
 }
 
 // Result is the fully-aggregated text response. Streaming callers also receive the same pieces

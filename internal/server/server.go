@@ -30,6 +30,7 @@ func (s *Server) Run(addr string) error {
 	r.GET("/healthz", func(c *gin.Context) { c.String(http.StatusOK, "ok") })
 	r.GET("/v1/models", s.listModels)
 	r.POST("/v1/chat/completions", s.chatCompletions)
+	r.POST("/v1/completions", s.completions)
 	return r.Run(addr)
 }
 

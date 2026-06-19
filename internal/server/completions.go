@@ -51,7 +51,30 @@ func decode(req ChatRequest) engine.Request {
 		MaxTokens:      req.MaxTokens,
 		Temperature:    req.Temperature,
 		TopP:           req.TopP,
+		IgnoreEOS:      req.IgnoreEOS,
 	}
+}
+
+// decodeCompletion maps an OpenAI /v1/completions request into the neutral engine.Request. prompt is
+// either a string (tokenised as-is) or an array of token ids.
+func decodeCompletion(req CompletionRequest) (engine.Request, error) {
+	er := engine.Request{
+		MaxTokens:   req.MaxTokens,
+		Temperature: req.Temperature,
+		TopP:        req.TopP,
+		IgnoreEOS:   req.IgnoreEOS,
+	}
+	var s string
+	if json.Unmarshal(req.Prompt, &s) == nil {
+		er.RawPrompt = s
+		return er, nil
+	}
+	var ids []int
+	if json.Unmarshal(req.Prompt, &ids) == nil {
+		er.InputIDs = ids
+		return er, nil
+	}
+	return er, fmt.Errorf("prompt must be a string or an array of token ids")
 }
 
 func (s *Server) chatCompletions(c *gin.Context) {
@@ -161,6 +184,97 @@ func (s *Server) streamChat(c *gin.Context, req engine.Request, includeUsage boo
 				TotalTokens: res.PromptTokens + res.CompletionTokens}}
 		b, _ := json.Marshal(usage)
 		fmt.Fprintf(c.Writer, "data: %s\n\n", b)
+	}
+	fmt.Fprint(c.Writer, "data: [DONE]\n\n")
+	flusher.Flush()
+}
+
+// ---- /v1/completions (raw text completion) ----------------------------------------------
+
+func (s *Server) completions(c *gin.Context) {
+	var req CompletionRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": gin.H{"message": err.Error(), "type": "invalid_request_error"}})
+		return
+	}
+	if len(req.Prompt) == 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": gin.H{"message": "prompt is required", "type": "invalid_request_error"}})
+		return
+	}
+	er, err := decodeCompletion(req)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": gin.H{"message": err.Error(), "type": "invalid_request_error"}})
+		return
+	}
+	if req.Stream {
+		includeUsage := req.StreamOptions != nil && req.StreamOptions.IncludeUsage
+		s.streamCompletion(c, er, includeUsage)
+	} else {
+		s.blockingCompletion(c, er)
+	}
+}
+
+func (s *Server) blockingCompletion(c *gin.Context, req engine.Request) {
+	res, err := s.gen.Complete(c.Request.Context(), req, nil)
+	if err != nil {
+		status, typ := classifyError(err)
+		c.JSON(status, gin.H{"error": gin.H{"message": err.Error(), "type": typ}})
+		return
+	}
+	reason := res.FinishReason
+	c.JSON(http.StatusOK, Completion{
+		ID: s.newID(), Object: "text_completion", Created: time.Now().Unix(), Model: s.model,
+		Choices: []CompletionChoice{{Index: 0, Text: res.Text, FinishReason: &reason}},
+		Usage: &Usage{PromptTokens: res.PromptTokens, CompletionTokens: res.CompletionTokens,
+			TotalTokens: res.PromptTokens + res.CompletionTokens},
+	})
+}
+
+func (s *Server) streamCompletion(c *gin.Context, req engine.Request, includeUsage bool) {
+	c.Header("Content-Type", "text/event-stream")
+	c.Header("Cache-Control", "no-cache")
+	c.Header("Connection", "keep-alive")
+	flusher, ok := c.Writer.(http.Flusher)
+	if !ok {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": gin.H{"message": "streaming unsupported"}})
+		return
+	}
+	id := s.newID()
+	created := time.Now().Unix()
+	send := func(cc Completion) {
+		b, _ := json.Marshal(cc)
+		fmt.Fprintf(c.Writer, "data: %s\n\n", b)
+		flusher.Flush()
+	}
+	textChunk := func(text string, reason *string) {
+		send(Completion{ID: id, Object: "text_completion", Created: created, Model: s.model,
+			Choices: []CompletionChoice{{Index: 0, Text: text, FinishReason: reason}}})
+	}
+
+	res, err := s.gen.Complete(c.Request.Context(), req, func(text string) {
+		if text != "" {
+			textChunk(text, nil)
+		}
+	})
+	if err != nil {
+		// Client disconnected mid-stream: not a server error, just stop (the connection is gone).
+		if c.Request.Context().Err() != nil {
+			return
+		}
+		_, typ := classifyError(err)
+		b, _ := json.Marshal(gin.H{"error": gin.H{"message": err.Error(), "type": typ}})
+		fmt.Fprintf(c.Writer, "data: %s\n\n", b)
+		fmt.Fprint(c.Writer, "data: [DONE]\n\n")
+		flusher.Flush()
+		return
+	}
+	reason := res.FinishReason
+	textChunk("", &reason)
+	if includeUsage {
+		// Final chunk: empty choices + token usage (the exact output-token count benchmarks rely on).
+		send(Completion{ID: id, Object: "text_completion", Created: created, Model: s.model,
+			Choices: []CompletionChoice{}, Usage: &Usage{PromptTokens: res.PromptTokens,
+				CompletionTokens: res.CompletionTokens, TotalTokens: res.PromptTokens + res.CompletionTokens}})
 	}
 	fmt.Fprint(c.Writer, "data: [DONE]\n\n")
 	flusher.Flush()

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"unicode/utf8"
 
 	"flashqwen/internal/chatml"
 	pb "flashqwen/internal/enginepb"
@@ -97,13 +98,25 @@ func (g *Generator) resolveMaxTokens(promptLen, requested int) (int, error) {
 	return requested, nil
 }
 
-// buildRequest renders the ChatML prompt, tokenises, resolves the output budget, and attaches the
-// stop ids — turning a neutral Request into the engine's token-level request.
+// buildRequest resolves the prompt token ids (pre-tokenised InputIDs, a raw prompt, or a rendered
+// ChatML template — in that order), resolves the output budget, and attaches the stop ids — turning
+// a neutral Request into the engine's token-level request. IgnoreEOS drops the stop ids so the
+// engine runs to MaxTokens (used by benchmarks to force a fixed output length).
 func (g *Generator) buildRequest(req Request) (*pb.GenerateRequest, error) {
-	prompt := g.cm.Render(req.Messages, req.Tools, req.EnableThinking)
-	ids, err := g.tok.Encode(prompt)
-	if err != nil {
-		return nil, err
+	var ids []int
+	switch {
+	case len(req.InputIDs) > 0:
+		ids = req.InputIDs
+	case req.RawPrompt != "":
+		var err error
+		if ids, err = g.tok.Encode(req.RawPrompt); err != nil {
+			return nil, err
+		}
+	default:
+		var err error
+		if ids, err = g.tok.Encode(g.cm.Render(req.Messages, req.Tools, req.EnableThinking)); err != nil {
+			return nil, err
+		}
 	}
 	maxTokens, err := g.resolveMaxTokens(len(ids), req.MaxTokens)
 	if err != nil {
@@ -115,10 +128,12 @@ func (g *Generator) buildRequest(req Request) (*pb.GenerateRequest, error) {
 	}
 
 	greq := &pb.GenerateRequest{
-		InputIds:     in,
-		MaxTokens:    int32(maxTokens),
-		TopP:         1.0,
-		StopTokenIds: g.cm.StopTokenIDs(),
+		InputIds:  in,
+		MaxTokens: int32(maxTokens),
+		TopP:      1.0,
+	}
+	if !req.IgnoreEOS {
+		greq.StopTokenIds = g.cm.StopTokenIDs()
 	}
 	if req.Temperature != nil {
 		greq.Temperature = float32(*req.Temperature)
@@ -127,4 +142,65 @@ func (g *Generator) buildRequest(req Request) (*pb.GenerateRequest, error) {
 		greq.TopP = float32(*req.TopP)
 	}
 	return greq, nil
+}
+
+// Complete runs a raw text completion (no ChatML template, no tool-call parsing): it builds the
+// request from RawPrompt/InputIDs, drives the engine, and decodes the id stream straight to text.
+// onDelta (may be nil) receives each visible text delta as it arrives. Used by /v1/completions.
+func (g *Generator) Complete(ctx context.Context, req Request, onDelta func(text string)) (*Result, error) {
+	greq, err := g.buildRequest(req)
+	if err != nil {
+		return nil, err
+	}
+	res := &Result{}
+	var pending []byte // decoded bytes not yet emitted (the tail may be a half-finished rune)
+	stats, err := g.conn.stream(ctx, greq, func(id int32) {
+		pending = append(pending, g.tok.Decode([]int{int(id)})...)
+		if text := takeRunes(&pending); text != "" {
+			res.Text += text
+			if onDelta != nil {
+				onDelta(text)
+			}
+		}
+	})
+	if err != nil {
+		return nil, err
+	}
+	if len(pending) > 0 { // trailing partial rune (e.g. max_tokens landed mid-character)
+		tail := string(pending)
+		res.Text += tail
+		if onDelta != nil {
+			onDelta(tail)
+		}
+	}
+	res.FinishReason = stats.FinishReason
+	res.PromptTokens = stats.PromptTokens
+	res.CompletionTokens = stats.CompletionTokens
+	return res, nil
+}
+
+// takeRunes drains the complete-UTF-8-rune prefix of *buf, retaining any trailing partial multibyte
+// sequence (a rune can straddle two tokens). Mirrors chatml.Stream's decode buffering, for the raw
+// completion path which has no ChatML stream.
+func takeRunes(buf *[]byte) string {
+	b := *buf
+	i := 0
+	for i < len(b) {
+		if b[i] < utf8.RuneSelf {
+			i++
+			continue
+		}
+		if !utf8.FullRune(b[i:]) {
+			break
+		}
+		_, size := utf8.DecodeRune(b[i:])
+		i += size
+	}
+	if i == 0 {
+		return ""
+	}
+	out := string(b[:i])
+	n := copy(b, b[i:])
+	*buf = b[:n]
+	return out
 }
