@@ -245,6 +245,23 @@ FlashQwen's single-stream decode.)
 The tracked 1024/128 metric sits exactly on the KV-capacity cliff — which is why everything here is so
 sensitive. Throughput is governed first by KV-pool capacity vs demand, then by kernels.
 
+### S11 attempt — CUDA graphs for pure-decode steps (TRIED, REVERTED, 2026-06-20)
+Captured the pure-decode forward (run_layers + lm_head + sample) into a CUDA graph per batch size B and
+replayed it (split forward into eager upload_inputs + captureable compute; pinned a cuBLAS workspace and
+fixed the block-table stride so launches stay valid; graceful fallback if capture fails). Capture
+**succeeded** and output stayed coherent — but it was **net negative**: conc=1 flat (45.2 → 45.7), conc=32
+**589 → 520 (−12%)**. Reverted.
+- **Why no conc=1 win**: conc=1 decode is **weight-bandwidth-bound**, not launch-bound — each token reads
+  all 17.3 GB of weights (~17.3 ms floor; our TPOT 22 ms ≈ 78% of HBM). The ~470 launches run async and
+  overlap that 17 ms of GPU work, so eliding them saves ~0 wall-clock. (vLLM's conc=1 17.9 ms ≈ the
+  17.3 ms floor; its edge is leaner *eager* per-step work — H2D + sync — which the graph doesn't cover.)
+- **Why conc=32 regressed**: GPU is already ~97% busy (no launch gaps to hide), and B drains 32→1 over
+  the run so each new batch size pays a one-time eager-warmup + graph-instantiate → net overhead.
+- **Takeaway**: FlashQwen is not launch-bound at any concurrency (saturated at 32, bandwidth-bound at 1),
+  so CUDA graphs — which only remove launch overhead — have nothing to recover here. This closes the
+  search: the remaining gap to vLLM (589→698) is HBM bandwidth + vLLM's leaner per-step eager path, not
+  a kernel/launch problem we can fix without quantization.
+
 #### S9 attempt — attn_prefill head-dim split (TRIED, REVERTED, 2026-06-20)
 After S8, tried 2 warps/block splitting the head dim (warp 0 dims [0,64), warp 1 [64,128); each
 contracts its half for a partial S, warp 0 sums + softmaxes, each does P·V for its output half). Os
