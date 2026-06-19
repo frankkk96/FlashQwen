@@ -213,6 +213,15 @@ FlashQwen's single-stream decode.)
   likely remains (a multi-warp block / KV-split would push occupancy further), but that's a bigger
   rewrite with the usual WMMA-correctness risk; the cheap shared cut banked most of the easy gain.
 
+#### S9 attempt — attn_prefill head-dim split (TRIED, REVERTED, 2026-06-20)
+After S8, tried 2 warps/block splitting the head dim (warp 0 dims [0,64), warp 1 [64,128); each
+contracts its half for a partial S, warp 0 sums + softmaxes, each does P·V for its output half). Os
+stays 8 KB (partitioned, not duplicated) so occupancy rose 9 → ~14 warps/SM. Output coherent, but
+conc=32 528 → 534 (**+1.1%, within noise**). The partial-S combine's extra `__syncthreads` (coupling
+the two warps) roughly cancels the occupancy gain — and S8 already banked the real occupancy win, so
+attn_prefill is no longer occupancy-bound. Reverted (kept the simpler 1-warp S8). Lesson: occupancy
+had one cheap win (S8's shared cut); past that, more warps don't pay here.
+
 #### S5 ablation — which of the three fusions actually paid (2026-06-19)
 Each change isolated on the S3 base (1024/128, temp 0); only the engine differs.
 
