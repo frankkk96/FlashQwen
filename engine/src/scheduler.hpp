@@ -51,6 +51,17 @@ struct StepBatch {
     std::vector<int>      num_new;           // tokens advanced per scheduled request
     std::vector<Request*> sampling;          // scheduled requests that sample (input.logits_rows order)
     void clear() { input.clear(); scheduled.clear(); num_new.clear(); sampling.clear(); }
+
+    // Append request r advancing it by `n` tokens (positions computed..computed+n-1); flags the
+    // frontier row for sampling when the chunk reaches the end of r's committed tokens.
+    void add_request(Request* r, int n) {
+        int ri = input.begin_request(r->block_table);
+        for (int k = 0; k < n; ++k)
+            input.add_row(r->token_at(r->computed + k), r->computed + k, ri);
+        if (r->computed + n == r->num_tokens()) { input.mark_logits_row(); sampling.push_back(r); }
+        scheduled.push_back(r);
+        num_new.push_back(n);
+    }
 };
 
 class Scheduler {
@@ -77,7 +88,6 @@ private:
     void admit();                           // waiting -> running while slots are free
     int  chunk_size(const Request* r, int pass, int budget) const;   // tokens to advance this step
     bool grow_or_preempt(Request* r, int upto_tokens);  // false => r was failed + freed (rebuild)
-    void append_request(StepBatch& b, Request* r, int n);
     void build_batch(StepBatch& b);
     void run_forward(const StepBatch& b, std::vector<int>& sampled);
     void apply_results(const StepBatch& b, const std::vector<int>& sampled);

@@ -18,9 +18,22 @@
 struct ForwardInput {
     std::vector<int> tokens, positions, req_index, logits_rows;
     std::vector<std::vector<int>> block_tables;
+
     void clear() { tokens.clear(); positions.clear(); req_index.clear();
                    logits_rows.clear(); block_tables.clear(); }
     int rows() const { return (int)tokens.size(); }
+    int num_requests() const { return (int)block_tables.size(); }
+
+    // --- append primitives (callers build the batch through these, not the raw vectors) ---
+    // Register a request's block table; returns its row index (use it for that request's rows).
+    int begin_request(std::vector<int> block_table) {
+        block_tables.push_back(std::move(block_table));
+        return (int)block_tables.size() - 1;
+    }
+    void add_row(int token, int position, int req) {   // append one query row of request `req`
+        tokens.push_back(token); positions.push_back(position); req_index.push_back(req);
+    }
+    void mark_logits_row() { logits_rows.push_back((int)tokens.size() - 1); }   // flag last row for sampling
 };
 
 class ModelRuntime {

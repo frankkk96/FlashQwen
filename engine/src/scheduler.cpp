@@ -99,24 +99,6 @@ bool Scheduler::grow_or_preempt(Request* r, int upto) {
     return true;
 }
 
-// Append request r's `n` query rows (positions computed..computed+n-1) to the batch, recording the
-// frontier row for sampling when the chunk reaches the end of the request's committed tokens.
-void Scheduler::append_request(StepBatch& b, Request* r, int n) {
-    int ri = (int)b.input.block_tables.size();
-    for (int k = 0; k < n; ++k) {
-        b.input.tokens.push_back(r->token_at(r->computed + k));
-        b.input.positions.push_back(r->computed + k);
-        b.input.req_index.push_back(ri);
-    }
-    b.input.block_tables.push_back(r->block_table);
-    if (r->computed + n == r->num_tokens()) {            // chunk reaches the frontier -> sample
-        b.input.logits_rows.push_back((int)b.input.tokens.size() - 1);
-        b.sampling.push_back(r);
-    }
-    b.scheduled.push_back(r);
-    b.num_new.push_back(n);
-}
-
 // Build the flattened batch under the token budget: decode requests first (pass 0), then prefill
 // chunks (pass 1). Growing a request may preempt a younger one, which mutates running_, so we rebuild
 // the batch from scratch whenever that happens.
@@ -132,7 +114,7 @@ void Scheduler::build_batch(StepBatch& b) {
                 int n = chunk_size(r, pass, budget);
                 if (n == 0) continue;
                 if (!grow_or_preempt(r, r->computed + n)) { restart = true; break; }
-                append_request(b, r, n);
+                b.add_request(r, n);
                 budget -= n;
             }
     }
