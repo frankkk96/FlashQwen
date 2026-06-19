@@ -3,14 +3,13 @@
 #include <string>
 
 Scheduler::Scheduler(ModelRuntime& model, KVCacheManager& kv, int n_slots, int max_queue,
-                     int max_batch_tokens, int max_prefill, std::mt19937& rng)
-    : model_(model), kv_(kv), rng_(rng) {
+                     int max_batch_tokens, int max_prefill)
+    : model_(model), kv_(kv) {
     n_slots_          = std::min(n_slots, model_.max_batch());
     max_queue_        = max_queue;
     max_batch_tokens_ = max_batch_tokens;
     max_prefill_      = max_prefill;
     max_ctx_ = model_.max_ctx();
-    V_       = model_.spec().vocab_size;
     bsz_     = kv_.block_size();
 }
 
@@ -120,20 +119,6 @@ void Scheduler::build_batch(StepBatch& b) {
     }
 }
 
-// Run the merged forward: GPU argmax for an all-greedy batch, host-side per-row sampling otherwise.
-void Scheduler::run_forward(const StepBatch& b, std::vector<int>& sampled) {
-    bool any_sampling = false;
-    for (Request* r : b.sampling) if (r->sp.temp > 0.0f) any_sampling = true;
-    sampled.resize(b.sampling.size());
-    if (any_sampling) {
-        const float* L = model_.forward_logits_host(b.input);
-        for (size_t i = 0; i < b.sampling.size(); ++i)
-            sampled[i] = sample(L + (size_t)i * V_, V_, b.sampling[i]->sp, rng_);
-    } else {
-        model_.forward(b.input, sampled);
-    }
-}
-
 // Advance every scheduled request's cursor; for the sampling ones append + stream the token, and
 // finish (stream done + free) those that hit a stop id / max_new / a full context.
 void Scheduler::apply_results(const StepBatch& b, const std::vector<int>& sampled) {
@@ -161,7 +146,7 @@ void Scheduler::step() {
     if (running_.empty()) return;
     build_batch(batch_);
     if (batch_.scheduled.empty()) return;
-    run_forward(batch_, sampled_);
+    model_.forward(batch_.input, sampled_);   // merged forward + per-row GPU sampling -> sampled_
     apply_results(batch_, sampled_);
 }
 

@@ -7,6 +7,5 @@
 #pragma once
 #include "args.hpp"
 #include <string>
-#include <random>
 
-int run_engine(const Args& a, const std::string& model_id, std::mt19937& rng);
+int run_engine(const Args& a, const std::string& model_id);

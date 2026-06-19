@@ -333,29 +333,114 @@ void launch_silu_mul(const float* gate, const float* up, float* h, int N, cudaSt
     silu_mul_kernel<<<(N + block - 1) / block, block, 0, s>>>(gate, up, h, N);
 }
 
-// Batched argmax: one block per row of logits[B, N]; d_out[b] = argmax over row b. The shared-array
-// size is tied to the launch width below through kArgmaxThreads.
-static constexpr int kArgmaxThreads = 256;
-__global__ void argmax_batch_kernel(const float* __restrict__ logits, int N, int* __restrict__ out) {
-    __shared__ float sval[kArgmaxThreads];
-    __shared__ int   sidx[kArgmaxThreads];
-    int b = blockIdx.x, tid = threadIdx.x;
+// Batched sampling: one block per row of logits[B, N]. Greedy (invT[b] <= 0) reduces an argmax;
+// otherwise temperature softmax + inverse-CDF categorical sampling, restricted to the nucleus when
+// top_p[b] < 1. Each thread owns a CONTIGUOUS index range so the cumulative scan is in token-id
+// order (any consistent order gives the same distribution; contiguous makes the per-thread prefix a
+// true prefix over token ids). Nucleus = the smallest set of highest-prob tokens with cumulative
+// prob >= top_p; found by binary-searching a weight threshold wt with sum_{w_i >= wt} w_i >= top_p*Z
+// (full distribution is the wt == 0 case). No global sort — all work stays inside one block.
+static constexpr int kSampleThreads = 256;
+__global__ void sample_batch_kernel(const float* __restrict__ logits, int N,
+                                    const float* __restrict__ invT,
+                                    const float* __restrict__ topp,
+                                    const float* __restrict__ u,
+                                    int* __restrict__ out) {
+    int b = blockIdx.x, tid = threadIdx.x, nt = blockDim.x;
     const float* lg = logits + (size_t)b * N;
-    float best = -1e30f; int bi = 0;
-    for (int i = tid; i < N; i += blockDim.x) {
-        float v = lg[i];
-        if (v > best) { best = v; bi = i; }
+    float it = invT[b];
+
+    __shared__ float sval[kSampleThreads];   // per-thread reduction / partial-sum scratch
+    __shared__ int   sidx[kSampleThreads];
+
+    // ---- greedy: argmax over a strided sweep ----
+    if (it <= 0.0f) {
+        float best = -1e30f; int bi = 0;
+        for (int i = tid; i < N; i += nt) { float v = lg[i]; if (v > best) { best = v; bi = i; } }
+        sval[tid] = best; sidx[tid] = bi;
+        __syncthreads();
+        for (int s = nt >> 1; s > 0; s >>= 1) {
+            if (tid < s && sval[tid + s] > sval[tid]) { sval[tid] = sval[tid + s]; sidx[tid] = sidx[tid + s]; }
+            __syncthreads();
+        }
+        if (tid == 0) out[b] = sidx[0];
+        return;
     }
-    sval[tid] = best; sidx[tid] = bi;
+
+    // ---- temperature categorical (full distribution, or nucleus when top_p < 1) ----
+    int chunk = (N + nt - 1) / nt;
+    int lo = min(tid * chunk, N), hi = min(lo + chunk, N);
+
+    // pass 1: max logit (numerical stability), block max-reduce
+    float lmax = -1e30f;
+    for (int i = lo; i < hi; ++i) lmax = fmaxf(lmax, lg[i]);
+    sval[tid] = lmax;
     __syncthreads();
-    for (int s = blockDim.x >> 1; s > 0; s >>= 1) {
-        if (tid < s && sval[tid + s] > sval[tid]) { sval[tid] = sval[tid + s]; sidx[tid] = sidx[tid + s]; }
+    for (int s = nt >> 1; s > 0; s >>= 1) {
+        if (tid < s) sval[tid] = fmaxf(sval[tid], sval[tid + s]);
         __syncthreads();
     }
-    if (tid == 0) out[b] = sidx[0];
+    float m = sval[0];
+    __syncthreads();
+
+    // pass 2: per-thread exp-weight sum over its chunk; prefix -> base[], total Z. w_i in (0,1]
+    // since the max logit gives w = exp(0) = 1.
+    __shared__ float base[kSampleThreads];
+    __shared__ float total;            // Z first, then the nucleus mass M
+    float lsum = 0.0f;
+    for (int i = lo; i < hi; ++i) lsum += expf((lg[i] - m) * it);
+    sval[tid] = lsum;
+    __syncthreads();
+    if (tid == 0) { float acc = 0.0f; for (int t = 0; t < nt; ++t) { base[t] = acc; acc += sval[t]; } total = acc; }
+    __syncthreads();
+    float Z = total;
+
+    // nucleus: binary-search the largest weight threshold wt whose kept mass still covers top_p*Z
+    // (largest wt => smallest set), then rebuild base[]/M over the kept tokens. wt stays 0 (keep
+    // all) when top_p >= 1.
+    float wt = 0.0f;
+    if (topp[b] < 1.0f) {
+        float need = topp[b] * Z, wlo = 0.0f, whi = 1.0f;
+        for (int it2 = 0; it2 < 32; ++it2) {
+            float mid = 0.5f * (wlo + whi);
+            float mmass = 0.0f;
+            for (int i = lo; i < hi; ++i) { float w = expf((lg[i] - m) * it); if (w >= mid) mmass += w; }
+            sval[tid] = mmass;
+            __syncthreads();
+            for (int s = nt >> 1; s > 0; s >>= 1) { if (tid < s) sval[tid] += sval[tid + s]; __syncthreads(); }
+            float mass = sval[0];
+            __syncthreads();
+            if (mass >= need) wlo = mid; else whi = mid;
+        }
+        wt = wlo;
+        float km = 0.0f;
+        for (int i = lo; i < hi; ++i) { float w = expf((lg[i] - m) * it); if (w >= wt) km += w; }
+        sval[tid] = km;
+        __syncthreads();
+        if (tid == 0) { float acc = 0.0f; for (int t = 0; t < nt; ++t) { base[t] = acc; acc += sval[t]; } total = acc; }
+        __syncthreads();
+    }
+
+    // inverse-CDF within the kept set (all tokens when wt == 0): the one thread whose
+    // [base, base+sum) interval straddles the target re-scans its chunk in token-id order.
+    __shared__ int result;
+    if (tid == 0) result = N - 1;   // defensive fallback (target ~ total)
+    __syncthreads();
+    float target = u[b] * total;
+    if (target >= base[tid] && target < base[tid] + sval[tid]) {
+        float acc = base[tid];
+        for (int i = lo; i < hi; ++i) {
+            float w = expf((lg[i] - m) * it);
+            if (w >= wt) { acc += w; if (acc >= target) { result = i; break; } }
+        }
+    }
+    __syncthreads();
+    if (tid == 0) out[b] = result;
 }
 
-void launch_argmax_batch(const float* logits, int B, int N, int* d_out, cudaStream_t s) {
-    argmax_batch_kernel<<<B, kArgmaxThreads, 0, s>>>(logits, N, d_out);
+void launch_sample_batch(const float* logits, int B, int N,
+                         const float* invT, const float* topp, const float* u,
+                         int* out, cudaStream_t s) {
+    sample_batch_kernel<<<B, kSampleThreads, 0, s>>>(logits, N, invT, topp, u, out);
 }
 

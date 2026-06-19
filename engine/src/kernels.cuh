@@ -76,5 +76,10 @@ void launch_add(float* out, const float* in, int N, cudaStream_t s);
 // h[i] = silu(gate[i]) * up[i]   for N elements
 void launch_silu_mul(const float* gate, const float* up, float* h, int N, cudaStream_t s);
 
-// Batched argmax: logits is [B, N]; d_out[b] = argmax over row b. One block per row.
-void launch_argmax_batch(const float* logits, int B, int N, int* d_out, cudaStream_t s);
+// Batched sampling: logits is [B, N]; out[b] = a sampled token id over row b. One block per row.
+//   invT[b] : 1/temperature for row b, or <= 0 to take the greedy argmax (ignores u/topp)
+//   topp[b] : nucleus cutoff (>= 1 means no truncation; < 1 restricts to the top-p nucleus)
+//   u[b]    : a uniform(0,1) draw for row b (used by the stochastic paths)
+void launch_sample_batch(const float* logits, int B, int N,
+                         const float* invT, const float* topp, const float* u,
+                         int* out, cudaStream_t s);

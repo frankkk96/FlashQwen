@@ -61,7 +61,6 @@ add_custom_command(
 add_executable(flashqwen-engine
   src/main.cpp
   src/args.cpp
-  src/sampler.cpp
   src/scheduler.cpp
   src/grpc_service.cpp
   src/safetensors.cpp

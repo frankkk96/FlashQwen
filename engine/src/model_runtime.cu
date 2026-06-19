@@ -78,8 +78,8 @@ ModelRuntime::QWeight ModelRuntime::upload_int8(const std::string& name) {
     return qw;
 }
 
-ModelRuntime::ModelRuntime(const ModelSpec& spec, int max_ctx, int max_batch_tokens)
-    : spec_(spec) {
+ModelRuntime::ModelRuntime(const ModelSpec& spec, int max_ctx, int max_batch_tokens, uint32_t seed)
+    : spec_(spec), rng_(seed) {
     max_ctx_  = ((max_ctx + 15) / 16) * 16;   // round up so WMMA tiles never read past buffers
     max_rows_ = std::max(max_ctx_, ((max_batch_tokens + 15) / 16) * 16);  // query rows per forward
     LOG_INFO("[model] loading weights from %s ...", spec_.dir.c_str());
@@ -137,9 +137,12 @@ ModelRuntime::ModelRuntime(const ModelSpec& spec, int max_ctx, int max_batch_tok
     CUDA_CHECK(cudaMalloc(&d_bt_, (size_t)MAX_DECODE_B * max_blocks_ * sizeof(int)));
     CUDA_CHECK(cudaMalloc(&d_lrows_, MAX_DECODE_B * sizeof(int)));
     CUDA_CHECK(cudaMalloc(&d_arg_,   MAX_DECODE_B * sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&d_invT_,  MAX_DECODE_B * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_topp_,  MAX_DECODE_B * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_u_,     MAX_DECODE_B * sizeof(float)));
     host_bt_.resize((size_t)MAX_DECODE_B * max_blocks_);
+    host_invT_.resize(MAX_DECODE_B); host_topp_.resize(MAX_DECODE_B); host_u_.resize(MAX_DECODE_B);
     CUDA_CHECK(cudaStreamCreate(&stream_));
-    host_logits_.resize((size_t)MAX_DECODE_B * V);
 
     size_t freeb, totalb;
     CUDA_CHECK(cudaMemGetInfo(&freeb, &totalb));
@@ -236,21 +239,22 @@ void ModelRuntime::forward(const ForwardInput& in, std::vector<int>& out_tokens)
     forward_core(in);
     out_tokens.resize(S);
     if (S > 0) {
-        launch_argmax_batch(logits_, S, spec_.vocab_size, d_arg_, stream_);   // greedy, on the GPU
+        // Per-row sampling inputs: 1/temp (<=0 => greedy), nucleus cutoff, and a uniform draw.
+        std::uniform_real_distribution<float> dist(0.0f, 1.0f);
+        for (int i = 0; i < S; ++i) {
+            const SampleParams& sp = in.sample_params[i];
+            host_invT_[i] = sp.temp > 0.0f ? 1.0f / sp.temp : 0.0f;
+            host_topp_[i] = sp.top_p;
+            host_u_[i]    = dist(rng_);
+        }
+        CUDA_CHECK(cudaMemcpyAsync(d_invT_, host_invT_.data(), S * sizeof(float), cudaMemcpyHostToDevice, stream_));
+        CUDA_CHECK(cudaMemcpyAsync(d_topp_, host_topp_.data(), S * sizeof(float), cudaMemcpyHostToDevice, stream_));
+        CUDA_CHECK(cudaMemcpyAsync(d_u_,    host_u_.data(),    S * sizeof(float), cudaMemcpyHostToDevice, stream_));
+        launch_sample_batch(logits_, S, spec_.vocab_size, d_invT_, d_topp_, d_u_, d_arg_, stream_);
         CUDA_CHECK(cudaMemcpyAsync(out_tokens.data(), d_arg_, S * sizeof(int),
                                    cudaMemcpyDeviceToHost, stream_));
     }
     CUDA_CHECK(cudaStreamSynchronize(stream_));
-}
-
-const float* ModelRuntime::forward_logits_host(const ForwardInput& in) {
-    int S = (int)in.logits_rows.size();
-    forward_core(in);
-    if (S > 0)
-        CUDA_CHECK(cudaMemcpyAsync(host_logits_.data(), logits_, (size_t)S * spec_.vocab_size * sizeof(float),
-                                   cudaMemcpyDeviceToHost, stream_));
-    CUDA_CHECK(cudaStreamSynchronize(stream_));
-    return host_logits_.data();
 }
 
 ModelRuntime::~ModelRuntime() {
@@ -262,5 +266,6 @@ ModelRuntime::~ModelRuntime() {
     cudaFree(xbf_); cudaFree(w_dq_);
     cudaFree(d_ids_); cudaFree(d_pos_); cudaFree(d_req_);
     cudaFree(d_bt_); cudaFree(d_lrows_); cudaFree(d_arg_);
+    cudaFree(d_invT_); cudaFree(d_topp_); cudaFree(d_u_);
     if (stream_) cudaStreamDestroy(stream_);
 }

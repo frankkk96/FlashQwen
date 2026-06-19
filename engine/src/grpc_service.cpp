@@ -76,7 +76,7 @@ private:
 // Load the model, then bind + serve. Loading happens before the port opens, so the client simply
 // retries GetModel until it answers (up to its own startup timeout); load progress + failures go to
 // stderr, and a fatal load failure returns non-zero so the supervisor detects the process death.
-int run_engine(const Args& a, const std::string& model_id, std::mt19937& rng) {
+int run_engine(const Args& a, const std::string& model_id) {
     try {
         ModelSpec spec = ModelSpec::load(a.model_dir);
         if (!spec.supported()) {
@@ -87,7 +87,7 @@ int run_engine(const Args& a, const std::string& model_id, std::mt19937& rng) {
             return 1;
         }
         LOG_INFO("[engine] loading model %s ...", model_id.c_str());
-        ModelRuntime model(spec, a.max_ctx, a.max_batch_tokens);
+        ModelRuntime model(spec, a.max_ctx, a.max_batch_tokens, a.seed);
         BlockPool pool(spec, a.max_ctx, a.gpu_mem_fraction);
         model.attach_pool(pool);
         KVCacheManager kv(pool);
@@ -96,7 +96,7 @@ int run_engine(const Args& a, const std::string& model_id, std::mt19937& rng) {
         if (n_slots > model.max_batch()) n_slots = model.max_batch();
         int max_queue = a.max_queue <= 0 ? 4 * n_slots : a.max_queue;
         int max_prefill = a.max_prefill_tokens > 0 ? a.max_prefill_tokens : a.max_batch_tokens;
-        Scheduler sched(model, kv, n_slots, max_queue, a.max_batch_tokens, max_prefill, rng);
+        Scheduler sched(model, kv, n_slots, max_queue, a.max_batch_tokens, max_prefill);
 
         ServiceImpl service(sched, model_id, model.max_ctx(), spec.vocab_size);
         grpc::ServerBuilder builder;

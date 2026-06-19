@@ -6,20 +6,24 @@
 #include "safetensors.hpp"
 #include "kernels.cuh"
 #include "block_pool.hpp"
+#include "sampler.hpp"
 #include <vector>
 #include <string>
+#include <random>
 
 // One merged forward's inputs — a flattened mixed batch (prefill chunks + decodes together).
 //   tokens[t], positions[t]  : the t-th query row's token id and its absolute logical position
 //   req_index[t]             : which request that row belongs to (0..R-1)
 //   block_tables[r]          : request r's physical KV block ids (row r of the uploaded table)
 //   logits_rows[s]           : the flattened row index whose logits feed sampling for request s
+//   sample_params[s]         : sampling params for that row (parallel to logits_rows)
 struct ForwardInput {
     std::vector<int> tokens, positions, req_index, logits_rows;
     std::vector<std::vector<int>> block_tables;
+    std::vector<SampleParams> sample_params;
 
     void clear() { tokens.clear(); positions.clear(); req_index.clear();
-                   logits_rows.clear(); block_tables.clear(); }
+                   logits_rows.clear(); block_tables.clear(); sample_params.clear(); }
     int rows() const { return (int)tokens.size(); }
     int num_requests() const { return (int)block_tables.size(); }
 
@@ -32,7 +36,11 @@ struct ForwardInput {
     void add_row(int token, int position, int req) {   // append one query row of request `req`
         tokens.push_back(token); positions.push_back(position); req_index.push_back(req);
     }
-    void mark_logits_row() { logits_rows.push_back((int)tokens.size() - 1); }   // flag last row for sampling
+    // flag the last appended row for sampling, with its per-request sampling params
+    void mark_logits_row(SampleParams sp) {
+        logits_rows.push_back((int)tokens.size() - 1);
+        sample_params.push_back(sp);
+    }
 };
 
 class ModelRuntime {
@@ -41,18 +49,16 @@ public:
     // per-sequence KV cache; max_batch_tokens bounds the number of query rows in one forward.
     // Allocates weights + activation scratch only — the paged KV pool lives in a separate
     // BlockPool; attach one (sized from the VRAM left after construction) before any forward call.
-    // Per-layer upload progress is logged (LOG_INFO) as it goes.
-    ModelRuntime(const ModelSpec& spec, int max_ctx, int max_batch_tokens);
+    // Per-layer upload progress is logged (LOG_INFO) as it goes. `seed` seeds the sampling RNG.
+    ModelRuntime(const ModelSpec& spec, int max_ctx, int max_batch_tokens, uint32_t seed);
     void attach_pool(const BlockPool& pool) { pool_ = &pool; }   // non-owning; storage for the attention kernels
     ~ModelRuntime();
 
     // --- one merged forward over a flattened mixed batch (prefill chunks + decodes together) ----
-    // The whole running set is computed in one pass (see ForwardInput). forward(): greedy argmax per
-    // sampling row, on the GPU -> out_tokens[S]. forward_logits_host(): run the same forward and copy
-    // the [S, vocab] logits to the host (row-major) for per-request sampling; the returned pointer is
-    // valid until the next call. S = in.logits_rows.size().
+    // The whole running set is computed in one pass (see ForwardInput); the per-request "last token"
+    // rows then run final norm + lm_head and are sampled on the GPU (greedy or temperature, per each
+    // row's in.sample_params) -> out_tokens[S]. S = in.logits_rows.size().
     void forward(const ForwardInput& in, std::vector<int>& out_tokens);
-    const float* forward_logits_host(const ForwardInput& in);
 
     const ModelSpec& spec() const { return spec_; }
     int max_ctx() const { return max_ctx_; }
@@ -98,9 +104,11 @@ private:
     bf16  *w_dq_ = nullptr;  // BF16 dequantized-weight scratch for the tensor-core matmul
     int   *d_ids_, *d_pos_, *d_req_;   // per-row: token id, absolute position, request index
     int   *d_bt_;                      // packed per-request block tables [R, bt_stride_]
-    int   *d_lrows_, *d_arg_;          // sampling-row indices [S]; greedy argmax output [S]
+    int   *d_lrows_, *d_arg_;          // sampling-row indices [S]; sampled-token output [S]
+    float *d_invT_, *d_topp_, *d_u_;   // per-sampling-row: 1/temp, nucleus cutoff, uniform draw [S]
     std::vector<int>   host_bt_;       // scratch to pack padded block tables for upload
-    std::vector<float> host_logits_;
+    std::vector<float> host_invT_, host_topp_, host_u_;   // scratch for the per-row sampling inputs
+    std::mt19937 rng_;                 // sampling RNG (per-row uniforms generated on the host)
 
     cudaStream_t stream_ = nullptr;
 

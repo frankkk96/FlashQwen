@@ -24,7 +24,6 @@
 #include <memory>
 #include <mutex>
 #include <condition_variable>
-#include <random>
 #include <string>
 
 struct Request {
@@ -62,7 +61,7 @@ struct StepBatch {
         int ri = input.begin_request(r->block_table);
         for (int k = 0; k < n; ++k)
             input.add_row(r->token_at(r->computed + k), r->computed + k, ri);
-        if (r->computed + n == r->num_tokens()) { input.mark_logits_row(); sampling.push_back(r); }
+        if (r->computed + n == r->num_tokens()) { input.mark_logits_row(r->sp); sampling.push_back(r); }
         scheduled.push_back(r);
         num_new.push_back(n);
     }
@@ -71,7 +70,7 @@ struct StepBatch {
 class Scheduler {
 public:
     Scheduler(ModelRuntime& model, KVCacheManager& kv, int n_slots, int max_queue,
-              int max_batch_tokens, int max_prefill, std::mt19937& rng);
+              int max_batch_tokens, int max_prefill);
 
     // submit() hands a new request to the engine (thread-safe; called by gRPC handler threads).
     // run() is the engine thread: it drains submitted requests and drives the batching loop forever.
@@ -96,7 +95,6 @@ private:
     int  chunk_size(const Request* r, int pass, int budget) const;   // tokens to advance this step
     bool grow_or_preempt(Request* r, int upto_tokens);  // false => r was failed + freed (rebuild)
     void build_batch(StepBatch& b);
-    void run_forward(const StepBatch& b, std::vector<int>& sampled);
     void apply_results(const StepBatch& b, const std::vector<int>& sampled);
 
     bool finished(const Request* r) const;
@@ -106,8 +104,7 @@ private:
 
     ModelRuntime& model_;
     KVCacheManager& kv_;
-    int  n_slots_, max_queue_, max_ctx_, V_, bsz_, max_batch_tokens_, max_prefill_;
-    std::mt19937& rng_;
+    int  n_slots_, max_queue_, max_ctx_, bsz_, max_batch_tokens_, max_prefill_;
 
     // cross-thread handoff: handler threads push to inbound_ via submit(); run() drains it.
     std::mutex inbound_mu_;
@@ -118,5 +115,5 @@ private:
     std::vector<std::unique_ptr<Request>> running_;   // resident (prefilling or decoding)
 
     StepBatch        batch_;     // per-step scratch (reused to avoid reallocation)
-    std::vector<int> sampled_;   // greedy sampled tokens (parallel to batch_.sampling)
+    std::vector<int> sampled_;   // sampled tokens (parallel to batch_.sampling)
 };
