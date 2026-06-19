@@ -1,19 +1,17 @@
-#include "grpc_server.hpp"
+#include "grpc_service.hpp"
+#include "grpc_sink.hpp"
+#include "engine_loop.hpp"
 #include "model_spec.hpp"
 #include "model_runtime.hpp"
 #include "block_pool.hpp"
 #include "kv_cache.hpp"
 #include "scheduler.hpp"
-#include "errors.hpp"
-#include "output_sink.hpp"
 #include "startup.hpp"
 #include "engine.grpc.pb.h"
 #include <grpcpp/grpcpp.h>
-#include <atomic>
-#include <deque>
+#include <algorithm>
 #include <memory>
 #include <mutex>
-#include <condition_variable>
 #include <thread>
 #include <cstdio>
 #include <exception>
@@ -29,121 +27,6 @@ using flashqwen::StatusResponse;
 // Generate-stream tuning.
 constexpr int kDefaultMaxTokens = 512;   // used when a request omits max_tokens
 constexpr int kStreamPollMs     = 100;   // how often the handler re-checks for client cancellation
-
-// The single place that maps the engine's domain error taxonomy to the proto wire codes.
-static flashqwen::ErrorCode to_proto(EngineErrc e) {
-    switch (e) {
-        case EngineErrc::OverCapacity: return flashqwen::ERROR_CODE_OVER_CAPACITY;
-        case EngineErrc::Internal:     return flashqwen::ERROR_CODE_INTERNAL;
-    }
-    return flashqwen::ERROR_CODE_UNSPECIFIED;
-}
-
-// Maps the startup lifecycle to the proto state enum.
-static flashqwen::EngineState to_proto(LoadState s) {
-    switch (s) {
-        case LoadState::Loading: return flashqwen::ENGINE_STATE_LOADING;
-        case LoadState::Ready:   return flashqwen::ENGINE_STATE_READY;
-        case LoadState::Failed:  return flashqwen::ENGINE_STATE_FAILED;
-    }
-    return flashqwen::ENGINE_STATE_UNSPECIFIED;
-}
-
-// ---- per-request output sink ------------------------------------------------------------
-// GrpcSink is the engine's OutputSink for one Generate stream: the scheduler writes tokens / the
-// terminal event into the EventQueue, the handler thread drains it onto the wire. The Request (owned
-// by the scheduler) and the handler each hold a shared_ptr to it, so it lives until both are done;
-// cancellation is a flag the handler sets and the scheduler polls.
-struct EventQueue {
-    void push(GenerateEvent e) {
-        { std::lock_guard<std::mutex> lk(m_); q_.push_back(std::move(e)); }
-        cv_.notify_one();
-    }
-    void close() {
-        { std::lock_guard<std::mutex> lk(m_); closed_ = true; }
-        cv_.notify_all();
-    }
-    // Wait up to timeout_ms for an event. Returns true with `out` set, or false on timeout/closed.
-    bool pop(GenerateEvent& out, int timeout_ms) {
-        std::unique_lock<std::mutex> lk(m_);
-        cv_.wait_for(lk, std::chrono::milliseconds(timeout_ms), [&] { return !q_.empty() || closed_; });
-        if (q_.empty()) return false;
-        out = std::move(q_.front()); q_.pop_front();
-        return true;
-    }
-    bool is_closed() { std::lock_guard<std::mutex> lk(m_); return closed_ && q_.empty(); }
-
-private:
-    std::mutex m_;
-    std::condition_variable cv_;
-    std::deque<GenerateEvent> q_;
-    bool closed_ = false;
-};
-
-struct GrpcSink : OutputSink {
-    EventQueue queue;
-    std::atomic<bool> cancel{false};
-
-    void token(int id) override {
-        GenerateEvent ev; ev.set_token_id(id); queue.push(std::move(ev));
-    }
-    void done(const std::string& finish_reason, int prompt_tokens, int completion_tokens) override {
-        GenerateEvent ev; auto* d = ev.mutable_done();
-        d->set_finish_reason(finish_reason);
-        d->set_prompt_tokens(prompt_tokens);
-        d->set_completion_tokens(completion_tokens);
-        queue.push(std::move(ev)); queue.close();
-    }
-    void error(EngineErrc code, const std::string& msg) override {
-        GenerateEvent ev; auto* e = ev.mutable_error();
-        e->set_code(to_proto(code)); e->set_message(msg);
-        queue.push(std::move(ev)); queue.close();
-    }
-    bool cancelled() const override { return cancel.load(std::memory_order_relaxed); }
-};
-
-// ---- the engine: the single thread that touches the model / GPU -------------------------
-// The handler threads hand Requests in over `inbound`; the engine thread owns them from there on
-// (via the scheduler) and streams results straight to each request's sink — no callbacks, no
-// per-request registry, no cancellation pointers crossing back.
-struct EngineLoop {
-    ModelRuntime& model; KVCacheManager& kv; std::mt19937& rng;
-    int n_slots; int max_queue; int max_batch_tokens; int max_prefill;
-    std::mutex mu; std::condition_variable cv;
-    std::deque<std::unique_ptr<Request>> inbound;
-
-    void submit(std::unique_ptr<Request> r) {
-        { std::lock_guard<std::mutex> lk(mu); inbound.push_back(std::move(r)); }
-        cv.notify_one();
-    }
-
-    void run() {
-        Scheduler sched(model, kv, n_slots, max_queue, max_batch_tokens, max_prefill, rng);
-        std::deque<std::unique_ptr<Request>> incoming;
-        while (true) {
-            {
-                std::unique_lock<std::mutex> lk(mu);
-                if (inbound.empty() && !sched.busy())
-                    cv.wait(lk, [&] { return !inbound.empty(); });
-                incoming.swap(inbound);
-            }
-            while (!incoming.empty()) {
-                auto r = std::move(incoming.front()); incoming.pop_front();
-                if (!sched.can_admit()) {   // admission control: queue full -> reject as over-capacity
-                    if (r->sink) r->sink->error(EngineErrc::OverCapacity,
-                        "request queue full: " + std::to_string(sched.queue_depth()) +
-                        " requests already waiting (limit " + std::to_string(sched.max_queue()) +
-                        "), engine running up to " + std::to_string(n_slots) +
-                        " concurrent sequences; retry shortly");
-                    // r is dropped here; the handler's sink ref still delivers the error event.
-                } else {
-                    sched.add(std::move(r));
-                }
-            }
-            if (sched.busy()) sched.step();
-        }
-    }
-};
 
 // ---- gRPC service -----------------------------------------------------------------------
 // GetStatus answers from the moment the port binds (driven by the loader thread through

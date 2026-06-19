@@ -6,7 +6,7 @@
 //   flashqwen-engine --model DIR [--address host:port] [--slots N] [--max-ctx N]
 //
 #include "args.hpp"
-#include "grpc_server.hpp"
+#include "grpc_service.hpp"
 #include <string>
 #include <random>
 
