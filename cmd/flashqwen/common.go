@@ -15,11 +15,9 @@ import (
 const startupStallTimeout = 120 * time.Second
 
 // session bundles the embedded engine plus its lifecycle. gen is the text tier (used by serve /
-// chat); tok is the same tokenizer, exposed so the benchmark can synthesise prompts of a target
-// length without loading it a second time.
+// chat); info carries the engine's reported model metadata; stop tears the engine down.
 type session struct {
 	gen  *engine.Generator
-	tok  *tokenizer.Tokenizer
 	info *engine.ModelInfo
 	stop func()
 }
@@ -55,5 +53,5 @@ func open(modelDir string, slots, maxCtx, maxQueue int) (*session, error) {
 		return nil, err
 	}
 	gen := engine.NewGenerator(conn, cm, tok, info.MaxCtx)
-	return &session{gen: gen, tok: tok, info: info, stop: func() { conn.Close(); sup.Stop() }}, nil
+	return &session{gen: gen, info: info, stop: func() { conn.Close(); sup.Stop() }}, nil
 }

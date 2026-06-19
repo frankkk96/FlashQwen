@@ -63,7 +63,6 @@ gRPC/protobuf,以及一块显存 ≥20 GB 的 NVIDIA GPU。默认按 `sm_89`(RTX
 ```bash
 ./flashqwen serve     --model models/qwen3-8b   # 启动 OpenAI 兼容服务(默认监听 :8000)
 ./flashqwen chat      --model models/qwen3-8b   # 进入交互式多轮对话
-./flashqwen benchmark --model models/qwen3-8b   # 跑端到端吞吐基准(并发 1/8/16)
 ./flashqwen --help
 ```
 
@@ -132,22 +131,3 @@ barrier。decode 在 batch 1 时这种划分只有 ~32 个并行单元(每 head 
 
 这些背后的分阶段历程——单流优化(标量 matmul → WMMA → split-K → INT8,49.7 → 104 tok/s)与批处理实现
 ——保存在 `optimization-study` 与 `feature/batching` 两个分支。
-
----
-
-## Benchmark
-
-下表是 `./flashqwen benchmark` 测得的端到端吞吐,走的是经 gRPC 的真实路径,包含分词与采样。
-
-**环境:** NVIDIA RTX 4090(24 GB),Qwen3-8B,matmul 权重 INT8 量化,连续批处理 + PagedAttention。
-**配置:** 默认参数 —— 合成请求,每条 128 token 输入、128 token 输出,每个并发档位 32 条请求,贪心解码。
-
-| 并发 | 请求数 | 墙钟 | 聚合吞吐 | 平均 TTFT |
-|---:|---:|---:|---:|---:|
-| 1  | 32 | 44.9 s | 91 tok/s  | 99 ms  |
-| 8  | 32 | 18.0 s | 228 tok/s | 286 ms |
-| 16 | 32 | 16.7 s | **245 tok/s** | 647 ms |
-
-单流约 91 tok/s:decode 阶段是访存瓶颈(每生成一个 token 都要把整个模型读一遍),INT8 权重把上限推到
-这个量级。并发提到 16 时,连续批处理把一次权重读取摊薄到同批的多个序列上,聚合吞吐升到约 245 tok/s
-(约 2.7×);代价是首 token 延迟(TTFT)随并发升高。

@@ -3,7 +3,6 @@
 //
 //	flashqwen serve     --model DIR [--addr :8000] [--slots N] [--max-ctx N]
 //	flashqwen chat      --model DIR [--max-ctx N]
-//	flashqwen benchmark --model DIR [--slots N] [--max-ctx N]
 package main
 
 import (
@@ -17,7 +16,6 @@ func usage() {
 usage:
   flashqwen serve     --model DIR [--addr :8000] [--slots N] [--max-ctx N]
   flashqwen chat      --model DIR [--max-ctx N]
-  flashqwen benchmark --model DIR [--slots N] [--max-ctx N]
 
 All modes embed and launch the C++ engine themselves; no separate process to start.
 `)
@@ -33,8 +31,6 @@ func main() {
 		runServe(os.Args[2:])
 	case "chat":
 		runChat(os.Args[2:])
-	case "benchmark", "bench":
-		runBench(os.Args[2:])
 	case "-h", "--help", "help":
 		usage()
 	default:
