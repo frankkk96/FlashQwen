@@ -17,12 +17,14 @@ func runServe(args []string) {
 	slots := fs.Int("slots", 16, "max concurrent sequences")
 	maxCtx := fs.Int("max-ctx", 4096, "KV / context length")
 	maxQueue := fs.Int("max-queue", 0, "max requests waiting for admission before new ones are rejected as over-capacity (0 => 4*slots)")
+	maxBatchTokens := fs.Int("max-batch-tokens", 2048, "total tokens computed per scheduler step (max_num_batched_tokens)")
+	maxPrefill := fs.Int("max-prefill-tokens", 512, "per-request prefill chunk cap per step (long_prefill_token_threshold)")
 	fs.Parse(args)
 	if *model == "" {
 		log.Fatal("serve: --model is required")
 	}
 
-	s, err := open(*model, *slots, *maxCtx, *maxQueue)
+	s, err := open(*model, *slots, *maxCtx, *maxQueue, *maxBatchTokens, *maxPrefill)
 	if err != nil {
 		log.Fatalf("serve: %v", err)
 	}

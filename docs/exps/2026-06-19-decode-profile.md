@@ -35,3 +35,36 @@ standing [[s2-gap-is-scheduling]] note.
    attempt) would help both regimes. Distinct lever from the spent S4 tensor-core experiment.
 3. **Prefill-chunk drag** — smaller/smarter prefill chunking so 1024-token prompts don't stall decode
    (tune `--max-prefill-tokens`, or split prefill onto its own step). Zero/low code, matches vLLM's edge.
+
+## Follow-up experiments (2026-06-19, same session)
+
+### E1 — `--max-prefill-tokens` sweep on the tracked 1024/128 conc=32 workload — REFUTED
+Plumbed `--max-batch-tokens` / `--max-prefill-tokens` through the Go layer (serve.go → common.go →
+supervisor) so the chunk size could be swept. Fixed `--slots 32 --max-batch-tokens 2048`.
+
+| max_prefill | conc=32 tok/s | TTFT | TPOT |
+|---|---|---|---|
+| 128 | 356.0 | 18.4 ms | 85.4 ms |
+| 256 | 355.6 | 18.5 ms | 84.9 ms |
+| 512 (default) | 357.1 | 18.1 ms | 84.9 ms |
+| 1024 | 354.6 | 18.2 ms | 85.3 ms |
+
+**All within noise — prefill chunk size does not move conc=32 throughput (nor TTFT/TPOT).** So the
+prefill-chunk-drag hypothesis (lever #3 above) is *refuted* for this workload: how prefill is sliced
+doesn't matter. (Script: `/root/bench-compare/prefill_sweep.sh`, CSV `results/prefill_sweep.csv`.)
+
+### Open question — the long-context decode regime is still unprofiled
+All three profiles above used SHORT context (32–512 tokens). The tracked metric is **1024-token
+context**, where decode attention reads a ~1152-token KV every step — a regime none of these captures.
+TPOT in the std test is ~85 ms vs ~24 ms/step in the short-context decode profile: a 3.5× gap that
+must come from long-context attention (our decode kernel uses 1 active warp per (head,req) scanning
+~72 KV tiles sequentially, and re-reads each kv-head's K/V 4× across the GQA group). **Next: profile
+the exact 1024/128 conc=32 workload** (`/root/bench-compare/nsys_std.sh`, written but not yet run —
+interrupted) to confirm whether long-context decode attention, not GEMM, is the real conc=32 ceiling.
+If so, the lever is a FlashDecoding/split-K decode attention (distinct from the spent S4 WMMA attempt).
+
+### What's been ruled out so far (conc=32, 1024/128)
+- cuBLASLt GEMM autotuning — decode GEMM is at 84% HBM BW, no headroom.
+- CUDA graphs / async scheduling — GPU is ~97% busy in decode, no launch gaps to fill.
+- Elementwise/launch fusion (S5 #5/#7) — ~4% of GPU time, in the noise.
+- Prefill chunk size (`--max-prefill-tokens`) — no effect (E1).
