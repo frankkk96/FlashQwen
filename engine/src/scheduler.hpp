@@ -152,7 +152,6 @@ private:
     int  queue_depth() const { return (int)waiting_.size(); }
     bool busy() const { return !waiting_.empty() || !running_.empty(); }
 
-    void add(std::unique_ptr<Request> r);   // move a submitted request into the waiting set
     // Advance one scheduling iteration: drop cancelled requests, admit waiters, pack a token-budget
     // batch (preempting if the pool is exhausted), run one merged forward, apply the results to each
     // request, and reclaim the resources of any that finished. The batch is a step-local value.
@@ -162,8 +161,8 @@ private:
     bool grow_or_preempt(Request* r, int upto_tokens);  // false => r was failed + freed (rebuild)
 
     bool preempt_one(Request* protect);     // free youngest running seq != protect; requeue for recompute
-    void release(Request* r);               // return a request's blocks to the pool
-    void erase_running(Request* r);         // drop + free a request from the running set
+    void release(Request* r);               // return a request's KV blocks to the pool (it stays alive)
+    void retire(Request* r);                // request leaves for good: free its KV + drop it from running
 
     ModelRuntime& model_;
     KVCacheManager& kv_;

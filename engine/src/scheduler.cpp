@@ -13,13 +13,14 @@ Scheduler::Scheduler(ModelRuntime& model, KVCacheManager& kv, int n_slots, int m
     bsz_     = kv_.block_size();
 }
 
-void Scheduler::add(std::unique_ptr<Request> r) { waiting_.push_back(std::move(r)); }
-
 void Scheduler::release(Request* r) {
     kv_.free(r->blocks());   // return blocks to the pool and clear the table
 }
 
-void Scheduler::erase_running(Request* r) {
+// A request has left the engine for good (finished or failed): return its KV blocks to the pool and
+// drop it from the running set (destroying it).
+void Scheduler::retire(Request* r) {
+    release(r);
     for (auto it = running_.begin(); it != running_.end(); ++it)
         if (it->get() == r) { running_.erase(it); return; }   // unique_ptr destroyed -> Request freed
 }
@@ -60,9 +61,8 @@ bool Scheduler::grow_or_preempt(Request* r, int upto) {
             std::string msg = "out of KV cache: pool has " + std::to_string(kv_.num_blocks()) +
                 " blocks of " + std::to_string(bsz_) + " tokens, cannot grow a sequence to " +
                 std::to_string(upto) + " tokens";
-            release(r);
             if (r->sink()) r->sink()->error(EngineErrc::OverCapacity, std::move(msg));
-            erase_running(r);
+            retire(r);
             return false;
         }
     }
@@ -115,7 +115,7 @@ void Scheduler::step() {
     // 4. forward + apply + reclaim
     model_.forward(batch.input, batch.sampled);   // merged forward + per-row GPU sampling
     batch.apply(max_ctx_);                          // advance + sample + stream -> batch.finished
-    for (Request* r : batch.finished) { release(r); erase_running(r); }   // reclaim engine resources
+    for (Request* r : batch.finished) retire(r);   // finished: free KV + drop from running
 }
 
 void Scheduler::submit(std::unique_ptr<Request> r) {
@@ -144,7 +144,7 @@ void Scheduler::run() {
                     " concurrent sequences; retry shortly");
                 // r is dropped here; the handler's sink ref still delivers the error event.
             } else {
-                add(std::move(r));
+                waiting_.push_back(std::move(r));   // admitted: into the scheduling queue
             }
         }
         if (busy()) step();
