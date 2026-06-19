@@ -42,14 +42,13 @@ public:
     grpc::Status Generate(grpc::ServerContext* ctx, const GenerateRequest* req,
                           grpc::ServerWriter<GenerateEvent>* writer) override {
         auto sink = std::make_shared<GrpcSink>();
-        auto r = std::make_unique<Request>();
-        r->prompt.assign(req->input_ids().begin(), req->input_ids().end());
-        r->stop_ids.assign(req->stop_token_ids().begin(), req->stop_token_ids().end());
+        std::vector<int> prompt(req->input_ids().begin(), req->input_ids().end());
+        std::vector<int> stop_ids(req->stop_token_ids().begin(), req->stop_token_ids().end());
         int max_new = req->max_tokens() > 0 ? req->max_tokens() : kDefaultMaxTokens;
-        int room = max_ctx_ - (int)r->prompt.size(); if (room < 1) room = 1;
-        r->max_new = std::min(max_new, room);
-        r->sp = SampleParams{req->temperature(), req->top_p() > 0.f ? req->top_p() : 1.0f};
-        r->sink = sink;
+        int room = max_ctx_ - (int)prompt.size(); if (room < 1) room = 1;
+        SampleParams sp{req->temperature(), req->top_p() > 0.f ? req->top_p() : 1.0f};
+        auto r = std::make_unique<Request>(std::move(prompt), std::min(max_new, room), sp,
+                                           std::move(stop_ids), sink);
         sched_.submit(std::move(r));   // hand the request to the engine; we keep `sink` for the stream
 
         while (true) {
