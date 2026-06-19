@@ -153,7 +153,7 @@ ModelRuntime::ModelRuntime(const ModelSpec& spec, const RuntimeConfig& cfg)
 
 void ModelRuntime::mm(const float* x, const QWeight& w, float* y, int M, int IN, int OUT, bool pure_decode) {
     if (pure_decode) launch_matmul_decode(x, w.w, w.scale, y, M, IN, OUT, stream_);
-    else             launch_matmul(x, w.w, w.scale, y, M, IN, OUT, xbf_, w_dq_, stream_);
+    else             launch_matmul_prefill(x, w.w, w.scale, y, M, IN, OUT, xbf_, w_dq_, stream_);
 }
 
 // The unified layer stack over T query rows. Every per-token op runs on the flattened batch; the

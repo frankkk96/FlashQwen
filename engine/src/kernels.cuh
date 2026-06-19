@@ -21,12 +21,12 @@
 
 using bf16 = __nv_bfloat16;
 
-// y[M,OUT] = x[M,IN] @ W[OUT,IN]^T   — W is INT8 with a per-row `scale[OUT]` (no bias).
-// Decode (M==1): memory-bound INT8 GEMV, dequantized in-kernel. Prefill (M>1): dequantize
-// W to BF16 in `w_dq` (>= OUT*IN elements), convert x to BF16 in `x_bf16`, then WMMA.
-// IN and OUT must be multiples of 16 (true for all Qwen3 layer dims).
-void launch_matmul(const float* x, const int8_t* W, const float* scale, float* y,
-                   int M, int IN, int OUT, bf16* x_bf16, bf16* w_dq, cudaStream_t s);
+// Prefill matmul (M>1): y[M,OUT] = x[M,IN] @ W[OUT,IN]^T, W INT8 + per-row `scale[OUT]` (no bias).
+// Dequantizes W to BF16 in `w_dq` (>= OUT*IN elements), converts x to BF16 in `x_bf16`, then runs
+// the tensor-core GEMM. IN and OUT must be multiples of 16 (true for all Qwen3 layer dims). The
+// single-row decode path is launch_matmul_decode.
+void launch_matmul_prefill(const float* x, const int8_t* W, const float* scale, float* y,
+                           int M, int IN, int OUT, bf16* x_bf16, bf16* w_dq, cudaStream_t s);
 
 // Largest decode batch a single GEMV pass supports (register-array bound). Decode batches are
 // capped at this; KV slots (B_max) may exceed it but never the per-step token count.
