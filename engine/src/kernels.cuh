@@ -28,11 +28,22 @@ constexpr int MAX_DECODE_B = 32;
 // out[M,H] = rmsnorm(x[M,H]) * w[H]    (x/out BF16, weight w FP32, reduction in FP32)
 void launch_rmsnorm(const bf16* x, const float* w, bf16* out, int M, int H, float eps, cudaStream_t s);
 
+// Fused residual-add + rmsnorm: x[m] += res[m] (written back, carries the residual forward), then
+// out[m] = rmsnorm(x[m]) * w. One launch + one pass over x replaces a separate add then rmsnorm
+// (saves a full H read/write of x and a kernel launch per residual).
+void launch_add_rmsnorm(bf16* x, const bf16* res, const float* w, bf16* out,
+                        int M, int H, float eps, cudaStream_t s);
+
 // Gather embedding rows: out[m,:] = embed[ids[m], :]   (embed + out BF16)
 void launch_embed(const int* ids, const bf16* embed, bf16* out, int M, int H, cudaStream_t s);
 
-// In-place rotary position embedding on x[M, n_heads, head_dim] (BF16), positions pos[M].
-void launch_rope(bf16* x, const int* pos, int M, int n_heads, int head_dim, float theta, cudaStream_t s);
+// Fused per-head RMSNorm + RoPE over one sub-tensor of a fused QKV buffer. `buf` points at the q (or
+// k) slice of a row of width `stride`; head (m,h) lives at buf + m*stride + h*head_dim. Each head row
+// is RMSNorm'd (weight w, FP32) then rotated using the precomputed cos/sin tables (cos/sin laid out
+// [max_pos, head_dim/2]) indexed by pos[m]. In place. blockDim must be head_dim.
+void launch_head_norm_rope(bf16* buf, const float* w, const float* cos_tab, const float* sin_tab,
+                           const int* pos, int M, int n_heads, int head_dim, int stride, float eps,
+                           cudaStream_t s);
 
 // ---- Paged KV cache attention -----------------------------------------------------------
 // The KV pool for a layer is [num_blocks, BLOCK, kv_dim] BF16. A sequence's KV is a list of physical
@@ -47,8 +58,10 @@ void launch_rope(bf16* x, const int* pos, int M, int n_heads, int head_dim, floa
 // handles (query-tile, head, request): BM query rows (one warp each) stream the request's K/V in
 // BLOCK-sized tiles through shared memory — reused across all BM rows — with online softmax in
 // registers and deferred normalization. max_qlen = max over requests of qlen (sets the q-tile grid).
-void launch_attention_flash(const bf16* q, const bf16* cache_k, const bf16* cache_v, bf16* out,
-                            int n_heads, int n_kv, int head_dim,
+// q_stride = elements between consecutive query rows in `q` (n_heads*head_dim for a packed q buffer,
+// or the fused-QKV row width when q points at the q slice of a [T, q+2kv] buffer).
+void launch_attention_flash(const bf16* q, int q_stride, const bf16* cache_k, const bf16* cache_v,
+                            bf16* out, int n_heads, int n_kv, int head_dim,
                             const int* pos, const int* qstart, const int* qlen,
                             int R, int max_qlen,
                             const int* bt, int max_blocks, int block_size, float scale,
@@ -61,8 +74,8 @@ void launch_gather_rows(const bf16* x, const int* rows, bf16* out, int S, int H,
 // out[i] += in[i]   for N elements (BF16, accumulated in FP32)
 void launch_add(bf16* out, const bf16* in, int N, cudaStream_t s);
 
-// h[i] = silu(gate[i]) * up[i]   for N elements (BF16)
-void launch_silu_mul(const bf16* gate, const bf16* up, bf16* h, int N, cudaStream_t s);
+// h[m,i] = silu(gateup[m, i]) * gateup[m, I + i]  over M rows of a fused gate|up buffer (row width 2I).
+void launch_silu_mul(const bf16* gateup, bf16* h, int M, int I, cudaStream_t s);
 
 // Batched sampling: logits is [B, N] FP32; out[b] = a sampled token id over row b. One block per row.
 //   invT[b] : 1/temperature for row b, or <= 0 to take the greedy argmax (ignores u/topp)

@@ -52,7 +52,8 @@ BlockPool::~BlockPool() {
 // ---- write side: scatter freshly-projected K/V rows into the pool -----------------------
 // The pool's only mutating compute op (the attention kernels read it; see kernels.cu). Token m
 // belongs to the sequence whose block table is row bt_row[m] of `bt`, at logical position pos[m].
-__global__ void store_kv_paged_kernel(const bf16* __restrict__ src, bf16* __restrict__ cache,
+__global__ void store_kv_paged_kernel(const bf16* __restrict__ src, int src_offset, int src_stride,
+                                      bf16* __restrict__ cache,
                                       const int* __restrict__ bt, int max_blocks, int block_size,
                                       int kv_dim, const int* __restrict__ bt_row,
                                       const int* __restrict__ pos, int M) {
@@ -60,13 +61,13 @@ __global__ void store_kv_paged_kernel(const bf16* __restrict__ src, bf16* __rest
     if (idx >= M * kv_dim) return;
     int m = idx / kv_dim, i = idx % kv_dim;
     size_t phys = kv_phys_row(bt + (size_t)bt_row[m] * max_blocks, pos[m], block_size);
-    cache[phys * kv_dim + i] = src[idx];
+    cache[phys * kv_dim + i] = src[(size_t)m * src_stride + src_offset + i];
 }
 
-void launch_store_kv_paged(const bf16* src, bf16* cache, const int* bt, int max_blocks,
-                           int block_size, int kv_dim, const int* bt_row, const int* pos,
-                           int M, cudaStream_t s) {
+void launch_store_kv_paged(const bf16* src, int src_offset, int src_stride, bf16* cache,
+                           const int* bt, int max_blocks, int block_size, int kv_dim,
+                           const int* bt_row, const int* pos, int M, cudaStream_t s) {
     int n = M * kv_dim, blk = 256;
     store_kv_paged_kernel<<<(n + blk - 1) / blk, blk, 0, s>>>(
-        src, cache, bt, max_blocks, block_size, kv_dim, bt_row, pos, M);
+        src, src_offset, src_stride, cache, bt, max_blocks, block_size, kv_dim, bt_row, pos, M);
 }

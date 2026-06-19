@@ -74,12 +74,16 @@ public:
 
 private:
     struct Layer {
-        bf16 *q_proj, *k_proj, *v_proj, *o_proj, *gate, *up, *down;   // BF16, HF layout [OUT, IN]
+        // Fused weights (BF16, HF layout [OUT, IN]): qkv = [q|k|v] proj stacked on OUT (q_dim+2*kv_dim
+        // rows), gateup = [gate|up] stacked (2*intermediate rows). o_proj / down stay separate.
+        bf16 *qkv, *o_proj, *gateup, *down;
         float *in_norm, *post_norm, *q_norm, *k_norm;
     };
 
     bf16*   upload_bf16(const std::string& name);   // weight, kept BF16
+    bf16*   upload_concat(const std::vector<std::string>& names);  // weights stacked on OUT (rows)
     float*  upload_norm(const std::string& name);   // bf16 -> fp32
+    void    precompute_rope();                       // fill cos_tab_/sin_tab_ [max_ctx, head_dim/2]
 
     // y[M,OUT] = x[M,IN] @ W[OUT,IN]^T via cuBLAS (BF16 in, FP32 accumulate). Ytype picks the output
     // element type: CUDA_R_16BF for activations, CUDA_R_32F for the lm_head logits.
@@ -100,10 +104,14 @@ private:
     bf16*  embed_  = nullptr;
     float* fnorm_  = nullptr;
     bf16*  lm_head_ = nullptr;
+    float* cos_tab_ = nullptr;   // [max_ctx, head_dim/2] precomputed RoPE cos (layer-independent)
+    float* sin_tab_ = nullptr;
     std::vector<Layer> layers_;
 
     // activation scratch (BF16, sized to max_rows_ query rows); logits stay FP32 for sampling.
-    bf16  *x_, *xb_, *xb2_, *q_, *k_, *v_, *attn_, *gate_, *up_, *hmlp_;
+    // qkv_ holds the fused Q|K|V projection [max_rows, q_dim+2*kv_dim]; gateup_ the fused gate|up
+    // [max_rows, 2*intermediate].
+    bf16  *x_, *xb_, *xb2_, *qkv_, *attn_, *gateup_, *hmlp_;
     bf16  *xg_ = nullptr;    // gathered sampling rows [MAX_DECODE_B, H] before final norm + lm_head
     float *logits_ = nullptr;          // [S, vocab] FP32 (lm_head output -> sampling)
     int   *d_ids_, *d_pos_, *d_req_;   // per-row: token id, absolute position, request index

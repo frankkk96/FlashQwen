@@ -53,8 +53,9 @@ private:
 };
 
 // Write side of the pool: scatter M freshly-projected K (or V) rows into `cache` (one layer's
-// k(l)/v(l)). Token m goes to block-table row bt_row[m] of `bt` (row stride `max_blocks`), at
-// logical position pos[m]. Defined in block_pool.cu; the read side is the attention kernels.
-void launch_store_kv_paged(const bf16* src, bf16* cache, const int* bt, int max_blocks,
-                           int block_size, int kv_dim, const int* bt_row, const int* pos,
-                           int M, cudaStream_t s);
+// k(l)/v(l)). Token m's source row starts at src + m*src_stride + src_offset (so K/V can be read
+// straight from a fused QKV buffer); it goes to block-table row bt_row[m] of `bt` (row stride
+// `max_blocks`), at logical position pos[m]. Defined in block_pool.cu; read side = attention kernels.
+void launch_store_kv_paged(const bf16* src, int src_offset, int src_stride, bf16* cache,
+                           const int* bt, int max_blocks, int block_size, int kv_dim,
+                           const int* bt_row, const int* pos, int M, cudaStream_t s);

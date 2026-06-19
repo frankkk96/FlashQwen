@@ -30,6 +30,41 @@ void launch_rmsnorm(const bf16* x, const float* w, bf16* out, int M, int H, floa
 }
 
 // ---------------------------------------------------------------------------------------
+// fused residual-add + rmsnorm: x += res (stored back, carries the residual forward), out = rmsnorm(x)
+// ---------------------------------------------------------------------------------------
+__global__ void add_rmsnorm_kernel(bf16* __restrict__ x, const bf16* __restrict__ res,
+                                   const float* __restrict__ w, bf16* __restrict__ out,
+                                   int M, int H, float eps) {
+    int m = blockIdx.x;
+    bf16* xr = x + (size_t)m * H;
+    const bf16* rr = res + (size_t)m * H;
+    bf16* outr = out + (size_t)m * H;
+
+    extern __shared__ float red[];
+    float local = 0.f;
+    for (int i = threadIdx.x; i < H; i += blockDim.x) {
+        float v = __bfloat162float(xr[i]) + __bfloat162float(rr[i]);
+        xr[i] = __float2bfloat16(v);          // updated residual stays in x for the next layer
+        local += v * v;
+    }
+    red[threadIdx.x] = local;
+    __syncthreads();
+    for (int s = blockDim.x >> 1; s > 0; s >>= 1) {
+        if (threadIdx.x < s) red[threadIdx.x] += red[threadIdx.x + s];
+        __syncthreads();
+    }
+    float inv = rsqrtf(red[0] / H + eps);
+    for (int i = threadIdx.x; i < H; i += blockDim.x)
+        outr[i] = __float2bfloat16(__bfloat162float(xr[i]) * inv * w[i]);
+}
+
+void launch_add_rmsnorm(bf16* x, const bf16* res, const float* w, bf16* out,
+                        int M, int H, float eps, cudaStream_t s) {
+    int block = 256;
+    add_rmsnorm_kernel<<<M, block, block * sizeof(float), s>>>(x, res, w, out, M, H, eps);
+}
+
+// ---------------------------------------------------------------------------------------
 // embedding gather (BF16 -> BF16, straight copy)
 // ---------------------------------------------------------------------------------------
 __global__ void embed_kernel(const int* __restrict__ ids, const bf16* __restrict__ embed,
@@ -45,27 +80,50 @@ void launch_embed(const int* ids, const bf16* embed, bf16* out, int M, int H, cu
 }
 
 // ---------------------------------------------------------------------------------------
-// RoPE (rotate-half convention, matching HF Qwen). In-place on BF16, FP32 math.
+// Fused per-head RMSNorm + RoPE (rotate-half, matching HF Qwen). Operates in place on one sub-tensor
+// (q or k) of a fused QKV row of width `stride`: head (m,h) is at buf + m*stride + h*head_dim. The
+// rotation angles come from precomputed cos/sin tables ([max_pos, head_dim/2]) indexed by pos[m] —
+// no per-call transcendental, and they're identical across all 36 layers so the table is built once.
+// One block per (token, head); blockDim == head_dim. FP32 math.
 // ---------------------------------------------------------------------------------------
-__global__ void rope_kernel(bf16* __restrict__ x, const int* __restrict__ pos,
-                            int M, int n_heads, int head_dim, float theta) {
-    int idx = blockIdx.x;            // over M * n_heads
-    int m = idx / n_heads;
-    int i = threadIdx.x;             // over head_dim/2
+__global__ void head_norm_rope_kernel(bf16* __restrict__ buf, const float* __restrict__ w,
+                                      const float* __restrict__ cos_tab, const float* __restrict__ sin_tab,
+                                      const int* __restrict__ pos, int n_heads, int head_dim,
+                                      int stride, float eps) {
+    int row = blockIdx.x;            // over M * n_heads
+    int m = row / n_heads, h = row % n_heads;
+    int t = threadIdx.x;             // 0..head_dim-1
     int half = head_dim >> 1;
-    if (i >= half) return;
+    bf16* v = buf + (size_t)m * stride + (size_t)h * head_dim;
 
-    bf16* v = x + (size_t)idx * head_dim;
-    float inv = powf(theta, -2.0f * i / head_dim);
-    float ang = pos[m] * inv;
-    float cs = cosf(ang), sn = sinf(ang);
-    float x1 = __bfloat162float(v[i]), x2 = __bfloat162float(v[i + half]);
-    v[i]        = __float2bfloat16(x1 * cs - x2 * sn);
-    v[i + half] = __float2bfloat16(x2 * cs + x1 * sn);
+    extern __shared__ float sh[];    // [0,head_dim): reduction then normed values
+    float x = __bfloat162float(v[t]);
+    sh[t] = x * x;
+    __syncthreads();
+    for (int s = blockDim.x >> 1; s > 0; s >>= 1) {
+        if (t < s) sh[t] += sh[t + s];
+        __syncthreads();
+    }
+    float inv = rsqrtf(sh[0] / head_dim + eps);
+    __syncthreads();
+    sh[t] = x * inv * w[t];          // normed value
+    __syncthreads();
+
+    if (t < half) {
+        const float* cb = cos_tab + (size_t)pos[m] * half;
+        const float* sb = sin_tab + (size_t)pos[m] * half;
+        float cs = cb[t], sn = sb[t];
+        float x1 = sh[t], x2 = sh[t + half];
+        v[t]        = __float2bfloat16(x1 * cs - x2 * sn);
+        v[t + half] = __float2bfloat16(x2 * cs + x1 * sn);
+    }
 }
 
-void launch_rope(bf16* x, const int* pos, int M, int n_heads, int head_dim, float theta, cudaStream_t s) {
-    rope_kernel<<<M * n_heads, head_dim / 2, 0, s>>>(x, pos, M, n_heads, head_dim, theta);
+void launch_head_norm_rope(bf16* buf, const float* w, const float* cos_tab, const float* sin_tab,
+                           const int* pos, int M, int n_heads, int head_dim, int stride, float eps,
+                           cudaStream_t s) {
+    head_norm_rope_kernel<<<M * n_heads, head_dim, head_dim * sizeof(float), s>>>(
+        buf, w, cos_tab, sin_tab, pos, n_heads, head_dim, stride, eps);
 }
 
 // ---------------------------------------------------------------------------------------
@@ -81,7 +139,8 @@ void launch_rope(bf16* x, const int* pos, int M, int n_heads, int head_dim, floa
 // tile each warp stops at its own pos.
 // ---------------------------------------------------------------------------------------
 template<int BM, int DPL>
-__global__ void attention_flash_kernel(const bf16* __restrict__ q, const bf16* __restrict__ cache_k,
+__global__ void attention_flash_kernel(const bf16* __restrict__ q, int q_stride,
+                                       const bf16* __restrict__ cache_k,
                                        const bf16* __restrict__ cache_v, bf16* __restrict__ out,
                                        int n_heads, int n_kv, int head_dim,
                                        const int* __restrict__ pos, const int* __restrict__ qstart,
@@ -108,7 +167,7 @@ __global__ void attention_flash_kernel(const bf16* __restrict__ q, const bf16* _
     #pragma unroll
     for (int i = 0; i < DPL; ++i) acc[i] = 0.f;
     if (active) {
-        const bf16* qv = q + ((size_t)flat * n_heads + h) * head_dim;
+        const bf16* qv = q + (size_t)flat * q_stride + (size_t)h * head_dim;
         #pragma unroll
         for (int i = 0; i < DPL; ++i) qreg[i] = __bfloat162float(qv[lane + (i << 5)]);
     } else {
@@ -170,8 +229,8 @@ __global__ void attention_flash_kernel(const bf16* __restrict__ q, const bf16* _
     }
 }
 
-void launch_attention_flash(const bf16* q, const bf16* cache_k, const bf16* cache_v, bf16* out,
-                            int n_heads, int n_kv, int head_dim,
+void launch_attention_flash(const bf16* q, int q_stride, const bf16* cache_k, const bf16* cache_v,
+                            bf16* out, int n_heads, int n_kv, int head_dim,
                             const int* pos, const int* qstart, const int* qlen,
                             int R, int max_qlen,
                             const int* bt, int max_blocks, int block_size, float scale,
@@ -182,7 +241,7 @@ void launch_attention_flash(const bf16* q, const bf16* cache_k, const bf16* cach
     size_t shmem = 2 * (size_t)block_size * head_dim * sizeof(bf16);
     // head_dim 128 -> DPL 4 (one warp covers 128 dims, 4 per lane). Qwen3 head_dim is always 128.
     attention_flash_kernel<BM, 4><<<grid, BM * 32, shmem, s>>>(
-        q, cache_k, cache_v, out, n_heads, n_kv, head_dim, pos, qstart, qlen, bt,
+        q, q_stride, cache_k, cache_v, out, n_heads, n_kv, head_dim, pos, qstart, qlen, bt,
         max_blocks, block_size, scale);
 }
 
@@ -211,16 +270,19 @@ void launch_add(bf16* out, const bf16* in, int N, cudaStream_t s) {
     add_kernel<<<(N + block - 1) / block, block, 0, s>>>(out, in, N);
 }
 
-__global__ void silu_mul_kernel(const bf16* gate, const bf16* up, bf16* h, int N) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < N) {
-        float g = __bfloat162float(gate[i]);
-        h[i] = __float2bfloat16((g / (1.0f + expf(-g))) * __bfloat162float(up[i]));
-    }
+// h[m,i] = silu(gateup[m,i]) * gateup[m, I+i] — gate and up are the two halves of a fused row (width 2I).
+__global__ void silu_mul_kernel(const bf16* __restrict__ gateup, bf16* __restrict__ h, int M, int I) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= (size_t)M * I) return;
+    int m = idx / I, i = idx % I;
+    const bf16* row = gateup + (size_t)m * 2 * I;
+    float g = __bfloat162float(row[i]);
+    h[idx] = __float2bfloat16((g / (1.0f + expf(-g))) * __bfloat162float(row[I + i]));
 }
-void launch_silu_mul(const bf16* gate, const bf16* up, bf16* h, int N, cudaStream_t s) {
+void launch_silu_mul(const bf16* gateup, bf16* h, int M, int I, cudaStream_t s) {
     int block = 256;
-    silu_mul_kernel<<<(N + block - 1) / block, block, 0, s>>>(gate, up, h, N);
+    long N = (long)M * I;
+    silu_mul_kernel<<<(N + block - 1) / block, block, 0, s>>>(gateup, h, M, I);
 }
 
 // Batched sampling: one block per row of logits[B, N]. Greedy (invT[b] <= 0) reduces an argmax;
