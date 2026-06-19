@@ -11,7 +11,7 @@ struct Args {
     std::string address    = "127.0.0.1:50051";   // gRPC listen address
     int   slots            = 16;                   // max concurrent sequences (max_num_seqs)
     int   max_queue        = 0;                    // admission cap on waiting requests (<=0 => 4*slots)
-    int   max_batch_tokens = 2048;                 // total tokens computed per step (max_num_batched_tokens)
+    int   max_batch_tokens = 1024;                 // total tokens computed per step (max_num_batched_tokens)
     int   max_prefill_tokens = 512;                // per-request prefill chunk cap (long_prefill_token_threshold)
 };
 
