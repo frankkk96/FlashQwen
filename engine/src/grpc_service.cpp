@@ -86,16 +86,19 @@ int run_engine(const Args& a, const std::string& model_id) {
             return 1;
         }
         LOG_INFO("[engine] loading model %s ...", model_id.c_str());
-        ModelRuntime model(spec, a.max_ctx, a.max_batch_tokens, a.seed);
+        ModelRuntime model(spec, RuntimeConfig{a.max_ctx, a.max_batch_tokens, a.seed});
         BlockPool pool(spec, a.max_ctx, a.gpu_mem_fraction);
         model.attach_pool(pool);
         KVCacheManager kv(pool);
 
-        int n_slots = a.slots;
-        if (n_slots > model.max_batch()) n_slots = model.max_batch();
-        int max_queue = a.max_queue <= 0 ? 4 * n_slots : a.max_queue;
-        int max_prefill = a.max_prefill_tokens > 0 ? a.max_prefill_tokens : a.max_batch_tokens;
-        Scheduler sched(model, kv, n_slots, max_queue, a.max_batch_tokens, max_prefill);
+        int n_slots = std::min(a.slots, model.max_batch());   // clamp to the runtime cap
+        SchedulerConfig scfg{
+            n_slots,
+            a.max_queue <= 0 ? 4 * n_slots : a.max_queue,
+            a.max_batch_tokens,
+            a.max_prefill_tokens > 0 ? a.max_prefill_tokens : a.max_batch_tokens,
+        };
+        Scheduler sched(model, kv, scfg);
 
         ServiceImpl service(sched, model_id, model.max_ctx(), spec.vocab_size);
         grpc::ServerBuilder builder;
@@ -105,7 +108,8 @@ int run_engine(const Args& a, const std::string& model_id) {
         std::unique_ptr<grpc::Server> server(builder.BuildAndStart());
         if (!server) { LOG_ERROR("[engine] failed to bind %s", a.address.c_str()); return 1; }
         LOG_INFO("[engine] ready: %d slots, max_queue %d, max_batch_tokens %d, max_prefill %d, "
-                 "gRPC on %s", n_slots, max_queue, a.max_batch_tokens, max_prefill, a.address.c_str());
+                 "gRPC on %s", scfg.n_slots, scfg.max_queue, scfg.max_batch_tokens, scfg.max_prefill,
+                 a.address.c_str());
 
         std::thread engine([&] { sched.run(); });   // the engine thread; runs for the process lifetime
         engine.detach();

@@ -43,14 +43,21 @@ struct ForwardInput {
     }
 };
 
+// ModelRuntime tuning knobs, resolved from CLI Args in run_engine.
+struct RuntimeConfig {
+    int max_ctx;          // per-sequence KV / context length bound
+    int max_batch_tokens; // max query rows in one forward
+    unsigned seed;        // sampling RNG seed
+};
+
 class ModelRuntime {
 public:
-    // Load the weights described by `spec` (safetensors, from spec.dir). max_ctx bounds the
-    // per-sequence KV cache; max_batch_tokens bounds the number of query rows in one forward.
-    // Allocates weights + activation scratch only — the paged KV pool lives in a separate
-    // BlockPool; attach one (sized from the VRAM left after construction) before any forward call.
-    // Per-layer upload progress is logged (LOG_INFO) as it goes. `seed` seeds the sampling RNG.
-    ModelRuntime(const ModelSpec& spec, int max_ctx, int max_batch_tokens, uint32_t seed);
+    // Load the weights described by `spec` (safetensors, from spec.dir); cfg bounds the per-sequence
+    // KV cache (max_ctx) and the query rows per forward (max_batch_tokens), and seeds the sampling RNG.
+    // Allocates weights + activation scratch only — the paged KV pool lives in a separate BlockPool;
+    // attach one (sized from the VRAM left after construction) before any forward call. Per-layer
+    // upload progress is logged (LOG_INFO) as it goes.
+    ModelRuntime(const ModelSpec& spec, const RuntimeConfig& cfg);
     void attach_pool(const BlockPool& pool) { pool_ = &pool; }   // non-owning; storage for the attention kernels
     ~ModelRuntime();
 

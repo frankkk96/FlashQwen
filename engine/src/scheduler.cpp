@@ -3,15 +3,8 @@
 #include <numeric>
 #include <string>
 
-Scheduler::Scheduler(ModelRuntime& model, KVCacheManager& kv, int n_slots, int max_queue,
-                     int max_batch_tokens, int max_prefill)
-    : model_(model), kv_(kv) {
-    n_slots_          = std::min(n_slots, model_.max_batch());
-    max_queue_        = max_queue;
-    max_batch_tokens_ = max_batch_tokens;
-    max_prefill_      = max_prefill;
-    bsz_              = kv_.block_size();
-}
+Scheduler::Scheduler(ModelRuntime& model, KVCacheManager& kv, const SchedulerConfig& cfg)
+    : model_(model), kv_(kv), cfg_(cfg) {}
 
 void Scheduler::release(Request* r) {
     kv_.free(r->blocks());   // return blocks to the pool and clear the table
@@ -31,7 +24,7 @@ int Scheduler::chunk_size(const Request* r, int budget) const {
     int remaining = r->remaining();
     if (remaining <= 0) return 0;
     int n = std::min(remaining, budget);
-    if (remaining > 1) n = std::min(n, max_prefill_);   // chunk long prefills
+    if (remaining > 1) n = std::min(n, cfg_.max_prefill);   // chunk long prefills
     return n;
 }
 
@@ -48,7 +41,7 @@ bool Scheduler::grow(Request* r, int upto) {
         if (k < 0) {   // nobody else to preempt: r alone can't fit the pool -> fail it
             if (r->sink()) r->sink()->error(EngineErrc::OverCapacity,
                 "out of KV cache: pool has " + std::to_string(kv_.num_blocks()) +
-                " blocks of " + std::to_string(bsz_) + " tokens, cannot grow a sequence to " +
+                " blocks of " + std::to_string(kv_.block_size()) + " tokens, cannot grow a sequence to " +
                 std::to_string(upto) + " tokens");
             retire(r);
             return false;
@@ -73,7 +66,7 @@ void Scheduler::step() {
         else ++it;
     }
     // 2. admit waiters into the running set while slots are free
-    while ((int)running_.size() < n_slots_ && !waiting_.empty()) {
+    while ((int)running_.size() < cfg_.n_slots && !waiting_.empty()) {
         running_.push_back(std::move(waiting_.front()));
         waiting_.pop_front();
     }
@@ -90,7 +83,7 @@ void Scheduler::step() {
         std::iota(order.begin(), order.end(), 0);
         std::stable_sort(order.begin(), order.end(),
             [&](int a, int b) { return running_[a]->remaining() < running_[b]->remaining(); });
-        int budget = max_batch_tokens_;
+        int budget = cfg_.max_batch_tokens;
         for (int idx : order) {
             if (budget <= 0) break;
             Request* r = running_[idx].get();
@@ -127,11 +120,11 @@ void Scheduler::run() {
         while (!incoming.empty()) {
             auto r = std::move(incoming.front()); incoming.pop_front();
             // admission control: reject when the waiting queue is full -> over-capacity
-            if (max_queue_ > 0 && (int)waiting_.size() >= max_queue_) {
+            if (cfg_.max_queue > 0 && (int)waiting_.size() >= cfg_.max_queue) {
                 if (r->sink()) r->sink()->error(EngineErrc::OverCapacity,
                     "request queue full: " + std::to_string(waiting_.size()) +
-                    " requests already waiting (limit " + std::to_string(max_queue_) +
-                    "), engine running up to " + std::to_string(n_slots_) +
+                    " requests already waiting (limit " + std::to_string(cfg_.max_queue) +
+                    "), engine running up to " + std::to_string(cfg_.n_slots) +
                     " concurrent sequences; retry shortly");
                 // r is dropped here; the handler's sink ref still delivers the error event.
             } else {

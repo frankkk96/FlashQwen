@@ -78,10 +78,10 @@ ModelRuntime::QWeight ModelRuntime::upload_int8(const std::string& name) {
     return qw;
 }
 
-ModelRuntime::ModelRuntime(const ModelSpec& spec, int max_ctx, int max_batch_tokens, uint32_t seed)
-    : spec_(spec), rng_(seed) {
-    max_ctx_  = ((max_ctx + 15) / 16) * 16;   // round up so WMMA tiles never read past buffers
-    max_rows_ = std::max(max_ctx_, ((max_batch_tokens + 15) / 16) * 16);  // query rows per forward
+ModelRuntime::ModelRuntime(const ModelSpec& spec, const RuntimeConfig& cfg)
+    : spec_(spec), rng_(cfg.seed) {
+    max_ctx_  = ((cfg.max_ctx + 15) / 16) * 16;   // round up so WMMA tiles never read past buffers
+    max_rows_ = std::max(max_ctx_, ((cfg.max_batch_tokens + 15) / 16) * 16);  // query rows per forward
     LOG_INFO("[model] loading weights from %s ...", spec_.dir.c_str());
     st_.load_dir(spec_.dir);
 

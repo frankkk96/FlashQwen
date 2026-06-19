@@ -129,10 +129,17 @@ struct CurrentBatch {
     }
 };
 
+// Scheduler tuning knobs, resolved from CLI Args in run_engine (defaults already applied).
+struct SchedulerConfig {
+    int n_slots;          // max concurrent sequences (already clamped to model.max_batch())
+    int max_queue;        // admission cap on waiting requests before rejecting as over-capacity
+    int max_batch_tokens; // total query rows computed per step
+    int max_prefill;      // per-request prefill chunk cap
+};
+
 class Scheduler {
 public:
-    Scheduler(ModelRuntime& model, KVCacheManager& kv, int n_slots, int max_queue,
-              int max_batch_tokens, int max_prefill);
+    Scheduler(ModelRuntime& model, KVCacheManager& kv, const SchedulerConfig& cfg);
 
     // submit() hands a new request to the engine (thread-safe; called by gRPC handler threads).
     // run() is the engine thread: it drains submitted requests and drives the batching loop forever.
@@ -153,7 +160,7 @@ private:
 
     ModelRuntime& model_;
     KVCacheManager& kv_;
-    int  n_slots_, max_queue_, bsz_, max_batch_tokens_, max_prefill_;
+    const SchedulerConfig cfg_;
 
     // cross-thread handoff: handler threads push to inbound_ via submit(); run() drains it.
     std::mutex inbound_mu_;
