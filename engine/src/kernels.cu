@@ -144,9 +144,10 @@ __global__ void attention_flash_kernel(const bf16* __restrict__ q, int q_stride,
                                        const bf16* __restrict__ cache_v, bf16* __restrict__ out,
                                        int n_heads, int n_kv, int head_dim,
                                        const int* __restrict__ pos, const int* __restrict__ qstart,
-                                       const int* __restrict__ qlen, const int* __restrict__ bt,
+                                       const int* __restrict__ qlen, const int* __restrict__ rids,
+                                       const int* __restrict__ bt,
                                        int max_blocks, int block_size, float scale) {
-    int r     = blockIdx.z;            // request
+    int r     = rids[blockIdx.z];      // request (grid slot -> actual request id)
     int h     = blockIdx.y;            // query head
     int qtile = blockIdx.x;            // query-row tile within the request
     int warp  = threadIdx.x >> 5;      // 0..BM-1: this warp's query row within the tile
@@ -232,16 +233,115 @@ __global__ void attention_flash_kernel(const bf16* __restrict__ q, int q_stride,
 void launch_attention_flash(const bf16* q, int q_stride, const bf16* cache_k, const bf16* cache_v,
                             bf16* out, int n_heads, int n_kv, int head_dim,
                             const int* pos, const int* qstart, const int* qlen,
-                            int R, int max_qlen,
+                            const int* rids, int R, int max_qlen,
                             const int* bt, int max_blocks, int block_size, float scale,
                             cudaStream_t s) {
+    if (R <= 0) return;
     constexpr int BM = 16;                         // query rows (warps) per block
     int qtiles = (max_qlen + BM - 1) / BM;
     dim3 grid(qtiles, n_heads, R);
     size_t shmem = 2 * (size_t)block_size * head_dim * sizeof(bf16);
     // head_dim 128 -> DPL 4 (one warp covers 128 dims, 4 per lane). Qwen3 head_dim is always 128.
     attention_flash_kernel<BM, 4><<<grid, BM * 32, shmem, s>>>(
-        q, q_stride, cache_k, cache_v, out, n_heads, n_kv, head_dim, pos, qstart, qlen, bt,
+        q, q_stride, cache_k, cache_v, out, n_heads, n_kv, head_dim, pos, qstart, qlen, rids, bt,
+        max_blocks, block_size, scale);
+}
+
+// ---------------------------------------------------------------------------------------
+// Decode-only attention (q_len == 1 per request). One block = (query head blockIdx.x, decode-request
+// blockIdx.y). The block's NW warps split the request's KV [0, qpos] into strided slices (warp w takes
+// key positions w, w+NW, ...), each running an online softmax in registers over its slice — K/V are
+// read straight from the paged cache (one query row has no cross-row reuse, so shared-memory staging
+// would only add traffic + syncs). The NW per-warp partials (m, l, acc) are then merged by one warp
+// through shared memory. This gives full warp occupancy and NW-way KV parallelism, unlike the unified
+// kernel's single active warp serially scanning all KV tiles in the q_len==1 case.
+// ---------------------------------------------------------------------------------------
+template<int NW, int DPL>
+__global__ void decode_attn_kernel(const bf16* __restrict__ q, int q_stride,
+                                   const bf16* __restrict__ cache_k, const bf16* __restrict__ cache_v,
+                                   bf16* __restrict__ out, int n_heads, int n_kv, int head_dim,
+                                   const int* __restrict__ pos, const int* __restrict__ qstart,
+                                   const int* __restrict__ decode_rids, const int* __restrict__ bt,
+                                   int max_blocks, int block_size, float scale) {
+    int h    = blockIdx.x;             // query head
+    int di   = blockIdx.y;             // decode-request slot
+    int w    = threadIdx.x >> 5;       // 0..NW-1: this warp's KV split
+    int lane = threadIdx.x & 31;
+
+    int r    = decode_rids[di];
+    int flat = qstart[r];              // the single query row (q_len == 1)
+    int qpos = pos[flat];              // attends keys [0, qpos]
+    int kvh  = h / (n_heads / n_kv);
+    int kv_dim = n_kv * head_dim;
+    const int* btr = bt + (size_t)r * max_blocks;
+
+    float qreg[DPL];
+    const bf16* qv = q + (size_t)flat * q_stride + (size_t)h * head_dim;
+    #pragma unroll
+    for (int i = 0; i < DPL; ++i) qreg[i] = __bfloat162float(qv[lane + (i << 5)]);
+
+    float m_run = -1e30f, l_run = 0.f, acc[DPL];
+    #pragma unroll
+    for (int i = 0; i < DPL; ++i) acc[i] = 0.f;
+
+    // warp w streams key positions w, w+NW, w+2NW, ... <= qpos, reading K/V directly from the pool.
+    for (int kpos = w; kpos <= qpos; kpos += NW) {
+        size_t base = (size_t)btr[kpos / block_size] * block_size * kv_dim
+                    + (size_t)(kpos % block_size) * kv_dim + (size_t)kvh * head_dim;
+        const bf16* kc = cache_k + base;
+        float partial = 0.f;
+        #pragma unroll
+        for (int i = 0; i < DPL; ++i) partial += qreg[i] * __bfloat162float(kc[lane + (i << 5)]);
+        #pragma unroll
+        for (int o = 16; o > 0; o >>= 1) partial += __shfl_xor_sync(0xffffffff, partial, o);
+        float score = partial * scale;
+
+        float m_new = fmaxf(m_run, score);
+        float corr  = __expf(m_run - m_new);
+        float p     = __expf(score - m_new);
+        l_run = l_run * corr + p;
+        const bf16* vc = cache_v + base;
+        #pragma unroll
+        for (int i = 0; i < DPL; ++i) acc[i] = acc[i] * corr + p * __bfloat162float(vc[lane + (i << 5)]);
+        m_run = m_new;
+    }
+
+    // in-block combine of the NW partials (online-softmax merge), done by warp 0.
+    __shared__ float sm[NW], sl[NW], sacc[NW][DPL * 32];
+    sm[w] = m_run; sl[w] = l_run;
+    #pragma unroll
+    for (int i = 0; i < DPL; ++i) sacc[w][lane + (i << 5)] = acc[i];
+    __syncthreads();
+
+    if (w == 0) {
+        float gm = -1e30f;
+        #pragma unroll
+        for (int s = 0; s < NW; ++s) gm = fmaxf(gm, sm[s]);
+        float gl = 0.f, gacc[DPL];
+        #pragma unroll
+        for (int i = 0; i < DPL; ++i) gacc[i] = 0.f;
+        for (int s = 0; s < NW; ++s) {
+            float sc = __expf(sm[s] - gm);
+            gl += sl[s] * sc;
+            #pragma unroll
+            for (int i = 0; i < DPL; ++i) gacc[i] += sacc[s][lane + (i << 5)] * sc;
+        }
+        float inv = gl > 0.f ? 1.0f / gl : 0.f;
+        bf16* o = out + ((size_t)flat * n_heads + h) * head_dim;
+        #pragma unroll
+        for (int i = 0; i < DPL; ++i) o[lane + (i << 5)] = __float2bfloat16(gacc[i] * inv);
+    }
+}
+
+void launch_decode_attention(const bf16* q, int q_stride, const bf16* cache_k, const bf16* cache_v,
+                             bf16* out, int n_heads, int n_kv, int head_dim,
+                             const int* pos, const int* qstart, const int* decode_rids, int n_decode,
+                             const int* bt, int max_blocks, int block_size, float scale, cudaStream_t s) {
+    if (n_decode <= 0) return;
+    constexpr int NW = 8;              // warps per block = KV splits
+    dim3 grid(n_heads, n_decode);
+    decode_attn_kernel<NW, 4><<<grid, NW * 32, 0, s>>>(
+        q, q_stride, cache_k, cache_v, out, n_heads, n_kv, head_dim, pos, qstart, decode_rids, bt,
         max_blocks, block_size, scale);
 }
 

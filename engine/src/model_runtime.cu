@@ -129,6 +129,8 @@ ModelRuntime::ModelRuntime(const ModelSpec& spec, const RuntimeConfig& cfg)
     CUDA_CHECK(cudaMalloc(&d_req_, max_rows_ * sizeof(int)));
     CUDA_CHECK(cudaMalloc(&d_qstart_, MAX_DECODE_B * sizeof(int)));
     CUDA_CHECK(cudaMalloc(&d_qlen_,   MAX_DECODE_B * sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&d_decode_rids_,  MAX_DECODE_B * sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&d_prefill_rids_, MAX_DECODE_B * sizeof(int)));
     // Paged-KV block tables: up to MAX_DECODE_B requests, padded to the longest block table.
     max_blocks_ = (max_ctx_ + BlockPool::BLOCK - 1) / BlockPool::BLOCK;
     CUDA_CHECK(cudaMalloc(&d_bt_, (size_t)MAX_DECODE_B * max_blocks_ * sizeof(int)));
@@ -139,6 +141,7 @@ ModelRuntime::ModelRuntime(const ModelSpec& spec, const RuntimeConfig& cfg)
     CUDA_CHECK(cudaMalloc(&d_u_,     MAX_DECODE_B * sizeof(float)));
     host_bt_.resize((size_t)MAX_DECODE_B * max_blocks_);
     host_qstart_.resize(MAX_DECODE_B); host_qlen_.resize(MAX_DECODE_B);
+    host_decode_rids_.resize(MAX_DECODE_B); host_prefill_rids_.resize(MAX_DECODE_B);
     host_invT_.resize(MAX_DECODE_B); host_topp_.resize(MAX_DECODE_B); host_u_.resize(MAX_DECODE_B);
     CUDA_CHECK(cudaStreamCreate(&stream_));
     CUBLAS_CHECK(cublasCreate(&cublas_));
@@ -196,8 +199,12 @@ void ModelRuntime::run_layers(int T, int R, int max_qlen) {
         // append each row's new K/V at its position, read straight from the fused buffer.
         launch_store_kv_paged(qkv_, QD,        QKV, pool_->k(l), d_bt_, bt_stride_, blk, KVD, d_req_, d_pos_, T, s);
         launch_store_kv_paged(qkv_, QD + KVD,  QKV, pool_->v(l), d_bt_, bt_stride_, blk, KVD, d_req_, d_pos_, T, s);
+        // attention, dispatched per request type (both write disjoint rows of attn_):
+        launch_decode_attention(qkv_, QKV, pool_->k(l), pool_->v(l), attn_, nH, nKV, hd,
+                                d_pos_, d_qstart_, d_decode_rids_, n_decode_, d_bt_, bt_stride_, blk, scale, s);
         launch_attention_flash(qkv_, QKV, pool_->k(l), pool_->v(l), attn_, nH, nKV, hd,
-                               d_pos_, d_qstart_, d_qlen_, R, max_qlen, d_bt_, bt_stride_, blk, scale, s);
+                               d_pos_, d_qstart_, d_qlen_, d_prefill_rids_, n_prefill_, prefill_max_qlen_,
+                               d_bt_, bt_stride_, blk, scale, s);
 
         gemm(attn_, L.o_proj, xb2_, T, QD, H, CUDA_R_16BF);
         // post-attention norm: fuse the attention residual (xb2_) into the norm. x_ now carries it.
@@ -245,6 +252,16 @@ void ModelRuntime::forward_core(const ForwardInput& in) {
     CUDA_CHECK(cudaMemcpy(d_qstart_, host_qstart_.data(), R * sizeof(int), cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(d_qlen_,   host_qlen_.data(),   R * sizeof(int), cudaMemcpyHostToDevice));
 
+    // Split requests by type so attention runs the right kernel on each: decode (q_len==1) gets the
+    // FlashDecoding kernel, prefill (q_len>1) the tiled kernel. Both write disjoint rows of attn_.
+    n_decode_ = n_prefill_ = 0; prefill_max_qlen_ = 1;
+    for (int r = 0; r < R; ++r) {
+        if (host_qlen_[r] == 1) host_decode_rids_[n_decode_++] = r;
+        else { host_prefill_rids_[n_prefill_++] = r; prefill_max_qlen_ = std::max(prefill_max_qlen_, host_qlen_[r]); }
+    }
+    if (n_decode_)  CUDA_CHECK(cudaMemcpy(d_decode_rids_,  host_decode_rids_.data(),  n_decode_  * sizeof(int), cudaMemcpyHostToDevice));
+    if (n_prefill_) CUDA_CHECK(cudaMemcpy(d_prefill_rids_, host_prefill_rids_.data(), n_prefill_ * sizeof(int), cudaMemcpyHostToDevice));
+
     run_layers(T, R, max_qlen);
 
     if (S > 0) {
@@ -286,6 +303,7 @@ ModelRuntime::~ModelRuntime() {
     cudaFree(attn_); cudaFree(gateup_); cudaFree(hmlp_); cudaFree(xg_); cudaFree(logits_);
     cudaFree(d_ids_); cudaFree(d_pos_); cudaFree(d_req_);
     cudaFree(d_qstart_); cudaFree(d_qlen_);
+    cudaFree(d_decode_rids_); cudaFree(d_prefill_rids_);
     cudaFree(d_bt_); cudaFree(d_lrows_); cudaFree(d_arg_);
     cudaFree(d_invT_); cudaFree(d_topp_); cudaFree(d_u_);
     if (cublas_) cublasDestroy(cublas_);

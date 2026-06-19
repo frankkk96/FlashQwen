@@ -116,11 +116,14 @@ private:
     float *logits_ = nullptr;          // [S, vocab] FP32 (lm_head output -> sampling)
     int   *d_ids_, *d_pos_, *d_req_;   // per-row: token id, absolute position, request index
     int   *d_qstart_, *d_qlen_;        // per-request: flat row offset, row count (attention grouping)
+    int   *d_decode_rids_, *d_prefill_rids_;   // request ids split by type (qlen==1 decode vs qlen>1 prefill)
+    int    n_decode_ = 0, n_prefill_ = 0, prefill_max_qlen_ = 1;   // attention dispatch split (per step)
     int   *d_bt_;                      // packed per-request block tables [R, bt_stride_]
     int   *d_lrows_, *d_arg_;          // sampling-row indices [S]; sampled-token output [S]
     float *d_invT_, *d_topp_, *d_u_;   // per-sampling-row: 1/temp, nucleus cutoff, uniform draw [S]
     std::vector<int>   host_bt_;       // scratch to pack padded block tables for upload
     std::vector<int>   host_qstart_, host_qlen_;          // scratch for the per-request attention grouping
+    std::vector<int>   host_decode_rids_, host_prefill_rids_;   // scratch for the attention type split
     std::vector<float> host_invT_, host_topp_, host_u_;   // scratch for the per-row sampling inputs
     std::mt19937 rng_;                 // sampling RNG (per-row uniforms generated on the host)
 
