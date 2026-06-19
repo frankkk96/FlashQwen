@@ -47,6 +47,7 @@ FlashQwen's single-stream decode.)
 | R1 | unified token-budget scheduler + GPU sampling | 25.0 | 87.2 | 12.5% | 5065b2e |
 | R2 | scheduler/kernel refactor (perf-neutral, Δ0) | 24.9 | 87.4 | 12.5% | 291cb74 |
 | S3 | bf16 weights + cuBLAS GEMM + FlashAttention-2 | 38.2 | **350.0** | **50.1%** | 7650654 |
+| S5 | kernel fusion: fused QKV/gate-up GEMM, add+rmsnorm, RoPE table | 39.1 | 356.1 | 51.0% | c2f98a0 |
 
 ## Step entries
 
@@ -114,5 +115,34 @@ FlashQwen's single-stream decode.)
 - **Decision**: reverted to S3 (commit 7650654). Kept here as the record that the attention lever is
   spent — the next real levers are launch-overhead (CUDA graphs / kernel fusion) and the throughput
   features vLLM has (persistent batch, prefix caching).
+
+### S5 — kernel fusion: fused QKV/gate-up GEMM, add+rmsnorm, RoPE table (landed)
+- **Target**: the per-step launch + redundant-traffic overhead S3 named as the remaining conc=32 lever
+  (~720 kernel launches/step). Three fusions, all bf16-identical math:
+  1. **Fused QKV and gate|up GEMMs.** q/k/v proj weights are concatenated on the OUT dim into one
+     `wqkv` ([q_dim+2·kv_dim, H]) at load, likewise gate+up into `wgateup` ([2·I, H]); one
+     `cublasGemmEx` each replaces 3 and 2. Downstream kernels read the interleaved fused buffers via
+     offset/stride: a new fused **per-head RMSNorm+RoPE** kernel normalizes+rotates the q and k slices
+     in place, `store_kv` reads k/v straight from the QKV buffer, attention takes a `q_stride`, and
+     `silu_mul` reads gate/up as the two halves of one row.
+  2. **Fused residual-add + RMSNorm.** `add_rmsnorm` does `x += residual` (written back, carrying the
+     residual forward) then `rmsnorm(x)` in one pass — replaces a separate `add` + `rmsnorm`, saving a
+     full H read/write of x and a launch per residual. run_layers restructured so every norm but the
+     first consumes the pending residual; one trailing `add` commits the last layer's MLP residual.
+  3. **Precomputed RoPE cos/sin table.** Angles depend only on (pos, i) and are identical across all
+     36 layers; the old kernel recomputed `powf/cosf/sinf` per element per layer (36× waste). Now a
+     `[max_ctx, head_dim/2]` table is built once at startup and looked up (folded into the fused
+     norm+rope kernel).
+  - Net: ~19 → 12 kernel launches per layer (~252 fewer/step, ~720 → ~470).
+- **Result vs S3**: conc=1 38.2 → **39.1 (+2.3%)**; conc=32 350.0 → **356.1 (+1.7%, within noise)**.
+  Greedy output verified coherent.
+- **Lesson**: removing ~250 launches/step + redundant elementwise traffic barely moved conc=32 — so at
+  conc=32 the launch/elementwise overhead is a **small fraction**; the skinny decode **GEMMs dominate**
+  (each step streams all 17 GB of bf16 weights from HBM). This recalibrates the roadmap: the
+  "~720 launches" figure overstated the lever. **CUDA graphs will help conc=1 (latency-bound) more than
+  conc=32**; closing the remaining 2× at conc=32 needs GEMM-side wins (cuBLASLt autotuning / better
+  decode-GEMM shapes) or the throughput features vLLM has (larger effective batch, prefix caching), not
+  just launch elision. The fusions are kept regardless — correct, cleaner, and they pre-stage the
+  persistent-buffer layout CUDA-graph capture will want.
 
 <!-- Append one ### entry per landed step: What / Why / Change / Result (vs prev) / Lesson -->
