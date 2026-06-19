@@ -262,7 +262,7 @@ __global__ void attn_prefill_kernel(const bf16* __restrict__ q, int q_stride,
     __shared__ float Ss[TILE * TILE];         // S tile scratch (fp32)
     __shared__ __nv_bfloat16 Ps[TILE * TILE]; // softmaxed P tile (bf16) for P*V
     __shared__ float Os[TILE * HD];           // O accumulator (fp32, persists across K tiles)
-    __shared__ float PVt[TILE * HD];          // per-tile P*V result before the rescale-add
+    __shared__ float Ot[TILE * TILE];         // one 16x16 P*V d-tile (folded into Os immediately)
     __shared__ float m_[TILE], l_[TILE], corr_[TILE];
 
     for (int e = lane; e < TILE * HD; e += 32) Os[e] = 0.f;
@@ -313,11 +313,9 @@ __global__ void attn_prefill_kernel(const bf16* __restrict__ q, int q_stride,
         }
         __syncthreads();
 
-        // rescale the running O by this tile's correction factor
-        for (int e = lane; e < TILE * HD; e += 32) Os[e] *= corr_[e / HD];
-        __syncthreads();
-
-        // P * V  -> PVt, then add into O
+        // P*V folded with the running-O rescale, one 16x16 d-tile at a time (no full [16,128] temp):
+        // Os[:,d] = Os[:,d]*corr + (P*V)[:,d]. Each Os element is rescaled exactly once (when its own
+        // d-tile is processed). Shrinks shared (~18KB -> ~11KB) so more blocks/warps stay resident.
         #pragma unroll
         for (int d = 0; d < ND; ++d) {
             wmma::fragment<wmma::accumulator, 16, 16, 16, float> pv;
@@ -325,11 +323,15 @@ __global__ void attn_prefill_kernel(const bf16* __restrict__ q, int q_stride,
             wmma::load_matrix_sync(pf, Ps, TILE);
             wmma::load_matrix_sync(vf, cache_v + kvbase + d * 16, kv_dim);
             wmma::mma_sync(pv, pf, vf, pv);
-            wmma::store_matrix_sync(PVt + d * 16, pv, HD, wmma::mem_row_major);
+            wmma::store_matrix_sync(Ot, pv, TILE, wmma::mem_row_major);
+            __syncthreads();
+            for (int e = lane; e < TILE * TILE; e += 32) {
+                int row = e / TILE, col = e % TILE;
+                int oidx = row * HD + d * 16 + col;
+                Os[oidx] = Os[oidx] * corr_[row] + Ot[e];
+            }
+            __syncthreads();
         }
-        __syncthreads();
-        for (int e = lane; e < TILE * HD; e += 32) Os[e] += PVt[e];
-        __syncthreads();
     }
 
     // normalize and write out the active rows
