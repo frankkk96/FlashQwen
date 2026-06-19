@@ -1,5 +1,7 @@
 #include "kernels.cuh"
 #include "kv_cache.cuh"   // kv_phys_row: the paged-KV addressing contract (shared with block_pool.cu)
+#include <mma.h>
+using namespace nvcuda;
 
 // ---------------------------------------------------------------------------------------
 // rmsnorm: one block per row, block-reduction over H. BF16 in/out, FP32 reduction + scale.
@@ -343,6 +345,141 @@ void launch_decode_attention(const bf16* q, int q_stride, const bf16* cache_k, c
     decode_attn_kernel<NW, 4><<<grid, NW * 32, 0, s>>>(
         q, q_stride, cache_k, cache_v, out, n_heads, n_kv, head_dim, pos, qstart, decode_rids, bt,
         max_blocks, block_size, scale);
+}
+
+// ---------------------------------------------------------------------------------------
+// Prefill attention via tensor cores (WMMA 16x16x16, bf16 in / fp32 accumulate). FlashAttention-2:
+// streams K/V in 16-key tiles (= one paged block, since block_size==16), no S materialization, online
+// softmax with deferred normalization, O kept in shared fp32 and rescaled per tile (no WMMA
+// fragment-layout assumptions). One warp per (16-query-tile, head, request). Q is read straight from
+// the fused-QKV buffer and K/V straight from the paged cache (one tile == one page), all as WMMA loads.
+// HD == 128 (8 d-steps of 16); requires block_size == 16.
+// ---------------------------------------------------------------------------------------
+__global__ void attention_prefill_wmma_kernel(const bf16* __restrict__ q, int q_stride,
+                                              const bf16* __restrict__ cache_k,
+                                              const bf16* __restrict__ cache_v, bf16* __restrict__ out,
+                                              int n_heads, int n_kv,
+                                              const int* __restrict__ pos, const int* __restrict__ qstart,
+                                              const int* __restrict__ qlen, const int* __restrict__ rids,
+                                              const int* __restrict__ bt, int max_blocks, float scale) {
+    constexpr int HD = 128, ND = HD / 16, TILE = 16;
+    int r  = rids[blockIdx.z];
+    int h  = blockIdx.y;
+    int qt = blockIdx.x;
+    int lane = threadIdx.x & 31;
+
+    int ql = qlen[r];
+    int q0 = qt * TILE;                       // first query row (within request) of this tile
+    if (q0 >= ql) return;                     // tile entirely past the request's rows
+    int qs  = qstart[r];
+    int kvh = h / (n_heads / n_kv);
+    int kv_dim = n_kv * HD;
+    const int* btr = bt + (size_t)r * max_blocks;
+
+    // last active row's position bounds the key range (positions increase within a request).
+    int last = min(q0 + TILE - 1, ql - 1);
+    int maxqpos = pos[qs + last];
+    int ntiles = maxqpos / TILE + 1;
+
+    __shared__ float Ss[TILE * TILE];         // S tile scratch (fp32)
+    __shared__ __nv_bfloat16 Ps[TILE * TILE]; // softmaxed P tile (bf16) for P*V
+    __shared__ float Os[TILE * HD];           // O accumulator (fp32, persists across K tiles)
+    __shared__ float PVt[TILE * HD];          // per-tile P*V result before the rescale-add
+    __shared__ float m_[TILE], l_[TILE], corr_[TILE];
+
+    for (int e = lane; e < TILE * HD; e += 32) Os[e] = 0.f;
+    if (lane < TILE) { m_[lane] = -1e30f; l_[lane] = 0.f; }
+    __syncthreads();
+
+    wmma::fragment<wmma::matrix_a, 16, 16, 16, __nv_bfloat16, wmma::row_major> qf;
+    wmma::fragment<wmma::matrix_b, 16, 16, 16, __nv_bfloat16, wmma::col_major> kf;
+    wmma::fragment<wmma::matrix_a, 16, 16, 16, __nv_bfloat16, wmma::row_major> pf;
+    wmma::fragment<wmma::matrix_b, 16, 16, 16, __nv_bfloat16, wmma::row_major> vf;
+
+    for (int kt = 0; kt < ntiles; ++kt) {
+        size_t kvbase = (size_t)btr[kt] * TILE * kv_dim + (size_t)kvh * HD;   // page kt, this kv-head
+
+        // S = Q * K^T  (accumulate over the 8 head-dim steps)
+        wmma::fragment<wmma::accumulator, 16, 16, 16, float> sacc;
+        wmma::fill_fragment(sacc, 0.f);
+        #pragma unroll
+        for (int d = 0; d < ND; ++d) {
+            wmma::load_matrix_sync(qf, q + (size_t)(qs + q0) * q_stride + (size_t)h * HD + d * 16, q_stride);
+            wmma::load_matrix_sync(kf, cache_k + kvbase + d * 16, kv_dim);
+            wmma::mma_sync(sacc, qf, kf, sacc);
+        }
+        wmma::store_matrix_sync(Ss, sacc, TILE, wmma::mem_row_major);
+        __syncthreads();
+
+        // online softmax over this tile's 16 keys (one warp lane per query row)
+        if (lane < TILE) {
+            int grow = q0 + lane;
+            if (grow < ql) {
+                int qpos = pos[qs + grow];
+                float sc[TILE], rmax = -1e30f;
+                #pragma unroll
+                for (int c = 0; c < TILE; ++c) {
+                    int kpos = kt * TILE + c;
+                    sc[c] = (kpos <= qpos) ? Ss[lane * TILE + c] * scale : -1e30f;
+                    rmax = fmaxf(rmax, sc[c]);
+                }
+                float mold = m_[lane], mnew = fmaxf(mold, rmax), corr = __expf(mold - mnew), rsum = 0.f;
+                #pragma unroll
+                for (int c = 0; c < TILE; ++c) { float p = __expf(sc[c] - mnew); Ps[lane * TILE + c] = __float2bfloat16(p); rsum += p; }
+                l_[lane] = l_[lane] * corr + rsum; m_[lane] = mnew; corr_[lane] = corr;
+            } else {
+                #pragma unroll
+                for (int c = 0; c < TILE; ++c) Ps[lane * TILE + c] = __float2bfloat16(0.f);
+                corr_[lane] = 1.f;
+            }
+        }
+        __syncthreads();
+
+        // rescale the running O by this tile's correction factor
+        for (int e = lane; e < TILE * HD; e += 32) Os[e] *= corr_[e / HD];
+        __syncthreads();
+
+        // P * V  -> PVt, then add into O
+        #pragma unroll
+        for (int d = 0; d < ND; ++d) {
+            wmma::fragment<wmma::accumulator, 16, 16, 16, float> pv;
+            wmma::fill_fragment(pv, 0.f);
+            wmma::load_matrix_sync(pf, Ps, TILE);
+            wmma::load_matrix_sync(vf, cache_v + kvbase + d * 16, kv_dim);
+            wmma::mma_sync(pv, pf, vf, pv);
+            wmma::store_matrix_sync(PVt + d * 16, pv, HD, wmma::mem_row_major);
+        }
+        __syncthreads();
+        for (int e = lane; e < TILE * HD; e += 32) Os[e] += PVt[e];
+        __syncthreads();
+    }
+
+    // normalize and write out the active rows
+    for (int e = lane; e < TILE * HD; e += 32) {
+        int row = e / HD, d = e % HD, grow = q0 + row;
+        if (grow < ql) {
+            float inv = l_[row] > 0.f ? 1.0f / l_[row] : 0.f;
+            out[((size_t)(qs + grow) * n_heads + h) * HD + d] = __float2bfloat16(Os[e] * inv);
+        }
+    }
+}
+
+void launch_attention_prefill(const bf16* q, int q_stride, const bf16* cache_k, const bf16* cache_v,
+                              bf16* out, int n_heads, int n_kv, int head_dim,
+                              const int* pos, const int* qstart, const int* qlen,
+                              const int* rids, int R, int max_qlen,
+                              const int* bt, int max_blocks, int block_size, float scale,
+                              cudaStream_t s) {
+    if (R <= 0) return;
+    if (block_size != 16 || head_dim != 128) {   // tile assumptions don't hold -> FMA fallback
+        launch_attention_flash(q, q_stride, cache_k, cache_v, out, n_heads, n_kv, head_dim,
+                               pos, qstart, qlen, rids, R, max_qlen, bt, max_blocks, block_size, scale, s);
+        return;
+    }
+    int qtiles = (max_qlen + 15) / 16;
+    dim3 grid(qtiles, n_heads, R);
+    attention_prefill_wmma_kernel<<<grid, 32, 0, s>>>(
+        q, q_stride, cache_k, cache_v, out, n_heads, n_kv, pos, qstart, qlen, rids, bt, max_blocks, scale);
 }
 
 // Gather S rows: out[i, :] = x[rows[i], :]   (one block per gathered row, BF16)

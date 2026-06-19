@@ -202,9 +202,9 @@ void ModelRuntime::run_layers(int T, int R, int max_qlen) {
         // attention, dispatched per request type (both write disjoint rows of attn_):
         launch_decode_attention(qkv_, QKV, pool_->k(l), pool_->v(l), attn_, nH, nKV, hd,
                                 d_pos_, d_qstart_, d_decode_rids_, n_decode_, d_bt_, bt_stride_, blk, scale, s);
-        launch_attention_flash(qkv_, QKV, pool_->k(l), pool_->v(l), attn_, nH, nKV, hd,
-                               d_pos_, d_qstart_, d_qlen_, d_prefill_rids_, n_prefill_, prefill_max_qlen_,
-                               d_bt_, bt_stride_, blk, scale, s);
+        launch_attention_prefill(qkv_, QKV, pool_->k(l), pool_->v(l), attn_, nH, nKV, hd,
+                                 d_pos_, d_qstart_, d_qlen_, d_prefill_rids_, n_prefill_, prefill_max_qlen_,
+                                 d_bt_, bt_stride_, blk, scale, s);
 
         gemm(attn_, L.o_proj, xb2_, T, QD, H, CUDA_R_16BF);
         // post-attention norm: fuse the attention residual (xb2_) into the norm. x_ now carries it.
