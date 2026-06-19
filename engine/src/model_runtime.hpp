@@ -10,6 +10,19 @@
 #include <string>
 #include <functional>
 
+// One merged forward's inputs — a flattened mixed batch (prefill chunks + decodes together).
+//   tokens[t], positions[t]  : the t-th query row's token id and its absolute logical position
+//   req_index[t]             : which request that row belongs to (0..R-1)
+//   block_tables[r]          : request r's physical KV block ids (row r of the uploaded table)
+//   logits_rows[s]           : the flattened row index whose logits feed sampling for request s
+struct ForwardInput {
+    std::vector<int> tokens, positions, req_index, logits_rows;
+    std::vector<std::vector<int>> block_tables;
+    void clear() { tokens.clear(); positions.clear(); req_index.clear();
+                   logits_rows.clear(); block_tables.clear(); }
+    int rows() const { return (int)tokens.size(); }
+};
+
 class ModelRuntime {
 public:
     // Load the weights described by `spec` (safetensors, from spec.dir). max_ctx bounds the
@@ -24,21 +37,12 @@ public:
     ~ModelRuntime();
 
     // --- one merged forward over a flattened mixed batch (prefill chunks + decodes together) ----
-    // The whole running set is computed in one pass. The inputs describe the flattened batch:
-    //   tokens[t], positions[t]  : the t-th query row's token id and its absolute logical position
-    //   req_index[t]             : which request that row belongs to (0..R-1)
-    //   block_tables[r]          : request r's physical KV block ids (row r of the uploaded table)
-    //   logits_rows[s]           : the flattened row index whose logits feed sampling for request s
-    //                              (the last row of each request that has reached its frontier)
-    // forward(): greedy argmax per sampling row, on the GPU -> out_tokens[S].
-    // forward_logits_host(): run the same forward and copy the [S, vocab] logits to the host
-    // (row-major) for per-request sampling; the returned pointer is valid until the next call.
-    void forward(const std::vector<int>& tokens, const std::vector<int>& positions,
-                 const std::vector<int>& req_index, const std::vector<std::vector<int>>& block_tables,
-                 const std::vector<int>& logits_rows, std::vector<int>& out_tokens);
-    const float* forward_logits_host(const std::vector<int>& tokens, const std::vector<int>& positions,
-                 const std::vector<int>& req_index, const std::vector<std::vector<int>>& block_tables,
-                 const std::vector<int>& logits_rows);
+    // The whole running set is computed in one pass (see ForwardInput). forward(): greedy argmax per
+    // sampling row, on the GPU -> out_tokens[S]. forward_logits_host(): run the same forward and copy
+    // the [S, vocab] logits to the host (row-major) for per-request sampling; the returned pointer is
+    // valid until the next call. S = in.logits_rows.size().
+    void forward(const ForwardInput& in, std::vector<int>& out_tokens);
+    const float* forward_logits_host(const ForwardInput& in);
 
     const ModelSpec& spec() const { return spec_; }
     int max_ctx() const { return max_ctx_; }
@@ -61,10 +65,7 @@ private:
     void mm(const float* x, const QWeight& w, float* y, int M, int IN, int OUT, bool pure_decode);
     void run_layers(int T, bool pure_decode);
     void upload_block_tables(const std::vector<std::vector<int>>& bts);   // -> d_bt_, sets bt_stride_
-    void forward_core(const std::vector<int>& tokens, const std::vector<int>& positions,
-                      const std::vector<int>& req_index,
-                      const std::vector<std::vector<int>>& block_tables,
-                      const std::vector<int>& logits_rows);   // -> logits_ [S, vocab], returns S rows
+    void forward_core(const ForwardInput& in);   // -> logits_ [S, vocab]
 
     ModelSpec spec_;
     SafeTensors st_;

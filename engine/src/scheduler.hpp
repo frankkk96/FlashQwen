@@ -2,24 +2,25 @@
 //
 // There is no prefill/decode split: every request is "advance me by num_new tokens from my computed
 // cursor". Each step fills a token budget — decode requests (num_new=1) first, then prefill chunks of
-// waiting/continuing requests — packs them all into ONE flattened batch, and runs a single merged
-// forward (see ModelRuntime::forward). Blocks are handed out on demand as a request grows; when the
-// pool is exhausted the youngest running request is preempted (its blocks freed, its KV recomputed
-// from prompt+output when it is later resumed).
+// waiting/continuing requests — packs them all into ONE flattened batch (a ForwardInput), and runs a
+// single merged forward (ModelRuntime::forward). Blocks are handed out on demand as a request grows;
+// when the pool is exhausted the youngest running request is preempted (its blocks freed, its KV
+// recomputed from prompt+output when it is later resumed).
 //
-// Three knobs: n_slots (max concurrent requests), max_batch_tokens (total query rows per step), and
-// max_prefill (per-request prefill chunk cap). The loop is driven through callbacks: add() enqueues,
-// step() advances one iteration and reports tokens / finishes / errors. A request stops when it
-// samples one of its own stop_ids or reaches max_new — the scheduler has no built-in notion of EOS.
+// The scheduler OWNS its requests (unique_ptr). Results stream out through each request's OutputSink
+// (token / done / error) — no callbacks, no central registry. Cancellation is a flag the transport
+// sets on the sink, polled at the top of each step. Three knobs: n_slots (max concurrent requests),
+// max_batch_tokens (total query rows per step), max_prefill (per-request prefill chunk cap).
 #pragma once
 #include "model_runtime.hpp"
 #include "kv_cache.hpp"
 #include "sampler.hpp"
 #include "errors.hpp"
+#include "output_sink.hpp"
 #include <vector>
 #include <deque>
+#include <memory>
 #include <random>
-#include <functional>
 #include <string>
 
 struct Request {
@@ -27,6 +28,8 @@ struct Request {
     int max_new = 0;                // input: number of tokens to generate
     SampleParams sp{0.0f, 1.0f};    // input: per-request sampling (temp<=0 => greedy)
     std::vector<int> stop_ids;      // input: stop as soon as one of these is sampled (empty => none)
+    std::shared_ptr<OutputSink> sink;   // input: where this request's results stream out
+
     std::vector<int> output;        // result: generated token ids
 
     // scheduler-internal state
@@ -41,6 +44,15 @@ struct Request {
     }
 };
 
+// One scheduling step's batch: the merged forward input plus the bookkeeping to apply results back.
+struct StepBatch {
+    ForwardInput input;                      // the flattened batch fed to ModelRuntime::forward
+    std::vector<Request*> scheduled;         // requests in this batch (batch order; engine owns them)
+    std::vector<int>      num_new;           // tokens advanced per scheduled request
+    std::vector<Request*> sampling;          // scheduled requests that sample (input.logits_rows order)
+    void clear() { input.clear(); scheduled.clear(); num_new.clear(); sampling.clear(); }
+};
+
 class Scheduler {
 public:
     Scheduler(ModelRuntime& model, KVCacheManager& kv, int n_slots, int max_queue,
@@ -52,36 +64,37 @@ public:
     int  queue_depth() const { return (int)waiting_.size(); }
     int  max_queue() const { return max_queue_; }
 
-    void add(Request* r);           // enqueue a new request (not yet prefilled)
-    void remove(Request* r);        // drop a request (cancellation); frees its blocks. Engine-thread only.
+    void add(std::unique_ptr<Request> r);   // enqueue a new request (engine takes ownership)
     bool busy() const { return !waiting_.empty() || !running_.empty(); }
 
-    using TokenFn  = std::function<void(Request*, int)>;   // fired per produced token id
-    using FinishFn = std::function<void(Request*)>;        // fired once when a request completes
-    using ErrorFn  = std::function<void(Request*, EngineErrc, std::string)>;
-
-    // Advance one scheduling iteration: admit, build a token-budget batch (preempting if the pool is
-    // exhausted), run one merged forward, emit tokens / finishes. No-ops to nullptr callbacks.
-    void step(const TokenFn& on_token = nullptr, const FinishFn& on_finish = nullptr,
-              const ErrorFn& on_error = nullptr);
+    // Advance one scheduling iteration: drop cancelled requests, admit, build a token-budget batch
+    // (preempting if the pool is exhausted), run one merged forward, and stream tokens / finishes /
+    // errors out through each request's sink.
+    void step();
 
 private:
+    void drop_cancelled();                  // release + free any request whose sink was cancelled
+    void admit();                           // waiting -> running while slots are free
+    int  chunk_size(const Request* r, int pass, int budget) const;   // tokens to advance this step
+    bool grow_or_preempt(Request* r, int upto_tokens);  // false => r was failed + freed (rebuild)
+    void append_request(StepBatch& b, Request* r, int n);
+    void build_batch(StepBatch& b);
+    void run_forward(const StepBatch& b, std::vector<int>& sampled);
+    void apply_results(const StepBatch& b, const std::vector<int>& sampled);
+
     bool finished(const Request* r) const;
     bool preempt_one(Request* protect);     // free youngest running seq != protect; requeue for recompute
-    void release(Request* r);               // return a finished/preempted seq's blocks to the pool
+    void release(Request* r);               // return a request's blocks to the pool
+    void erase_running(Request* r);         // drop + free a request from the running set
 
     ModelRuntime& model_;
     KVCacheManager& kv_;
     int  n_slots_, max_queue_, max_ctx_, V_, bsz_, max_batch_tokens_, max_prefill_;
     std::mt19937& rng_;
 
-    std::deque<Request*>  waiting_;          // not yet started / resumed
-    std::vector<Request*> running_;          // resident (prefilling or decoding)
+    std::deque<std::unique_ptr<Request>>  waiting_;   // not yet started / resumed
+    std::vector<std::unique_ptr<Request>> running_;   // resident (prefilling or decoding)
 
-    // per-step scratch: the flattened batch + the bookkeeping to apply results back to requests.
-    std::vector<int> in_tok_, pos_, reqidx_, lrows_, out_;
-    std::vector<std::vector<int>> bts_;
-    std::vector<Request*> sched_;            // requests scheduled this step (batch order)
-    std::vector<int>      sched_new_;        // num_new tokens per scheduled request
-    std::vector<Request*> sampling_;         // scheduled requests that sample this step (lrows_ order)
+    StepBatch        batch_;     // per-step scratch (reused to avoid reallocation)
+    std::vector<int> sampled_;   // greedy sampled tokens (parallel to batch_.sampling)
 };

@@ -212,34 +212,28 @@ void ModelRuntime::upload_block_tables(const std::vector<std::vector<int>>& bts)
 
 // Shared forward: H2D inputs, the unified layer stack, then gather the per-request sampling rows and
 // run final norm + lm_head only on those -> logits_ [S, vocab] on the device. Async on stream_.
-void ModelRuntime::forward_core(const std::vector<int>& tokens, const std::vector<int>& positions,
-                                const std::vector<int>& req_index,
-                                const std::vector<std::vector<int>>& block_tables,
-                                const std::vector<int>& logits_rows) {
-    int T = (int)tokens.size(), R = (int)block_tables.size(), S = (int)logits_rows.size();
+void ModelRuntime::forward_core(const ForwardInput& in) {
+    int T = in.rows(), R = (int)in.block_tables.size(), S = (int)in.logits_rows.size();
     int H = spec_.hidden_size, V = spec_.vocab_size;
-    CUDA_CHECK(cudaMemcpy(d_ids_, tokens.data(),    T * sizeof(int), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_pos_, positions.data(), T * sizeof(int), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_req_, req_index.data(), T * sizeof(int), cudaMemcpyHostToDevice));
-    upload_block_tables(block_tables);
+    CUDA_CHECK(cudaMemcpy(d_ids_, in.tokens.data(),    T * sizeof(int), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_pos_, in.positions.data(), T * sizeof(int), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_req_, in.req_index.data(), T * sizeof(int), cudaMemcpyHostToDevice));
+    upload_block_tables(in.block_tables);
 
     bool pure_decode = (T == R);   // every request contributes exactly one row -> batched INT8 GEMV
     run_layers(T, pure_decode);
 
     if (S > 0) {
-        CUDA_CHECK(cudaMemcpy(d_lrows_, logits_rows.data(), S * sizeof(int), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(d_lrows_, in.logits_rows.data(), S * sizeof(int), cudaMemcpyHostToDevice));
         launch_gather_rows(x_, d_lrows_, xg_, S, H, stream_);
         launch_rmsnorm(xg_, fnorm_, xb_, S, H, spec_.rms_eps, stream_);
         launch_matmul_decode(xb_, lm_head_.w, lm_head_.scale, logits_, S, H, V, stream_);  // INT8 GEMV
     }
 }
 
-void ModelRuntime::forward(const std::vector<int>& tokens, const std::vector<int>& positions,
-                           const std::vector<int>& req_index,
-                           const std::vector<std::vector<int>>& block_tables,
-                           const std::vector<int>& logits_rows, std::vector<int>& out_tokens) {
-    int S = (int)logits_rows.size();
-    forward_core(tokens, positions, req_index, block_tables, logits_rows);
+void ModelRuntime::forward(const ForwardInput& in, std::vector<int>& out_tokens) {
+    int S = (int)in.logits_rows.size();
+    forward_core(in);
     out_tokens.resize(S);
     if (S > 0) {
         launch_argmax_batch(logits_, S, spec_.vocab_size, d_arg_, stream_);   // greedy, on the GPU
@@ -249,13 +243,9 @@ void ModelRuntime::forward(const std::vector<int>& tokens, const std::vector<int
     CUDA_CHECK(cudaStreamSynchronize(stream_));
 }
 
-const float* ModelRuntime::forward_logits_host(const std::vector<int>& tokens,
-                                               const std::vector<int>& positions,
-                                               const std::vector<int>& req_index,
-                                               const std::vector<std::vector<int>>& block_tables,
-                                               const std::vector<int>& logits_rows) {
-    int S = (int)logits_rows.size();
-    forward_core(tokens, positions, req_index, block_tables, logits_rows);
+const float* ModelRuntime::forward_logits_host(const ForwardInput& in) {
+    int S = (int)in.logits_rows.size();
+    forward_core(in);
     if (S > 0)
         CUDA_CHECK(cudaMemcpyAsync(host_logits_.data(), logits_, (size_t)S * spec_.vocab_size * sizeof(float),
                                    cudaMemcpyDeviceToHost, stream_));

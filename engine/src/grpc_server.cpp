@@ -5,16 +5,16 @@
 #include "kv_cache.hpp"
 #include "scheduler.hpp"
 #include "errors.hpp"
+#include "output_sink.hpp"
 #include "startup.hpp"
 #include "engine.grpc.pb.h"
 #include <grpcpp/grpcpp.h>
-#include <algorithm>
+#include <atomic>
 #include <deque>
 #include <memory>
 #include <mutex>
 #include <condition_variable>
 #include <thread>
-#include <unordered_map>
 #include <cstdio>
 #include <exception>
 
@@ -45,10 +45,11 @@ static flashqwen::EngineState to_proto(LoadState s) {
     return flashqwen::ENGINE_STATE_UNSPECIFIED;
 }
 
-// ---- per-request server-side state ------------------------------------------------------
-// Owned by a shared_ptr held jointly by the gRPC handler thread (writes the stream) and the
-// engine thread (produces events); whichever finishes last frees it. The scheduler holds
-// &RequestCtx::req, which stays valid as long as any shared_ptr does.
+// ---- per-request output sink ------------------------------------------------------------
+// GrpcSink is the engine's OutputSink for one Generate stream: the scheduler writes tokens / the
+// terminal event into the EventQueue, the handler thread drains it onto the wire. The Request (owned
+// by the scheduler) and the handler each hold a shared_ptr to it, so it lives until both are done;
+// cancellation is a flag the handler sets and the scheduler polls.
 struct EventQueue {
     std::mutex m; std::condition_variable cv;
     std::deque<GenerateEvent> q; bool closed = false;
@@ -64,94 +65,67 @@ struct EventQueue {
     bool is_closed() { std::lock_guard<std::mutex> lk(m); return closed && q.empty(); }
 };
 
-struct RequestCtx {
-    Request req;
+struct GrpcSink : OutputSink {
     EventQueue queue;
-    int prompt_tokens = 0;
+    std::atomic<bool> cancel{false};
+
+    void token(int id) override {
+        GenerateEvent ev; ev.set_token_id(id); queue.push(std::move(ev));
+    }
+    void done(const std::string& finish_reason, int prompt_tokens, int completion_tokens) override {
+        GenerateEvent ev; auto* d = ev.mutable_done();
+        d->set_finish_reason(finish_reason);
+        d->set_prompt_tokens(prompt_tokens);
+        d->set_completion_tokens(completion_tokens);
+        queue.push(std::move(ev)); queue.close();
+    }
+    void error(EngineErrc code, const std::string& msg) override {
+        GenerateEvent ev; auto* e = ev.mutable_error();
+        e->set_code(to_proto(code)); e->set_message(msg);
+        queue.push(std::move(ev)); queue.close();
+    }
+    bool cancelled() const override { return cancel.load(std::memory_order_relaxed); }
 };
 
 // ---- the engine: the single thread that touches the model / GPU -------------------------
+// The handler threads hand Requests in over `inbound`; the engine thread owns them from there on
+// (via the scheduler) and streams results straight to each request's sink — no callbacks, no
+// per-request registry, no cancellation pointers crossing back.
 struct EngineLoop {
     ModelRuntime& model; KVCacheManager& kv; std::mt19937& rng;
     int n_slots; int max_queue; int max_batch_tokens; int max_prefill;
     std::mutex mu; std::condition_variable cv;
-    std::deque<std::shared_ptr<RequestCtx>> inbound;
-    std::deque<Request*> cancel_q;
+    std::deque<std::unique_ptr<Request>> inbound;
 
-    void submit(std::shared_ptr<RequestCtx> c) {
-        { std::lock_guard<std::mutex> lk(mu); inbound.push_back(std::move(c)); }
-        cv.notify_one();
-    }
-    void request_cancel(Request* r) {
-        { std::lock_guard<std::mutex> lk(mu); cancel_q.push_back(r); }
+    void submit(std::unique_ptr<Request> r) {
+        { std::lock_guard<std::mutex> lk(mu); inbound.push_back(std::move(r)); }
         cv.notify_one();
     }
 
     void run() {
         Scheduler sched(model, kv, n_slots, max_queue, max_batch_tokens, max_prefill, rng);
-        std::unordered_map<Request*, std::shared_ptr<RequestCtx>> conns;
-
-        // Terminate a request's stream with a structured error event (its blocks are already freed
-        // by the scheduler). The detailed message rides through to the client unchanged.
-        auto fail = [&](RequestCtx* c, EngineErrc code, const std::string& msg) {
-            GenerateEvent ev;
-            auto* e = ev.mutable_error();
-            e->set_code(to_proto(code));
-            e->set_message(msg);
-            c->queue.push(std::move(ev));
-            c->queue.close();
-        };
-
-        auto on_token = [&](Request* r, int t) {
-            auto it = conns.find(r); if (it == conns.end()) return;
-            GenerateEvent ev; ev.set_token_id(t);
-            it->second->queue.push(std::move(ev));
-        };
-        auto on_error = [&](Request* r, EngineErrc code, std::string msg) {
-            auto it = conns.find(r); if (it == conns.end()) return;
-            fail(it->second.get(), code, msg);
-            conns.erase(it);
-        };
-        auto on_finish = [&](Request* r) {
-            auto it = conns.find(r); if (it == conns.end()) return;
-            RequestCtx* c = it->second.get();
-            bool stopped = !r->stop_ids.empty() &&
-                std::find(r->stop_ids.begin(), r->stop_ids.end(), r->cur) != r->stop_ids.end();
-            int comp = (int)r->output.size() - (stopped ? 1 : 0);  // exclude the stop token itself
-            GenerateEvent ev;
-            auto* d = ev.mutable_done();
-            d->set_finish_reason(stopped ? "stop" : "length");
-            d->set_prompt_tokens(c->prompt_tokens);
-            d->set_completion_tokens(comp < 0 ? 0 : comp);
-            c->queue.push(std::move(ev));
-            c->queue.close();
-            conns.erase(it);
-        };
-
+        std::deque<std::unique_ptr<Request>> incoming;
         while (true) {
             {
                 std::unique_lock<std::mutex> lk(mu);
-                if (inbound.empty() && cancel_q.empty() && !sched.busy())
-                    cv.wait(lk, [&] { return !inbound.empty() || !cancel_q.empty(); });
-                while (!inbound.empty()) {
-                    auto c = std::move(inbound.front()); inbound.pop_front();
-                    if (!sched.can_admit()) {   // admission control: queue full -> reject as over-capacity
-                        fail(c.get(), EngineErrc::OverCapacity,
-                             "request queue full: " + std::to_string(sched.queue_depth()) +
-                             " requests already waiting (limit " + std::to_string(sched.max_queue()) +
-                             "), engine running up to " + std::to_string(n_slots) +
-                             " concurrent sequences; retry shortly");
-                        continue;
-                    }
-                    Request* rp = &c->req; conns[rp] = c; sched.add(rp);
-                }
-                while (!cancel_q.empty()) {
-                    Request* rp = cancel_q.front(); cancel_q.pop_front();
-                    auto it = conns.find(rp);
-                    if (it != conns.end()) { sched.remove(rp); it->second->queue.close(); conns.erase(it); }
+                if (inbound.empty() && !sched.busy())
+                    cv.wait(lk, [&] { return !inbound.empty(); });
+                incoming.swap(inbound);
+            }
+            while (!incoming.empty()) {
+                auto r = std::move(incoming.front()); incoming.pop_front();
+                if (!sched.can_admit()) {   // admission control: queue full -> reject as over-capacity
+                    if (r->sink) r->sink->error(EngineErrc::OverCapacity,
+                        "request queue full: " + std::to_string(sched.queue_depth()) +
+                        " requests already waiting (limit " + std::to_string(sched.max_queue()) +
+                        "), engine running up to " + std::to_string(n_slots) +
+                        " concurrent sequences; retry shortly");
+                    // r is dropped here; the handler's sink ref still delivers the error event.
+                } else {
+                    sched.add(std::move(r));
                 }
             }
-            if (sched.busy()) sched.step(on_token, on_finish, on_error);
+            if (sched.busy()) sched.step();
         }
     }
 };
@@ -195,28 +169,27 @@ public:
         { std::lock_guard<std::mutex> lk(rmu_); eng = eng_; max_ctx = max_ctx_; }
         if (!eng) return grpc::Status(grpc::StatusCode::UNAVAILABLE, "engine is still loading the model");
 
-        auto c = std::make_shared<RequestCtx>();
-        c->req.prompt.assign(req->input_ids().begin(), req->input_ids().end());
-        c->req.stop_ids.assign(req->stop_token_ids().begin(), req->stop_token_ids().end());
-        c->prompt_tokens = (int)c->req.prompt.size();
+        auto sink = std::make_shared<GrpcSink>();
+        auto r = std::make_unique<Request>();
+        r->prompt.assign(req->input_ids().begin(), req->input_ids().end());
+        r->stop_ids.assign(req->stop_token_ids().begin(), req->stop_token_ids().end());
         int max_new = req->max_tokens() > 0 ? req->max_tokens() : 512;
-        int room = max_ctx - c->prompt_tokens; if (room < 1) room = 1;
-        c->req.max_new = std::min(max_new, room);
-        c->req.sp = SampleParams{req->temperature(), req->top_p() > 0.f ? req->top_p() : 1.0f};
-
-        Request* rp = &c->req;
-        eng->submit(c);   // hands a shared ref to the engine; we keep `c` for the stream
+        int room = max_ctx - (int)r->prompt.size(); if (room < 1) room = 1;
+        r->max_new = std::min(max_new, room);
+        r->sp = SampleParams{req->temperature(), req->top_p() > 0.f ? req->top_p() : 1.0f};
+        r->sink = sink;
+        eng->submit(std::move(r));   // hand the request to the engine; we keep `sink` for the stream
 
         while (true) {
             GenerateEvent ev;
-            if (c->queue.pop(ev, 100)) {
-                if (!writer->Write(ev)) { eng->request_cancel(rp); break; }   // client write failed
+            if (sink->queue.pop(ev, 100)) {
+                if (!writer->Write(ev)) { sink->cancel.store(true); break; }   // client write failed
                 // Done and Error are both terminal; the client decodes Error into a typed failure.
                 if (ev.event_case() == GenerateEvent::kDone ||
                     ev.event_case() == GenerateEvent::kError) break;
             } else {
-                if (ctx->IsCancelled()) { eng->request_cancel(rp); break; }   // client went away
-                if (c->queue.is_closed()) break;                             // cancelled by engine
+                if (ctx->IsCancelled()) { sink->cancel.store(true); break; }   // client went away
+                if (sink->queue.is_closed()) break;                           // closed by the engine
             }
         }
         return grpc::Status::OK;
