@@ -46,6 +46,7 @@ FlashQwen's single-stream decode.)
 | B0 | baseline = main (per-seq scheduler, old attn kernel) | 56.7 | 106.9 | 15.3% | 08392df |
 | R1 | unified token-budget scheduler + GPU sampling | 25.0 | 87.2 | 12.5% | 5065b2e |
 | R2 | scheduler/kernel refactor (perf-neutral, Δ0) | 24.9 | 87.4 | 12.5% | 291cb74 |
+| S3 | bf16 weights + cuBLAS GEMM + FlashAttention-2 | 38.2 | **350.0** | **50.1%** | 7650654 |
 
 ## Step entries
 
@@ -74,5 +75,28 @@ FlashQwen's single-stream decode.)
   5065b2e ↔ HEAD).
 - **Lesson**: confirms the gap is the kernels, not scheduling/bookkeeping. Clears the deck for the
   attention rewrite (split-K).
+
+### S3 — bf16 + cuBLAS GEMM + FlashAttention-2 (7650654)
+- **Change**: three coordinated kernel rewrites, addressing the debt R1/R2 identified.
+  1. **Drop INT8 weight-quant → bf16 everywhere.** Weights load as bf16 (no dequant), and the whole
+     activation pipeline is bf16 (norm/rope/residual/silu accumulate in fp32 internally). This is now
+     **fair bf16-parity with vLLM** — the earlier precision caveat is gone.
+  2. **cuBLAS for all matmuls.** One `cublasGemmEx` path (bf16 in, fp32 accumulate, tensor cores)
+     replaces the hand-rolled WMMA prefill GEMM + per-call full-weight dequant + the batched INT8
+     decode GEMV. The decode/prefill matmul split is deleted — one path for the merged batch.
+  3. **FlashAttention-2 paged kernel.** Replaces the per-(head,row) varlen kernel that re-read all
+     K/V from global with zero reuse (O(T²)). New kernel: one block per (q-tile, head, request); BM=16
+     query rows (one warp each) share BLOCK-sized K/V tiles staged in shared memory (reuse factor BM),
+     online softmax with deferred normalization (divide by the running sum only at the end), causal
+     whole-tile skip. Host groups the batch by request (qstart/qlen) for the q-tile grid.
+- **Result vs R2**: conc=32 **87.4 → 350.0 tok/s (4.0×)** — **12.5% → 50.1% of vLLM**, and 3.3× the
+  `main` baseline (106.9). conc=1 24.9 → 38.2 (still below main's INT8 56.7: bf16 weights read 2× the
+  bytes of INT8, and single-stream decode is weight-bandwidth-bound — the expected de-quant cost; the
+  tracked metric is conc=32). Greedy generation verified coherent.
+- **Lesson**: R1/R2 were right — the gap was the kernels, not scheduling. The unified-scheduler
+  regression is not just recovered but blown past. The remaining ~2× to vLLM at conc=32: the FA2 kernel
+  is FMA-based (no tensor cores in attention yet) and one block per q-head wastes GQA's 4:1 K/V reuse;
+  a tensor-core + GQA-grouped attention is the next lever. Single-stream (conc=1) is now a separate,
+  bandwidth-bound concern (bf16 weight traffic) if we ever care about it.
 
 <!-- Append one ### entry per landed step: What / Why / Change / Result (vs prev) / Lesson -->
