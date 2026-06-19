@@ -10,7 +10,6 @@
 #pragma once
 #include "errors.hpp"
 #include "output_sink.hpp"
-#include "startup.hpp"
 #include "engine.grpc.pb.h"
 #include <atomic>
 #include <chrono>
@@ -19,21 +18,13 @@
 #include <mutex>
 #include <string>
 
-// Engine domain error / startup state -> proto wire enums (the single mapping spot).
+// Engine domain error -> proto wire code (the single mapping spot).
 inline flashqwen::ErrorCode to_proto(EngineErrc e) {
     switch (e) {
         case EngineErrc::OverCapacity: return flashqwen::ERROR_CODE_OVER_CAPACITY;
         case EngineErrc::Internal:     return flashqwen::ERROR_CODE_INTERNAL;
     }
     return flashqwen::ERROR_CODE_UNSPECIFIED;
-}
-inline flashqwen::EngineState to_proto(LoadState s) {
-    switch (s) {
-        case LoadState::Loading: return flashqwen::ENGINE_STATE_LOADING;
-        case LoadState::Ready:   return flashqwen::ENGINE_STATE_READY;
-        case LoadState::Failed:  return flashqwen::ENGINE_STATE_FAILED;
-    }
-    return flashqwen::ENGINE_STATE_UNSPECIFIED;
 }
 
 // Thread-safe queue of stream events: the engine thread pushes, the handler thread pops.

@@ -1,7 +1,7 @@
 // flashqwen-engine: token-level C++/CUDA inference engine. Parse args, then serve the gRPC Engine
-// service (token ids in -> sampled token ids out): the server binds its port immediately and loads
-// the model on a background thread, reporting progress through GetStatus. The flashqwen Go app is
-// the client and owns all model-text concerns; this binary is not meant to be run directly.
+// service (token ids in -> sampled token ids out): it loads the model and only then binds its port,
+// so a successful GetModel doubles as the readiness signal (load progress goes to stderr). The
+// flashqwen Go app is the client and owns all model-text concerns; not meant to be run directly.
 //
 //   flashqwen-engine --model DIR [--address host:port] [--slots N] [--max-ctx N]
 //

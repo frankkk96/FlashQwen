@@ -12,11 +12,9 @@ service Engine {
   // One prompt (token ids) -> a stream of generated token ids, then a final Done.
   rpc Generate(GenerateRequest) returns (stream GenerateEvent);
   // Engine metadata (authoritative max_ctx after rounding/KV limits, vocab) for clamping + /v1/models.
+  // The engine loads the model before binding its port, so a successful GetModel also signals
+  // readiness; the client polls it until it answers. Load progress goes to the engine's stderr.
   rpc GetModel(ModelRequest) returns (ModelInfo);
-  // Startup lifecycle + load progress. Answerable the moment the process binds its port — before the
-  // model is loaded — so the client can show progress and fail fast. GetModel/Generate return
-  // UNAVAILABLE until the reported state is READY.
-  rpc GetStatus(StatusRequest) returns (StatusResponse);
 }
 
 message GenerateRequest {
@@ -60,22 +58,4 @@ message ModelInfo {
   string id = 1;
   int32  max_ctx = 2;
   int32  vocab_size = 3;
-}
-
-// Engine startup lifecycle. The process binds its gRPC port immediately and loads the model on a
-// background thread, so the client can poll GetStatus to drive a progress bar and a stall watchdog.
-enum EngineState {
-  ENGINE_STATE_UNSPECIFIED = 0;
-  ENGINE_STATE_LOADING     = 1;   // binding done; weights / KV pool loading
-  ENGINE_STATE_READY       = 2;   // serving (GetModel/Generate now answer)
-  ENGINE_STATE_FAILED      = 3;   // load failed, terminal — see message
-}
-
-message StatusRequest {}
-message StatusResponse {
-  EngineState state = 1;
-  string      phase = 2;   // human-readable step, e.g. "loading weights" / "allocating kv pool"
-  int32       done  = 3;   // units completed in this phase (e.g. layers uploaded); 0 if not countable
-  int32       total = 4;   // units in this phase (e.g. layer count); 0 if not countable
-  string      message = 5; // detailed failure cause when state == FAILED
 }

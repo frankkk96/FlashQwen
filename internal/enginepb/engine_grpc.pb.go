@@ -19,9 +19,8 @@ import (
 const _ = grpc.SupportPackageIsVersion9
 
 const (
-	Engine_Generate_FullMethodName  = "/flashqwen.Engine/Generate"
-	Engine_GetModel_FullMethodName  = "/flashqwen.Engine/GetModel"
-	Engine_GetStatus_FullMethodName = "/flashqwen.Engine/GetStatus"
+	Engine_Generate_FullMethodName = "/flashqwen.Engine/Generate"
+	Engine_GetModel_FullMethodName = "/flashqwen.Engine/GetModel"
 )
 
 // EngineClient is the client API for Engine service.
@@ -36,11 +35,9 @@ type EngineClient interface {
 	// One prompt (token ids) -> a stream of generated token ids, then a final Done.
 	Generate(ctx context.Context, in *GenerateRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[GenerateEvent], error)
 	// Engine metadata (authoritative max_ctx after rounding/KV limits, vocab) for clamping + /v1/models.
+	// The engine loads the model before binding its port, so a successful GetModel also signals
+	// readiness; the client polls it until it answers. Load progress goes to the engine's stderr.
 	GetModel(ctx context.Context, in *ModelRequest, opts ...grpc.CallOption) (*ModelInfo, error)
-	// Startup lifecycle + load progress. Answerable the moment the process binds its port — before the
-	// model is loaded — so the client can show progress and fail fast. GetModel/Generate return
-	// UNAVAILABLE until the reported state is READY.
-	GetStatus(ctx context.Context, in *StatusRequest, opts ...grpc.CallOption) (*StatusResponse, error)
 }
 
 type engineClient struct {
@@ -80,16 +77,6 @@ func (c *engineClient) GetModel(ctx context.Context, in *ModelRequest, opts ...g
 	return out, nil
 }
 
-func (c *engineClient) GetStatus(ctx context.Context, in *StatusRequest, opts ...grpc.CallOption) (*StatusResponse, error) {
-	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	out := new(StatusResponse)
-	err := c.cc.Invoke(ctx, Engine_GetStatus_FullMethodName, in, out, cOpts...)
-	if err != nil {
-		return nil, err
-	}
-	return out, nil
-}
-
 // EngineServer is the server API for Engine service.
 // All implementations must embed UnimplementedEngineServer
 // for forward compatibility.
@@ -102,11 +89,9 @@ type EngineServer interface {
 	// One prompt (token ids) -> a stream of generated token ids, then a final Done.
 	Generate(*GenerateRequest, grpc.ServerStreamingServer[GenerateEvent]) error
 	// Engine metadata (authoritative max_ctx after rounding/KV limits, vocab) for clamping + /v1/models.
+	// The engine loads the model before binding its port, so a successful GetModel also signals
+	// readiness; the client polls it until it answers. Load progress goes to the engine's stderr.
 	GetModel(context.Context, *ModelRequest) (*ModelInfo, error)
-	// Startup lifecycle + load progress. Answerable the moment the process binds its port — before the
-	// model is loaded — so the client can show progress and fail fast. GetModel/Generate return
-	// UNAVAILABLE until the reported state is READY.
-	GetStatus(context.Context, *StatusRequest) (*StatusResponse, error)
 	mustEmbedUnimplementedEngineServer()
 }
 
@@ -122,9 +107,6 @@ func (UnimplementedEngineServer) Generate(*GenerateRequest, grpc.ServerStreaming
 }
 func (UnimplementedEngineServer) GetModel(context.Context, *ModelRequest) (*ModelInfo, error) {
 	return nil, status.Error(codes.Unimplemented, "method GetModel not implemented")
-}
-func (UnimplementedEngineServer) GetStatus(context.Context, *StatusRequest) (*StatusResponse, error) {
-	return nil, status.Error(codes.Unimplemented, "method GetStatus not implemented")
 }
 func (UnimplementedEngineServer) mustEmbedUnimplementedEngineServer() {}
 func (UnimplementedEngineServer) testEmbeddedByValue()                {}
@@ -176,24 +158,6 @@ func _Engine_GetModel_Handler(srv interface{}, ctx context.Context, dec func(int
 	return interceptor(ctx, in, info, handler)
 }
 
-func _Engine_GetStatus_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
-	in := new(StatusRequest)
-	if err := dec(in); err != nil {
-		return nil, err
-	}
-	if interceptor == nil {
-		return srv.(EngineServer).GetStatus(ctx, in)
-	}
-	info := &grpc.UnaryServerInfo{
-		Server:     srv,
-		FullMethod: Engine_GetStatus_FullMethodName,
-	}
-	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return srv.(EngineServer).GetStatus(ctx, req.(*StatusRequest))
-	}
-	return interceptor(ctx, in, info, handler)
-}
-
 // Engine_ServiceDesc is the grpc.ServiceDesc for Engine service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -204,10 +168,6 @@ var Engine_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "GetModel",
 			Handler:    _Engine_GetModel_Handler,
-		},
-		{
-			MethodName: "GetStatus",
-			Handler:    _Engine_GetStatus_Handler,
 		},
 	},
 	Streams: []grpc.StreamDesc{

@@ -8,7 +8,6 @@
 #include "block_pool.hpp"
 #include <vector>
 #include <string>
-#include <functional>
 
 // One merged forward's inputs — a flattened mixed batch (prefill chunks + decodes together).
 //   tokens[t], positions[t]  : the t-th query row's token id and its absolute logical position
@@ -42,10 +41,8 @@ public:
     // per-sequence KV cache; max_batch_tokens bounds the number of query rows in one forward.
     // Allocates weights + activation scratch only — the paged KV pool lives in a separate
     // BlockPool; attach one (sized from the VRAM left after construction) before any forward call.
-    // on_progress (may be empty) is called as each transformer layer's weights upload, with
-    // (layers_done, layers_total), for a startup progress bar.
-    using ProgressFn = std::function<void(int done, int total)>;
-    ModelRuntime(const ModelSpec& spec, int max_ctx, int max_batch_tokens, ProgressFn on_progress = {});
+    // Per-layer upload progress is logged (LOG_INFO) as it goes.
+    ModelRuntime(const ModelSpec& spec, int max_ctx, int max_batch_tokens);
     void attach_pool(const BlockPool& pool) { pool_ = &pool; }   // non-owning; storage for the attention kernels
     ~ModelRuntime();
 

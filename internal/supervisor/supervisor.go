@@ -8,6 +8,7 @@ import (
 	_ "embed"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"os/exec"
@@ -84,12 +85,10 @@ func Start(modelDir string, slots, maxCtx, maxQueue int) (*Engine, error) {
 		"--slots", strconv.Itoa(slots),
 		"--max-ctx", strconv.Itoa(maxCtx),
 		"--max-queue", strconv.Itoa(maxQueue))
-	// Capture engine stderr into a rolling tail buffer rather than the terminal: during startup the
-	// Go side shows a load progress bar (driven by GetStatus) and owns the line, and on any failure
-	// the tail is surfaced in the returned error / Exited(). This keeps the engine's verbose per-layer
-	// logging from interleaving with the bar.
+	// Forward engine stderr to the terminal so the user sees its load progress + logs, while also
+	// retaining the tail so a startup failure can be reported with the engine's actual cause.
 	tail := &tailBuffer{max: 8 << 10}
-	cmd.Stderr = tail
+	cmd.Stderr = io.MultiWriter(os.Stderr, tail)
 	if err := cmd.Start(); err != nil {
 		os.Remove(f.Name())
 		return nil, fmt.Errorf("start engine: %w", err)
