@@ -48,6 +48,7 @@ FlashQwen's single-stream decode.)
 | R2 | scheduler/kernel refactor (perf-neutral, Δ0) | 24.9 | 87.4 | 12.5% | 291cb74 |
 | S3 | bf16 weights + cuBLAS GEMM + FlashAttention-2 | 38.2 | **350.0** | **50.1%** | 7650654 |
 | S5 | kernel fusion: fused QKV/gate-up GEMM, add+rmsnorm, RoPE table | 39.1 | 356.1 | 51.0% | c2f98a0 |
+| S6 | FlashDecoding decode-attention kernel (split by request type) | 44.7 | **455.2** | **65.2%** | f0b1499 |
 
 ## Step entries
 
@@ -144,6 +145,34 @@ FlashQwen's single-stream decode.)
   decode-GEMM shapes) or the throughput features vLLM has (larger effective batch, prefix caching), not
   just launch elision. The fusions are kept regardless — correct, cleaner, and they pre-stage the
   persistent-buffer layout CUDA-graph capture will want.
+
+### S6 — FlashDecoding decode-attention kernel (f0b1499)
+- **Target**: the conc=32 ceiling the S5 profiling left open. Profiles used SHORT context; the tracked
+  metric is 1024-ctx, where decode attention reads a ~1152-tok KV every step. The unified attention
+  kernel handles q_len==1 (decode) terribly: only 1 of its 16 warps is active (~6% occupancy) and that
+  warp serially scans all ~72 KV tiles. GEMM was already at 84% HBM BW (S5 profile), so attention was
+  the remaining lever.
+- **Change**: split attention by request type *within* the unified batch — the GEMMs/norms stay merged
+  (attention is per-request anyway, so this is orthogonal to unified batching, NOT a return to
+  prefill/decode-split forwards). Decode rows (q_len==1) → new `decode_attn_kernel`; prefill rows
+  (q_len>1) → the existing tiled flash kernel. Both take a `rids[]` grid→request indirection so each
+  runs on its request subset, writing disjoint rows of `attn_`. In steady conc=32 most steps are pure
+  decode, so the decode kernel carries the common case.
+  - `decode_attn_kernel`: one block per (head, decode-request); NW=8 warps split that request's KV
+    [0,qpos] into strided slices; each warp online-softmaxes its slice in registers reading K/V
+    **straight from the paged cache** (one query row has no cross-row reuse → shared-memory staging is
+    pure overhead); then an in-block combine merges the NW partials (online-softmax). Full warp
+    occupancy + NW-way KV parallelism vs the old 1-warp serial scan.
+  - GQA K/V is still read per q-head (4× within a group), accepted: KV bytes are ~4% of GEMM and the
+    4 q-heads of a group hit the same cache lines (L2 absorbs most of it).
+- **Result vs S5**: conc=32 **357 → 455 tok/s (+27.5%, TPOT 84.9 → 65.3 ms)**; conc=1 39.1 → 44.7
+  (+14%, TPOT 25.8 → 22.5 ms). **51% → 65% of vLLM**, 4.26× the `main` baseline. Greedy output coherent.
+- **Lesson**: the S5 profiles (short context) under-counted attention; at the tracked 1024-ctx the
+  hand-rolled decode attention WAS the conc=32 bottleneck after all — and unlike the spent S4 WMMA
+  attempt (which fixed nothing real), FlashDecoding-style **KV-parallelism + occupancy** is the right
+  fix. Confirms the rule from the profiling sweep: GEMM/elementwise/scheduling were dead ends; the one
+  hand-rolled kernel with headroom delivered. Next gap to vLLM (455→698) is likely prefill-side
+  attention + the GQA 4× redundant KV read (a GQA-shared decode kernel) and CUDA graphs for conc=1.
 
 #### S5 ablation — which of the three fusions actually paid (2026-06-19)
 Each change isolated on the S3 base (1024/128, temp 0); only the engine differs.
