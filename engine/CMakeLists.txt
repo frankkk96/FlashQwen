@@ -66,7 +66,7 @@ add_executable(flashqwen-engine
   src/grpc_server.cpp
   src/safetensors.cpp
   src/kernels.cu
-  src/kv_cache.cu
+  src/block_pool.cu
   src/model_runtime.cu
   ${PROTO_SRCS}
 )

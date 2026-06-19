@@ -234,20 +234,27 @@ void launch_rope(float* x, const int* pos, int M, int n_heads, int head_dim, flo
 // the per-token / per-key row lookup now goes through the block table.
 // ---------------------------------------------------------------------------------------
 
-// Prefill attention — one WARP per (head, query token), online softmax over the paged KV. Each
-// lane owns head_dim/32 dims; the per-key q.k dot is a warp-shuffle reduction (no __syncthreads).
-__global__ void attention_paged_kernel(const float* __restrict__ q, const bf16* __restrict__ cache_k,
-                                       const bf16* __restrict__ cache_v, float* __restrict__ out,
-                                       int M, int n_heads, int n_kv, int head_dim,
-                                       const int* __restrict__ d_past, float scale,
-                                       const int* __restrict__ bt, int max_blocks, int block_size) {
+// Unified varlen attention — one WARP per (head, query row), online softmax over the paged KV.
+// Query row m belongs to request req[m] (block-table row req[m] of `bt`) at absolute position
+// pos[m], and attends that request's keys [0, pos[m]] (causal). This single kernel covers both
+// prefill chunks (a request contributes many rows, increasing pos) and decode (one row, pos=past):
+// causality falls out of "attend [0, pos[m]]", and cross-request isolation falls out of indexing
+// each row through its own request's block table. Each lane owns head_dim/32 dims; the per-key q.k
+// dot is a warp-shuffle reduction (no __syncthreads). Simple/correct, no split-K — optimise later.
+__global__ void attention_varlen_kernel(const float* __restrict__ q, const bf16* __restrict__ cache_k,
+                                        const bf16* __restrict__ cache_v, float* __restrict__ out,
+                                        int n_heads, int n_kv, int head_dim,
+                                        const int* __restrict__ pos, const int* __restrict__ req,
+                                        const int* __restrict__ bt, int max_blocks, int block_size,
+                                        float scale) {
     constexpr int DPL = 4;
     int h = blockIdx.x;              // query head
-    int m = blockIdx.y;              // query token
+    int m = blockIdx.y;              // query row (0..T-1)
     int lane = threadIdx.x;          // 0..31
     int kvh = h / (n_heads / n_kv);
     int kv_dim = n_kv * head_dim;
-    int qpos = *d_past + m;          // attend keys [0, qpos]
+    int qpos = pos[m];                                   // attend keys [0, qpos]
+    const int* btr = bt + (size_t)req[m] * max_blocks;   // this row's request block table
 
     const float* qv = q + ((size_t)m * n_heads + h) * head_dim;
     float qreg[DPL], acc[DPL];
@@ -256,7 +263,7 @@ __global__ void attention_paged_kernel(const float* __restrict__ q, const bf16* 
     float m_run = -1e30f, l_run = 0.f;
 
     for (int j = 0; j <= qpos; ++j) {
-        size_t phys = kv_phys_row(bt, j, block_size);            // block table row 0
+        size_t phys = kv_phys_row(btr, j, block_size);
         const bf16* kj = cache_k + phys * kv_dim + kvh * head_dim;
         float partial = 0.f;
         #pragma unroll
@@ -280,96 +287,26 @@ __global__ void attention_paged_kernel(const float* __restrict__ q, const bf16* 
     for (int i = 0; i < DPL; ++i) o[lane + (i << 5)] = acc[i] * inv;
 }
 
-void launch_attention_paged(const float* q, const bf16* cache_k, const bf16* cache_v, float* out,
-                            int M, int n_heads, int n_kv, int head_dim, const int* d_past,
-                            float scale, const int* bt, int max_blocks, int block_size,
-                            cudaStream_t s) {
-    attention_paged_kernel<<<dim3(n_heads, M), 32, 0, s>>>(
-        q, cache_k, cache_v, out, M, n_heads, n_kv, head_dim, d_past, scale, bt, max_blocks, block_size);
+void launch_attention_varlen(const float* q, const bf16* cache_k, const bf16* cache_v, float* out,
+                             int T, int n_heads, int n_kv, int head_dim,
+                             const int* pos, const int* req_index,
+                             const int* bt, int max_blocks, int block_size, float scale,
+                             cudaStream_t s) {
+    attention_varlen_kernel<<<dim3(n_heads, T), 32, 0, s>>>(
+        q, cache_k, cache_v, out, n_heads, n_kv, head_dim, pos, req_index, bt, max_blocks, block_size, scale);
 }
 
-// Batched flash-decoding phase 1: block (h, split, b) does a partial online-softmax over its key
-// chunk of sequence b (block-table row b), attending keys [0, past_len[b]].
-__global__ void attn_decode_split_paged_kernel(
-        const float* __restrict__ q, const bf16* __restrict__ cache_k, const bf16* __restrict__ cache_v,
-        float* __restrict__ part_m, float* __restrict__ part_l, float* __restrict__ part_acc,
-        int n_heads, int n_kv, int head_dim, const int* __restrict__ past_len,
-        const int* __restrict__ bt, int max_blocks, int block_size, float scale) {
-    constexpr int DPL = 4;
-    int h = blockIdx.x, sp = blockIdx.y, b = blockIdx.z, lane = threadIdx.x;
-    int kvh = h / (n_heads / n_kv);
-    int kv_dim = n_kv * head_dim;
-    int L = past_len[b] + 1;                        // keys [0, past_len[b]]
-    int per = (L + ATTN_SPLITS - 1) / ATTN_SPLITS;
-    int kb = sp * per, ke = min(kb + per, L);
-
-    const int* btb = bt + (size_t)b * max_blocks;   // this sequence's block table
-    const float* qv = q + ((size_t)b * n_heads + h) * head_dim;
-    float qreg[DPL], acc[DPL];
-    #pragma unroll
-    for (int i = 0; i < DPL; ++i) { qreg[i] = qv[lane + (i << 5)]; acc[i] = 0.f; }
-    float m_run = -1e30f, l_run = 0.f;
-
-    for (int j = kb; j < ke; ++j) {
-        size_t phys = kv_phys_row(btb, j, block_size);
-        const bf16* kj = cache_k + phys * kv_dim + kvh * head_dim;
-        float p = 0.f;
-        #pragma unroll
-        for (int i = 0; i < DPL; ++i) p += qreg[i] * __bfloat162float(kj[lane + (i << 5)]);
-        #pragma unroll
-        for (int o = 16; o > 0; o >>= 1) p += __shfl_xor_sync(0xffffffff, p, o);
-        float score = p * scale;
-        float m_new = fmaxf(m_run, score);
-        float corr = __expf(m_run - m_new), pp = __expf(score - m_new);
-        l_run = l_run * corr + pp;
-        const bf16* vj = cache_v + phys * kv_dim + kvh * head_dim;
-        #pragma unroll
-        for (int i = 0; i < DPL; ++i) acc[i] = acc[i] * corr + pp * __bfloat162float(vj[lane + (i << 5)]);
-        m_run = m_new;
-    }
-    int slot_idx = ((size_t)b * n_heads + h) * ATTN_SPLITS + sp;
-    if (lane == 0) { part_m[slot_idx] = m_run; part_l[slot_idx] = l_run; }
-    #pragma unroll
-    for (int i = 0; i < DPL; ++i) part_acc[(size_t)slot_idx * head_dim + lane + (i << 5)] = acc[i];
+// Gather S rows: out[i, :] = x[rows[i], :]   (one block per gathered row)
+__global__ void gather_rows_kernel(const float* __restrict__ x, const int* __restrict__ rows,
+                                   float* __restrict__ out, int H) {
+    int i = blockIdx.x, r = rows[i];
+    const float* src = x + (size_t)r * H;
+    float* dst = out + (size_t)i * H;
+    for (int j = threadIdx.x; j < H; j += blockDim.x) dst[j] = src[j];
 }
 
-// Batched flash-decoding phase 2: one warp per (b, head) merges the ATTN_SPLITS partials.
-__global__ void attn_decode_combine_paged_kernel(
-        const float* __restrict__ part_m, const float* __restrict__ part_l,
-        const float* __restrict__ part_acc, float* __restrict__ out, int n_heads, int head_dim) {
-    constexpr int DPL = 4;
-    int h = blockIdx.x, b = blockIdx.y, lane = threadIdx.x;
-    int base = ((size_t)b * n_heads + h) * ATTN_SPLITS;
-    float gm = -1e30f;
-    #pragma unroll
-    for (int sp = 0; sp < ATTN_SPLITS; ++sp) gm = fmaxf(gm, part_m[base + sp]);
-    float gl = 0.f, gacc[DPL];
-    #pragma unroll
-    for (int i = 0; i < DPL; ++i) gacc[i] = 0.f;
-    #pragma unroll
-    for (int sp = 0; sp < ATTN_SPLITS; ++sp) {
-        int slot_idx = base + sp;
-        float w = __expf(part_m[slot_idx] - gm);
-        gl += part_l[slot_idx] * w;
-        #pragma unroll
-        for (int i = 0; i < DPL; ++i) gacc[i] += part_acc[(size_t)slot_idx * head_dim + lane + (i << 5)] * w;
-    }
-    float inv = 1.0f / gl;
-    float* o = out + ((size_t)b * n_heads + h) * head_dim;
-    #pragma unroll
-    for (int i = 0; i < DPL; ++i) o[lane + (i << 5)] = gacc[i] * inv;
-}
-
-void launch_attention_decode_paged(const float* q, const bf16* cache_k, const bf16* cache_v,
-                                   float* out, int B, int n_heads, int n_kv, int head_dim,
-                                   const int* past_len, const int* bt, int max_blocks, int block_size,
-                                   float scale, float* part_m, float* part_l, float* part_acc,
-                                   cudaStream_t s) {
-    attn_decode_split_paged_kernel<<<dim3(n_heads, ATTN_SPLITS, B), 32, 0, s>>>(
-        q, cache_k, cache_v, part_m, part_l, part_acc, n_heads, n_kv, head_dim,
-        past_len, bt, max_blocks, block_size, scale);
-    attn_decode_combine_paged_kernel<<<dim3(n_heads, B), 32, 0, s>>>(
-        part_m, part_l, part_acc, out, n_heads, head_dim);
+void launch_gather_rows(const float* x, const int* rows, float* out, int S, int H, cudaStream_t s) {
+    if (S > 0) gather_rows_kernel<<<S, 256, 0, s>>>(x, rows, out, H);
 }
 
 // ---------------------------------------------------------------------------------------
@@ -394,29 +331,6 @@ __global__ void silu_mul_kernel(const float* gate, const float* up, float* h, in
 void launch_silu_mul(const float* gate, const float* up, float* h, int N, cudaStream_t s) {
     int block = 256;
     silu_mul_kernel<<<(N + block - 1) / block, block, 0, s>>>(gate, up, h, N);
-}
-
-// argmax over N logits in a single block (256 threads), result index in *out.
-__global__ void argmax_kernel(const float* __restrict__ logits, int N, int* __restrict__ out) {
-    __shared__ float sval[256];
-    __shared__ int   sidx[256];
-    int tid = threadIdx.x;
-    float best = -1e30f; int bi = 0;
-    for (int i = tid; i < N; i += blockDim.x) {
-        float v = logits[i];
-        if (v > best) { best = v; bi = i; }
-    }
-    sval[tid] = best; sidx[tid] = bi;
-    __syncthreads();
-    for (int s = blockDim.x >> 1; s > 0; s >>= 1) {
-        if (tid < s && sval[tid + s] > sval[tid]) { sval[tid] = sval[tid + s]; sidx[tid] = sidx[tid + s]; }
-        __syncthreads();
-    }
-    if (tid == 0) *out = sidx[0];
-}
-
-void launch_argmax(const float* logits, int N, int* d_out, cudaStream_t s) {
-    argmax_kernel<<<1, 256, 0, s>>>(logits, N, d_out);
 }
 
 // Batched argmax: one block per row of logits[B, N]; d_out[b] = argmax over row b.

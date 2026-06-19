@@ -77,9 +77,10 @@ ModelRuntime::QWeight ModelRuntime::upload_int8(const std::string& name) {
     return qw;
 }
 
-ModelRuntime::ModelRuntime(const ModelSpec& spec, int max_ctx, ProgressFn on_progress)
+ModelRuntime::ModelRuntime(const ModelSpec& spec, int max_ctx, int max_batch_tokens, ProgressFn on_progress)
     : spec_(spec) {
-    max_ctx_ = ((max_ctx + 15) / 16) * 16;   // round up so WMMA tiles never read past buffers
+    max_ctx_  = ((max_ctx + 15) / 16) * 16;   // round up so WMMA tiles never read past buffers
+    max_rows_ = std::max(max_ctx_, ((max_batch_tokens + 15) / 16) * 16);  // query rows per forward
     std::fprintf(stderr, "[model] loading weights from %s ...\n", spec_.dir.c_str());
     st_.load_dir(spec_.dir);
 
@@ -107,228 +108,159 @@ ModelRuntime::ModelRuntime(const ModelSpec& spec, int max_ctx, ProgressFn on_pro
         if (on_progress) on_progress(l + 1, spec_.num_layers);
     }
 
-    // activation scratch (sized to max_ctx tokens; a decode batch is at most MAX_DECODE_B <= that)
+    // activation scratch (sized to max_rows_ query rows; the sampling buffers are sized to the
+    // concurrent-request cap MAX_DECODE_B, since at most one logits row is produced per request).
     int H = spec_.hidden_size, QD = spec_.q_dim(), I = spec_.intermediate, V = spec_.vocab_size;
-    int kvd = spec_.kv_dim(), nh = spec_.num_heads, hd = spec_.head_dim;
+    int kvd = spec_.kv_dim();
     auto fmalloc = [&](float** p, size_t n) { CUDA_CHECK(cudaMalloc(p, n * sizeof(float))); };
-    fmalloc(&x_,    (size_t)max_ctx_ * H);
-    fmalloc(&xb_,   (size_t)max_ctx_ * H);
-    fmalloc(&xb2_,  (size_t)max_ctx_ * H);
-    fmalloc(&q_,    (size_t)max_ctx_ * QD);
-    fmalloc(&k_,    (size_t)max_ctx_ * kvd);
-    fmalloc(&v_,    (size_t)max_ctx_ * kvd);
-    fmalloc(&attn_, (size_t)max_ctx_ * QD);
-    fmalloc(&gate_, (size_t)max_ctx_ * I);
-    fmalloc(&up_,   (size_t)max_ctx_ * I);
-    fmalloc(&hmlp_, (size_t)max_ctx_ * I);
-    fmalloc(&logits_, (size_t)MAX_DECODE_B * V);   // [B, vocab] logits for the whole decode batch
-    // BF16 activation scratch for the tensor-core prefill GEMM (largest IN is `I`).
-    CUDA_CHECK(cudaMalloc(&xbf_, (size_t)max_ctx_ * I * sizeof(bf16)));
-    // BF16 dequantized-weight scratch for prefill (largest matmul weight is I*H).
+    fmalloc(&x_,    (size_t)max_rows_ * H);
+    fmalloc(&xb_,   (size_t)max_rows_ * H);
+    fmalloc(&xb2_,  (size_t)max_rows_ * H);
+    fmalloc(&q_,    (size_t)max_rows_ * QD);
+    fmalloc(&k_,    (size_t)max_rows_ * kvd);
+    fmalloc(&v_,    (size_t)max_rows_ * kvd);
+    fmalloc(&attn_, (size_t)max_rows_ * QD);
+    fmalloc(&gate_, (size_t)max_rows_ * I);
+    fmalloc(&up_,   (size_t)max_rows_ * I);
+    fmalloc(&hmlp_, (size_t)max_rows_ * I);
+    fmalloc(&xg_,     (size_t)MAX_DECODE_B * H);   // gathered sampling rows
+    fmalloc(&logits_, (size_t)MAX_DECODE_B * V);   // [S, vocab]
+    // BF16 activation scratch for the tensor-core matmul (largest IN is `I`).
+    CUDA_CHECK(cudaMalloc(&xbf_, (size_t)max_rows_ * I * sizeof(bf16)));
+    // BF16 dequantized-weight scratch for the tensor-core matmul (largest matmul weight is I*H).
     CUDA_CHECK(cudaMalloc(&w_dq_, (size_t)I * H * sizeof(bf16)));
-    CUDA_CHECK(cudaMalloc(&d_ids_,  max_ctx_ * sizeof(int)));
-    CUDA_CHECK(cudaMalloc(&d_pos_,  max_ctx_ * sizeof(int)));
-    CUDA_CHECK(cudaMalloc(&d_arg_,  MAX_DECODE_B * sizeof(int)));
-    CUDA_CHECK(cudaMalloc(&d_past_, sizeof(int)));
-    // Paged-KV indexing buffers. d_bt_ holds up to MAX_DECODE_B padded block tables (one per
-    // decode-batch row, or row 0 for prefill). d_iota_ = {0,1,..} is the decode bt_row map;
-    // d_zero_ = {0,0,..} is the prefill bt_row map (all M tokens use block-table row 0).
-    max_blocks_ = (max_ctx_ + KVCache::BLOCK - 1) / KVCache::BLOCK;
-    CUDA_CHECK(cudaMalloc(&d_bt_,   (size_t)MAX_DECODE_B * max_blocks_ * sizeof(int)));
-    CUDA_CHECK(cudaMalloc(&d_iota_, MAX_DECODE_B * sizeof(int)));
-    CUDA_CHECK(cudaMalloc(&d_zero_, max_ctx_ * sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&d_ids_, max_rows_ * sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&d_pos_, max_rows_ * sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&d_req_, max_rows_ * sizeof(int)));
+    // Paged-KV block tables: up to MAX_DECODE_B requests, padded to the longest block table.
+    max_blocks_ = (max_ctx_ + BlockPool::BLOCK - 1) / BlockPool::BLOCK;
+    CUDA_CHECK(cudaMalloc(&d_bt_, (size_t)MAX_DECODE_B * max_blocks_ * sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&d_lrows_, MAX_DECODE_B * sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&d_arg_,   MAX_DECODE_B * sizeof(int)));
     host_bt_.resize((size_t)MAX_DECODE_B * max_blocks_);
-    {
-        std::vector<int> iota(MAX_DECODE_B);
-        for (int i = 0; i < MAX_DECODE_B; ++i) iota[i] = i;
-        CUDA_CHECK(cudaMemcpy(d_iota_, iota.data(), MAX_DECODE_B * sizeof(int), cudaMemcpyHostToDevice));
-        std::vector<int> zero(max_ctx_, 0);
-        CUDA_CHECK(cudaMemcpy(d_zero_, zero.data(), max_ctx_ * sizeof(int), cudaMemcpyHostToDevice));
-    }
-    // flash-decoding split-K scratch, sized for a full decode batch
-    CUDA_CHECK(cudaMalloc(&part_m_,   (size_t)MAX_DECODE_B * nh * ATTN_SPLITS * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&part_l_,   (size_t)MAX_DECODE_B * nh * ATTN_SPLITS * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&part_acc_, (size_t)MAX_DECODE_B * nh * ATTN_SPLITS * hd * sizeof(float)));
     CUDA_CHECK(cudaStreamCreate(&stream_));
     host_logits_.resize((size_t)MAX_DECODE_B * V);
 
     size_t freeb, totalb;
     CUDA_CHECK(cudaMemGetInfo(&freeb, &totalb));
-    std::fprintf(stderr, "[model] weights + activations ready (max_ctx=%d, up to %d concurrent). "
-                 "GPU mem: %.1f GB used / %.1f GB total. KV pool allocated separately.\n",
-                 max_ctx_, max_batch(), (totalb - freeb) / 1e9, totalb / 1e9);
+    std::fprintf(stderr, "[model] weights + activations ready (max_ctx=%d, max_rows=%d, up to %d "
+                 "concurrent). GPU mem: %.1f GB used / %.1f GB total. KV pool allocated separately.\n",
+                 max_ctx_, max_rows_, max_batch(), (totalb - freeb) / 1e9, totalb / 1e9);
 }
 
-// --- single-sequence prefill: M tokens into the paged KV described by d_bt_ row 0 ----------
-// The store/attention kernels resolve every position through that block table; d_pos_ holds the
-// logical positions (past_len..past_len+M-1) and d_past_ the base offset, so a chunked prefill
-// (past_len>0) writes into the correct blocks. All M tokens use block-table row 0 (d_zero_).
-void ModelRuntime::run_layers_prefill(int M) {
+void ModelRuntime::mm(const float* x, const QWeight& w, float* y, int M, int IN, int OUT, bool pure_decode) {
+    if (pure_decode) launch_matmul_decode(x, w.w, w.scale, y, M, IN, OUT, stream_);
+    else             launch_matmul(x, w.w, w.scale, y, M, IN, OUT, xbf_, w_dq_, stream_);
+}
+
+// The unified layer stack over T query rows. Every per-token op runs on the flattened batch; the
+// attention kernel resolves each row's request/position/KV through d_req_/d_pos_/d_bt_.
+void ModelRuntime::run_layers(int T, bool pure_decode) {
     const ModelSpec& c = spec_;
     int H = c.hidden_size, QD = c.q_dim(), KVD = c.kv_dim(), I = c.intermediate;
     int nH = c.num_heads, nKV = c.num_kv_heads, hd = c.head_dim;
     float eps = c.rms_eps, scale = 1.0f / std::sqrt((float)hd);
     cudaStream_t s = stream_;
+    int blk = pool_->block_size();
 
-    launch_embed(d_ids_, embed_, x_, M, H, s);
-
-    for (int l = 0; l < c.num_layers; ++l) {
-        Layer& L = layers_[l];
-
-        launch_rmsnorm(x_, L.in_norm, xb_, M, H, eps, s);
-        launch_matmul(xb_, L.q_proj.w, L.q_proj.scale, q_, M, H, QD,  xbf_, w_dq_, s);
-        launch_matmul(xb_, L.k_proj.w, L.k_proj.scale, k_, M, H, KVD, xbf_, w_dq_, s);
-        launch_matmul(xb_, L.v_proj.w, L.v_proj.scale, v_, M, H, KVD, xbf_, w_dq_, s);
-
-        launch_rmsnorm(q_, L.q_norm, q_, M * nH,  hd, eps, s);
-        launch_rmsnorm(k_, L.k_norm, k_, M * nKV, hd, eps, s);
-        launch_rope(q_, d_pos_, M, nH,  hd, c.rope_theta, s);
-        launch_rope(k_, d_pos_, M, nKV, hd, c.rope_theta, s);
-
-        int blk = kv_->block_size();
-        launch_store_kv_paged(k_, kv_->k(l), d_bt_, bt_stride_, blk, KVD, d_zero_, d_pos_, M, s);
-        launch_store_kv_paged(v_, kv_->v(l), d_bt_, bt_stride_, blk, KVD, d_zero_, d_pos_, M, s);
-        launch_attention_paged(q_, kv_->k(l), kv_->v(l), attn_, M, nH, nKV, hd, d_past_, scale,
-                               d_bt_, bt_stride_, blk, s);
-
-        launch_matmul(attn_, L.o_proj.w, L.o_proj.scale, xb2_, M, QD, H, xbf_, w_dq_, s);
-        launch_add(x_, xb2_, M * H, s);
-
-        launch_rmsnorm(x_, L.post_norm, xb_, M, H, eps, s);
-        launch_matmul(xb_, L.gate.w, L.gate.scale, gate_, M, H, I, xbf_, w_dq_, s);
-        launch_matmul(xb_, L.up.w,   L.up.scale,   up_,   M, H, I, xbf_, w_dq_, s);
-        launch_silu_mul(gate_, up_, hmlp_, M * I, s);
-        launch_matmul(hmlp_, L.down.w, L.down.scale, xb2_, M, I, H, xbf_, w_dq_, s);
-        launch_add(x_, xb2_, M * H, s);
-    }
-
-    // only the last token's logits are needed (GEMV) -> logits_ row 0
-    float* xlast = x_ + (size_t)(M - 1) * H;
-    launch_rmsnorm(xlast, fnorm_, xb_, 1, H, eps, s);
-    launch_matmul(xb_, lm_head_.w, lm_head_.scale, logits_, 1, H, c.vocab_size, xbf_, w_dq_, s);
-}
-
-void ModelRuntime::prefill(const std::vector<int>& tokens, const std::vector<int>& block_table, int past_len) {
-    int M = (int)tokens.size();
-    CUDA_CHECK(cudaMemcpy(d_ids_, tokens.data(), M * sizeof(int), cudaMemcpyHostToDevice));
-    std::vector<int> pos(M);
-    for (int i = 0; i < M; ++i) pos[i] = past_len + i;
-    CUDA_CHECK(cudaMemcpy(d_pos_, pos.data(), M * sizeof(int), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_past_, &past_len, sizeof(int), cudaMemcpyHostToDevice));
-    bt_stride_ = (int)block_table.size();          // block table goes into d_bt_ row 0
-    CUDA_CHECK(cudaMemcpy(d_bt_, block_table.data(), bt_stride_ * sizeof(int), cudaMemcpyHostToDevice));
-    run_layers_prefill(M);
-    CUDA_CHECK(cudaStreamSynchronize(stream_));   // logits_ row 0 ready
-}
-
-// --- batched single-token decode for B sequences -----------------------------------------
-// Leaves the post-final-layer residual stream for all B sequences in x_ ([B, H]).
-void ModelRuntime::run_layers_decode(int B) {
-    const ModelSpec& c = spec_;
-    int H = c.hidden_size, QD = c.q_dim(), KVD = c.kv_dim(), I = c.intermediate;
-    int nH = c.num_heads, nKV = c.num_kv_heads, hd = c.head_dim;
-    float eps = c.rms_eps, scale = 1.0f / std::sqrt((float)hd);
-    cudaStream_t s = stream_;
-
-    launch_embed(d_ids_, embed_, x_, B, H, s);
+    launch_embed(d_ids_, embed_, x_, T, H, s);
 
     for (int l = 0; l < c.num_layers; ++l) {
         Layer& L = layers_[l];
 
-        launch_rmsnorm(x_, L.in_norm, xb_, B, H, eps, s);
-        launch_matmul_decode(xb_, L.q_proj.w, L.q_proj.scale, q_, B, H, QD,  s);
-        launch_matmul_decode(xb_, L.k_proj.w, L.k_proj.scale, k_, B, H, KVD, s);
-        launch_matmul_decode(xb_, L.v_proj.w, L.v_proj.scale, v_, B, H, KVD, s);
+        launch_rmsnorm(x_, L.in_norm, xb_, T, H, eps, s);
+        mm(xb_, L.q_proj, q_, T, H, QD,  pure_decode);
+        mm(xb_, L.k_proj, k_, T, H, KVD, pure_decode);
+        mm(xb_, L.v_proj, v_, T, H, KVD, pure_decode);
 
-        launch_rmsnorm(q_, L.q_norm, q_, B * nH,  hd, eps, s);
-        launch_rmsnorm(k_, L.k_norm, k_, B * nKV, hd, eps, s);
-        launch_rope(q_, d_pos_, B, nH,  hd, c.rope_theta, s);   // d_pos_[b] = past_len[b]
-        launch_rope(k_, d_pos_, B, nKV, hd, c.rope_theta, s);
+        launch_rmsnorm(q_, L.q_norm, q_, T * nH,  hd, eps, s);
+        launch_rmsnorm(k_, L.k_norm, k_, T * nKV, hd, eps, s);
+        launch_rope(q_, d_pos_, T, nH,  hd, c.rope_theta, s);   // d_pos_[m] = row m's absolute position
+        launch_rope(k_, d_pos_, T, nKV, hd, c.rope_theta, s);
 
-        // append each sequence's new K/V at its logical position past_len[b] (= d_pos_); the
-        // block table (d_bt_, row b via d_iota_) maps that to a physical block row.
-        int blk = kv_->block_size();
-        launch_store_kv_paged(k_, kv_->k(l), d_bt_, bt_stride_, blk, KVD, d_iota_, d_pos_, B, s);
-        launch_store_kv_paged(v_, kv_->v(l), d_bt_, bt_stride_, blk, KVD, d_iota_, d_pos_, B, s);
-        launch_attention_decode_paged(q_, kv_->k(l), kv_->v(l), attn_, B, nH, nKV, hd,
-                                      d_pos_, d_bt_, bt_stride_, blk, scale,
-                                      part_m_, part_l_, part_acc_, s);
+        // append each row's new K/V at its position (d_pos_), into its request's blocks (d_req_ row).
+        launch_store_kv_paged(k_, pool_->k(l), d_bt_, bt_stride_, blk, KVD, d_req_, d_pos_, T, s);
+        launch_store_kv_paged(v_, pool_->v(l), d_bt_, bt_stride_, blk, KVD, d_req_, d_pos_, T, s);
+        launch_attention_varlen(q_, pool_->k(l), pool_->v(l), attn_, T, nH, nKV, hd,
+                                d_pos_, d_req_, d_bt_, bt_stride_, blk, scale, s);
 
-        launch_matmul_decode(attn_, L.o_proj.w, L.o_proj.scale, xb2_, B, QD, H, s);
-        launch_add(x_, xb2_, B * H, s);
+        mm(attn_, L.o_proj, xb2_, T, QD, H, pure_decode);
+        launch_add(x_, xb2_, T * H, s);
 
-        launch_rmsnorm(x_, L.post_norm, xb_, B, H, eps, s);
-        launch_matmul_decode(xb_, L.gate.w, L.gate.scale, gate_, B, H, I, s);
-        launch_matmul_decode(xb_, L.up.w,   L.up.scale,   up_,   B, H, I, s);
-        launch_silu_mul(gate_, up_, hmlp_, B * I, s);
-        launch_matmul_decode(hmlp_, L.down.w, L.down.scale, xb2_, B, I, H, s);
-        launch_add(x_, xb2_, B * H, s);
+        launch_rmsnorm(x_, L.post_norm, xb_, T, H, eps, s);
+        mm(xb_, L.gate, gate_, T, H, I, pure_decode);
+        mm(xb_, L.up,   up_,   T, H, I, pure_decode);
+        launch_silu_mul(gate_, up_, hmlp_, T * I, s);
+        mm(hmlp_, L.down, xb2_, T, I, H, pure_decode);
+        launch_add(x_, xb2_, T * H, s);
     }
 }
 
-// Pack B block tables, padded to the longest, into host_bt_ and upload to d_bt_; bt_stride_ is
-// the padded row length the kernels index with.
+// Pack R block tables, padded to the longest, into host_bt_ and upload to d_bt_; bt_stride_ is the
+// padded row length the kernels index with.
 void ModelRuntime::upload_block_tables(const std::vector<std::vector<int>>& bts) {
-    int B = (int)bts.size();
+    int R = (int)bts.size();
     int mb = 1;
     for (auto& t : bts) mb = std::max(mb, (int)t.size());
     bt_stride_ = mb;
-    for (int b = 0; b < B; ++b) {
-        int* row = host_bt_.data() + (size_t)b * mb;
-        for (int g = 0; g < mb; ++g) row[g] = g < (int)bts[b].size() ? bts[b][g] : 0;
+    for (int r = 0; r < R; ++r) {
+        int* row = host_bt_.data() + (size_t)r * mb;
+        for (int g = 0; g < mb; ++g) row[g] = g < (int)bts[r].size() ? bts[r][g] : 0;
     }
-    CUDA_CHECK(cudaMemcpy(d_bt_, host_bt_.data(), (size_t)B * mb * sizeof(int), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_bt_, host_bt_.data(), (size_t)R * mb * sizeof(int), cudaMemcpyHostToDevice));
 }
 
-// Shared forward for a decode batch: H2D inputs, the layer stack, final norm, and the lm_head
-// GEMV — one pass reads the lm_head weight once for the whole batch and leaves the [B, vocab]
-// logits in logits_ on the device. Async on stream_ (caller syncs).
-void ModelRuntime::decode_forward(const std::vector<int>& in_tokens, const std::vector<int>& past_len,
-                           const std::vector<std::vector<int>>& block_tables) {
-    int B = (int)in_tokens.size();
-    int V = spec_.vocab_size, H = spec_.hidden_size;
-    CUDA_CHECK(cudaMemcpy(d_ids_, in_tokens.data(), B * sizeof(int), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_pos_, past_len.data(),  B * sizeof(int), cudaMemcpyHostToDevice));
+// Shared forward: H2D inputs, the unified layer stack, then gather the per-request sampling rows and
+// run final norm + lm_head only on those -> logits_ [S, vocab] on the device. Async on stream_.
+void ModelRuntime::forward_core(const std::vector<int>& tokens, const std::vector<int>& positions,
+                                const std::vector<int>& req_index,
+                                const std::vector<std::vector<int>>& block_tables,
+                                const std::vector<int>& logits_rows) {
+    int T = (int)tokens.size(), R = (int)block_tables.size(), S = (int)logits_rows.size();
+    int H = spec_.hidden_size, V = spec_.vocab_size;
+    CUDA_CHECK(cudaMemcpy(d_ids_, tokens.data(),    T * sizeof(int), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_pos_, positions.data(), T * sizeof(int), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_req_, req_index.data(), T * sizeof(int), cudaMemcpyHostToDevice));
     upload_block_tables(block_tables);
 
-    run_layers_decode(B);
-    launch_rmsnorm(x_, fnorm_, xb_, B, H, spec_.rms_eps, stream_);          // final norm, all B rows
-    launch_matmul_decode(xb_, lm_head_.w, lm_head_.scale, logits_, B, H, V, stream_);
+    bool pure_decode = (T == R);   // every request contributes exactly one row -> batched INT8 GEMV
+    run_layers(T, pure_decode);
+
+    if (S > 0) {
+        CUDA_CHECK(cudaMemcpy(d_lrows_, logits_rows.data(), S * sizeof(int), cudaMemcpyHostToDevice));
+        launch_gather_rows(x_, d_lrows_, xg_, S, H, stream_);
+        launch_rmsnorm(xg_, fnorm_, xb_, S, H, spec_.rms_eps, stream_);
+        launch_matmul_decode(xb_, lm_head_.w, lm_head_.scale, logits_, S, H, V, stream_);  // INT8 GEMV
+    }
 }
 
-void ModelRuntime::decode(const std::vector<int>& in_tokens, const std::vector<int>& past_len,
-                   const std::vector<std::vector<int>>& block_tables, std::vector<int>& out_tokens) {
-    int B = (int)in_tokens.size();
-    decode_forward(in_tokens, past_len, block_tables);
-    launch_argmax_batch(logits_, B, spec_.vocab_size, d_arg_, stream_);     // greedy, on the GPU
-    out_tokens.resize(B);
-    CUDA_CHECK(cudaMemcpyAsync(out_tokens.data(), d_arg_, B * sizeof(int),
-                               cudaMemcpyDeviceToHost, stream_));
+void ModelRuntime::forward(const std::vector<int>& tokens, const std::vector<int>& positions,
+                           const std::vector<int>& req_index,
+                           const std::vector<std::vector<int>>& block_tables,
+                           const std::vector<int>& logits_rows, std::vector<int>& out_tokens) {
+    int S = (int)logits_rows.size();
+    forward_core(tokens, positions, req_index, block_tables, logits_rows);
+    out_tokens.resize(S);
+    if (S > 0) {
+        launch_argmax_batch(logits_, S, spec_.vocab_size, d_arg_, stream_);   // greedy, on the GPU
+        CUDA_CHECK(cudaMemcpyAsync(out_tokens.data(), d_arg_, S * sizeof(int),
+                                   cudaMemcpyDeviceToHost, stream_));
+    }
     CUDA_CHECK(cudaStreamSynchronize(stream_));
 }
 
-const float* ModelRuntime::decode_logits_host(const std::vector<int>& in_tokens,
-                                       const std::vector<int>& past_len,
-                                       const std::vector<std::vector<int>>& block_tables) {
-    int B = (int)in_tokens.size();
-    decode_forward(in_tokens, past_len, block_tables);
-    CUDA_CHECK(cudaMemcpyAsync(host_logits_.data(), logits_, (size_t)B * spec_.vocab_size * sizeof(float),
-                               cudaMemcpyDeviceToHost, stream_));
+const float* ModelRuntime::forward_logits_host(const std::vector<int>& tokens,
+                                               const std::vector<int>& positions,
+                                               const std::vector<int>& req_index,
+                                               const std::vector<std::vector<int>>& block_tables,
+                                               const std::vector<int>& logits_rows) {
+    int S = (int)logits_rows.size();
+    forward_core(tokens, positions, req_index, block_tables, logits_rows);
+    if (S > 0)
+        CUDA_CHECK(cudaMemcpyAsync(host_logits_.data(), logits_, (size_t)S * spec_.vocab_size * sizeof(float),
+                                   cudaMemcpyDeviceToHost, stream_));
     CUDA_CHECK(cudaStreamSynchronize(stream_));
     return host_logits_.data();
-}
-
-int ModelRuntime::argmax_last() {
-    launch_argmax(logits_, spec_.vocab_size, d_arg_, stream_);
-    int id = 0;
-    CUDA_CHECK(cudaMemcpyAsync(&id, d_arg_, sizeof(int), cudaMemcpyDeviceToHost, stream_));
-    CUDA_CHECK(cudaStreamSynchronize(stream_));
-    return id;
-}
-
-const std::vector<float>& ModelRuntime::copy_logits() {
-    CUDA_CHECK(cudaMemcpy(host_logits_.data(), logits_, spec_.vocab_size * sizeof(float), cudaMemcpyDeviceToHost));
-    return host_logits_;
 }
 
 ModelRuntime::~ModelRuntime() {
@@ -336,9 +268,9 @@ ModelRuntime::~ModelRuntime() {
     for (auto p : all_fbufs_) if (p) cudaFree(p);
     for (auto p : all_i8_)    if (p) cudaFree(p);
     cudaFree(x_); cudaFree(xb_); cudaFree(xb2_); cudaFree(q_); cudaFree(k_); cudaFree(v_);
-    cudaFree(attn_); cudaFree(gate_); cudaFree(up_); cudaFree(hmlp_); cudaFree(logits_);
-    cudaFree(xbf_); cudaFree(w_dq_); cudaFree(part_m_); cudaFree(part_l_); cudaFree(part_acc_);
-    cudaFree(d_ids_); cudaFree(d_pos_); cudaFree(d_arg_); cudaFree(d_past_);
-    cudaFree(d_bt_); cudaFree(d_iota_); cudaFree(d_zero_);
+    cudaFree(attn_); cudaFree(gate_); cudaFree(up_); cudaFree(hmlp_); cudaFree(xg_); cudaFree(logits_);
+    cudaFree(xbf_); cudaFree(w_dq_);
+    cudaFree(d_ids_); cudaFree(d_pos_); cudaFree(d_req_);
+    cudaFree(d_bt_); cudaFree(d_lrows_); cudaFree(d_arg_);
     if (stream_) cudaStreamDestroy(stream_);
 }

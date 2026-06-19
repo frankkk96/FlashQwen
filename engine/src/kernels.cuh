@@ -51,34 +51,30 @@ void launch_rope(float* x, const int* pos, int M, int n_heads, int head_dim, flo
 // ---- Paged KV cache attention -----------------------------------------------------------
 // The KV pool for a layer is [num_blocks, BLOCK, kv_dim] BF16. A sequence's KV is a list of
 // physical block ids — its "block table"; the logical->physical addressing lives in kv_cache.cuh
-// (kv_phys_row), and the write side (store) in kv_cache.* . `bt` holds one block table per row
-// (stride `max_blocks`); a sequence is identified by its row.
+// (kv_phys_row), and the write side (store) in block_pool.* . `bt` holds one block table per
+// request (stride `max_blocks`).
+//
+// Unified varlen attention over the paged pool — one kernel for the whole mixed batch (prefill
+// chunks + decodes together). q/out are [T, n_heads, head_dim] (T = total query rows across all
+// requests). Query row m belongs to request req_index[m] (-> block-table row req_index[m] of `bt`)
+// at absolute position pos[m], and attends that request's keys [0, pos[m]] (causal). One warp per
+// (head, query row); online softmax in registers. Simple/correct (no split-K) — optimise later.
+void launch_attention_varlen(const float* q, const bf16* cache_k, const bf16* cache_v, float* out,
+                             int T, int n_heads, int n_kv, int head_dim,
+                             const int* pos, const int* req_index,
+                             const int* bt, int max_blocks, int block_size, float scale,
+                             cudaStream_t s);
 
-// Prefill attention (M query rows of ONE sequence, block table = row 0 of `bt`) over the paged
-// pool. q[M, n_heads, hd] FP32; out[M, n_heads, hd]. Query token m attends keys [0, *d_past + m].
-void launch_attention_paged(const float* q, const bf16* cache_k, const bf16* cache_v, float* out,
-                            int M, int n_heads, int n_kv, int head_dim, const int* d_past,
-                            float scale, const int* bt, int max_blocks, int block_size,
-                            cudaStream_t s);
-
-// Batched flash-decoding split-K over the paged pool. Sequence b uses block-table row b of `bt`,
-// attending keys [0, past_len[b]]. q/out are [B, n_heads, head_dim]. part_* are scratch sized for
-// B*n_heads*ATTN_SPLITS (m/l) and *head_dim (acc).
-#define ATTN_SPLITS 16
-void launch_attention_decode_paged(const float* q, const bf16* cache_k, const bf16* cache_v,
-                                   float* out, int B, int n_heads, int n_kv, int head_dim,
-                                   const int* past_len, const int* bt, int max_blocks, int block_size,
-                                   float scale, float* part_m, float* part_l, float* part_acc,
-                                   cudaStream_t s);
+// Gather S rows from x[*, H] into out[S, H]: out[i] = x[rows[i]]. Used to pull the per-request
+// "last token" rows out of the flattened batch before the final norm + lm_head (so lm_head runs
+// only on the rows that need a sampled token, not the whole batch).
+void launch_gather_rows(const float* x, const int* rows, float* out, int S, int H, cudaStream_t s);
 
 // out[i] += in[i]   for N elements
 void launch_add(float* out, const float* in, int N, cudaStream_t s);
 
 // h[i] = silu(gate[i]) * up[i]   for N elements
 void launch_silu_mul(const float* gate, const float* up, float* h, int N, cudaStream_t s);
-
-// argmax over logits[N] -> single index in d_out (greedy decode; avoids copying all logits).
-void launch_argmax(const float* logits, int N, int* d_out, cudaStream_t s);
 
 // Batched argmax: logits is [B, N]; d_out[b] = argmax over row b. One block per row.
 void launch_argmax_batch(const float* logits, int B, int N, int* d_out, cudaStream_t s);

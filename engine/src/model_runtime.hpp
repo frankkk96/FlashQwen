@@ -1,11 +1,11 @@
 // Qwen3 dense decoder — the GPU executor: weight management + forward pass. The declarative half
 // (dims, arch) is ModelSpec (model_spec.hpp). Porting note: this is the compute half — the kernels
-// and the prefill/decode forward are what you rewrite for a different model.
+// and the unified forward are what you rewrite for a different model.
 #pragma once
 #include "model_spec.hpp"
 #include "safetensors.hpp"
 #include "kernels.cuh"
-#include "kv_cache.hpp"
+#include "block_pool.hpp"
 #include <vector>
 #include <string>
 #include <functional>
@@ -13,39 +13,36 @@
 class ModelRuntime {
 public:
     // Load the weights described by `spec` (safetensors, from spec.dir). max_ctx bounds the
-    // per-sequence KV cache and the prefill batch size. Allocates weights + activation scratch only
-    // — the paged KV pool lives in a separate KVCache; attach one (sized from the VRAM left after
-    // construction) before any prefill/decode call. on_progress (may be empty) is called as each
-    // transformer layer's weights upload, with (layers_done, layers_total), for a startup progress bar.
+    // per-sequence KV cache; max_batch_tokens bounds the number of query rows in one forward.
+    // Allocates weights + activation scratch only — the paged KV pool lives in a separate
+    // BlockPool; attach one (sized from the VRAM left after construction) before any forward call.
+    // on_progress (may be empty) is called as each transformer layer's weights upload, with
+    // (layers_done, layers_total), for a startup progress bar.
     using ProgressFn = std::function<void(int done, int total)>;
-    ModelRuntime(const ModelSpec& spec, int max_ctx, ProgressFn on_progress = {});
-    void attach_kv(const KVCache& kv) { kv_ = &kv; }   // non-owning; storage for the attention kernels
+    ModelRuntime(const ModelSpec& spec, int max_ctx, int max_batch_tokens, ProgressFn on_progress = {});
+    void attach_pool(const BlockPool& pool) { pool_ = &pool; }   // non-owning; storage for the attention kernels
     ~ModelRuntime();
 
-    // --- single-sequence prefill ---------------------------------------------------------
-    // Prefill `tokens` into the sequence whose paged KV is described by `block_table` (physical
-    // block ids), at logical positions past_len..past_len+M-1 (past_len>0 extends an existing
-    // sequence). The caller owns the block table and must have allocated enough blocks to cover
-    // past_len+M tokens. Leaves the LAST token's logits in row 0 (use argmax_last / copy_logits).
-    void prefill(const std::vector<int>& tokens, const std::vector<int>& block_table, int past_len = 0);
-
-    int argmax_last();                          // argmax of the prefill logits (row 0), on GPU
-    const std::vector<float>& copy_logits();    // prefill/decode logits row 0 -> host (sampling)
-
-    // --- batched decode ------------------------------------------------------------------
-    // One token per sequence for B sequences: sequence b feeds in_tokens[b], has past_len[b]
-    // tokens cached in the paged blocks listed by block_tables[b]. decode() returns the greedy
-    // next token per sequence (argmax on the GPU). decode_logits_host() instead runs the same
-    // forward and copies the full [B, vocab] logits to the host (row-major) for per-sequence
-    // sampling; the returned pointer is valid until the next decode/prefill call.
-    void decode(const std::vector<int>& in_tokens, const std::vector<int>& past_len,
-                const std::vector<std::vector<int>>& block_tables, std::vector<int>& out_tokens);
-    const float* decode_logits_host(const std::vector<int>& in_tokens, const std::vector<int>& past_len,
-                                    const std::vector<std::vector<int>>& block_tables);
+    // --- one merged forward over a flattened mixed batch (prefill chunks + decodes together) ----
+    // The whole running set is computed in one pass. The inputs describe the flattened batch:
+    //   tokens[t], positions[t]  : the t-th query row's token id and its absolute logical position
+    //   req_index[t]             : which request that row belongs to (0..R-1)
+    //   block_tables[r]          : request r's physical KV block ids (row r of the uploaded table)
+    //   logits_rows[s]           : the flattened row index whose logits feed sampling for request s
+    //                              (the last row of each request that has reached its frontier)
+    // forward(): greedy argmax per sampling row, on the GPU -> out_tokens[S].
+    // forward_logits_host(): run the same forward and copy the [S, vocab] logits to the host
+    // (row-major) for per-request sampling; the returned pointer is valid until the next call.
+    void forward(const std::vector<int>& tokens, const std::vector<int>& positions,
+                 const std::vector<int>& req_index, const std::vector<std::vector<int>>& block_tables,
+                 const std::vector<int>& logits_rows, std::vector<int>& out_tokens);
+    const float* forward_logits_host(const std::vector<int>& tokens, const std::vector<int>& positions,
+                 const std::vector<int>& req_index, const std::vector<std::vector<int>>& block_tables,
+                 const std::vector<int>& logits_rows);
 
     const ModelSpec& spec() const { return spec_; }
     int max_ctx() const { return max_ctx_; }
-    int max_batch() const { return MAX_DECODE_B; }                 // concurrent decode cap
+    int max_batch() const { return MAX_DECODE_B; }                 // concurrent request cap
 
 private:
     struct QWeight { int8_t* w = nullptr; float* scale = nullptr; };  // INT8 + per-row scale
@@ -58,33 +55,40 @@ private:
     float*  upload_norm(const std::string& name);   // bf16 -> fp32
     QWeight upload_int8(const std::string& name);    // bf16 -> int8 + per-row scale
 
-    void run_layers_prefill(int M);                  // single-seq prefill (block table in d_bt_ row 0)
-    void run_layers_decode(int B);                   // batched single-token decode
-    void upload_block_tables(const std::vector<std::vector<int>>& bts);   // -> d_bt_, returns stride in bt_stride_
-    void decode_forward(const std::vector<int>& in_tokens, const std::vector<int>& past_len,
-                        const std::vector<std::vector<int>>& block_tables);  // -> logits_ [B, vocab]
+    // Pick the matmul kernel for the layer stack: pure-decode steps (1 token per request) use the
+    // batched INT8 GEMV (reads weights once, amortised across the batch — the decode-throughput
+    // win); steps that include any prefill rows use the WMMA path (dequantise to BF16, tensor cores).
+    void mm(const float* x, const QWeight& w, float* y, int M, int IN, int OUT, bool pure_decode);
+    void run_layers(int T, bool pure_decode);
+    void upload_block_tables(const std::vector<std::vector<int>>& bts);   // -> d_bt_, sets bt_stride_
+    void forward_core(const std::vector<int>& tokens, const std::vector<int>& positions,
+                      const std::vector<int>& req_index,
+                      const std::vector<std::vector<int>>& block_tables,
+                      const std::vector<int>& logits_rows);   // -> logits_ [S, vocab], returns S rows
 
     ModelSpec spec_;
     SafeTensors st_;
-    int max_ctx_     = 4096;
-    int max_blocks_  = 0;    // ceil(max_ctx / KVCache::BLOCK) = max block-table length per sequence
-    int bt_stride_   = 0;    // current block-table row stride uploaded to d_bt_
+    int max_ctx_      = 4096;
+    int max_rows_     = 4096;   // max query rows in one forward = max(max_ctx, max_batch_tokens)
+    int max_blocks_   = 0;      // ceil(max_ctx / BlockPool::BLOCK) = max block-table length per request
+    int bt_stride_    = 0;      // current block-table row stride uploaded to d_bt_
 
-    const KVCache* kv_ = nullptr;   // paged KV storage the attention kernels read/write (non-owning)
+    const BlockPool* pool_ = nullptr;   // paged KV storage the attention kernels read/write (non-owning)
 
     bf16*   embed_  = nullptr;
     float*  fnorm_  = nullptr;
     QWeight lm_head_;
     std::vector<Layer> layers_;
 
-    // activation scratch (sized to max_ctx tokens, which also covers any decode batch)
+    // activation scratch (sized to max_rows_ query rows)
     float *x_, *xb_, *xb2_, *q_, *k_, *v_, *attn_, *gate_, *up_, *hmlp_, *logits_;
-    bf16  *xbf_ = nullptr;   // BF16 activation scratch for tensor-core prefill matmul
-    bf16  *w_dq_ = nullptr;  // BF16 dequantized-weight scratch for prefill matmul
-    float *part_m_, *part_l_, *part_acc_;   // flash-decoding split-K scratch (x MAX_DECODE_B)
-    int   *d_ids_, *d_pos_, *d_arg_, *d_past_;
-    int   *d_bt_, *d_iota_, *d_zero_;       // block tables; decode bt_row (0..B-1); prefill bt_row (all 0)
-    std::vector<int>   host_bt_;            // scratch to pack padded block tables for upload
+    float *xg_ = nullptr;    // gathered sampling rows [MAX_DECODE_B, H] before final norm + lm_head
+    bf16  *xbf_ = nullptr;   // BF16 activation scratch for the tensor-core matmul
+    bf16  *w_dq_ = nullptr;  // BF16 dequantized-weight scratch for the tensor-core matmul
+    int   *d_ids_, *d_pos_, *d_req_;   // per-row: token id, absolute position, request index
+    int   *d_bt_;                      // packed per-request block tables [R, bt_stride_]
+    int   *d_lrows_, *d_arg_;          // sampling-row indices [S]; greedy argmax output [S]
+    std::vector<int>   host_bt_;       // scratch to pack padded block tables for upload
     std::vector<float> host_logits_;
 
     cudaStream_t stream_ = nullptr;

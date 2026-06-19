@@ -1,15 +1,15 @@
-#include "kv_cache.hpp"
+#include "block_pool.hpp"
 #include "kv_cache.cuh"   // kv_phys_row: shared addressing contract
 #include <cstdio>
 #include <cstdlib>
 
-KVCache::KVCache(const ModelSpec& spec, int max_ctx, float gpu_mem_fraction) {
+BlockPool::BlockPool(const ModelSpec& spec, int max_ctx, float gpu_mem_fraction) {
     int kvd = spec.kv_dim();
     max_blocks_ = (max_ctx + BLOCK - 1) / BLOCK;   // block-table length for a full-length sequence
 
     // The pool gets whatever VRAM is left under the gpu_mem_fraction cap, carved into fixed-size
     // blocks of BLOCK tokens. Unlike a per-sequence reservation, blocks are handed out on demand by
-    // the scheduler, so the number of concurrent sequences is decoupled from max_ctx.
+    // the manager/scheduler, so the number of concurrent sequences is decoupled from max_ctx.
     size_t freeb, totalb;
     CUDA_CHECK(cudaMemGetInfo(&freeb, &totalb));
     size_t used      = totalb - freeb;
@@ -32,6 +32,10 @@ KVCache::KVCache(const ModelSpec& spec, int max_ctx, float gpu_mem_fraction) {
         CUDA_CHECK(cudaMalloc(&v_[l], (size_t)num_blocks_ * BLOCK * kvd * sizeof(bf16)));
     }
 
+    // Seed the free list with every block id (back() = block 0, so ids are handed out 0,1,2,...).
+    free_blocks_.reserve(num_blocks_);
+    for (int b = num_blocks_ - 1; b >= 0; --b) free_blocks_.push_back(b);
+
     CUDA_CHECK(cudaMemGetInfo(&freeb, &totalb));
     std::fprintf(stderr, "[kv] %d blocks x %d tok = %d-token pool (max_ctx=%d). "
                  "GPU mem: %.1f GB used / %.1f GB total\n",
@@ -39,13 +43,13 @@ KVCache::KVCache(const ModelSpec& spec, int max_ctx, float gpu_mem_fraction) {
                  (totalb - freeb) / 1e9, totalb / 1e9);
 }
 
-KVCache::~KVCache() {
+BlockPool::~BlockPool() {
     for (auto p : k_) if (p) cudaFree(p);
     for (auto p : v_) if (p) cudaFree(p);
 }
 
 // ---- write side: scatter freshly-projected K/V rows into the pool -----------------------
-// The cache's only mutating operation (the attention kernels read it; see kernels.cu). Token m
+// The pool's only mutating compute op (the attention kernels read it; see kernels.cu). Token m
 // belongs to the sequence whose block table is row bt_row[m] of `bt`, at logical position pos[m].
 __global__ void store_kv_paged_kernel(const float* __restrict__ src, bf16* __restrict__ cache,
                                       const int* __restrict__ bt, int max_blocks, int block_size,

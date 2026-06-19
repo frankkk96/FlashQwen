@@ -1,6 +1,7 @@
 #include "grpc_server.hpp"
 #include "model_spec.hpp"
 #include "model_runtime.hpp"
+#include "block_pool.hpp"
 #include "kv_cache.hpp"
 #include "scheduler.hpp"
 #include "errors.hpp"
@@ -71,7 +72,8 @@ struct RequestCtx {
 
 // ---- the engine: the single thread that touches the model / GPU -------------------------
 struct EngineLoop {
-    ModelRuntime& model; const KVCache& kv; std::mt19937& rng; int n_slots; int max_queue;
+    ModelRuntime& model; KVCacheManager& kv; std::mt19937& rng;
+    int n_slots; int max_queue; int max_batch_tokens; int max_prefill;
     std::mutex mu; std::condition_variable cv;
     std::deque<std::shared_ptr<RequestCtx>> inbound;
     std::deque<Request*> cancel_q;
@@ -86,7 +88,7 @@ struct EngineLoop {
     }
 
     void run() {
-        Scheduler sched(model, kv, n_slots, max_queue, rng);
+        Scheduler sched(model, kv, n_slots, max_queue, max_batch_tokens, max_prefill, rng);
         std::unordered_map<Request*, std::shared_ptr<RequestCtx>> conns;
 
         // Terminate a request's stream with a structured error event (its blocks are already freed
@@ -258,20 +260,24 @@ int run_engine(const Args& a, const std::string& model_id, std::mt19937& rng) {
                 return;
             }
             status.set_phase("loading weights", spec.num_layers);
-            ModelRuntime model(spec, a.max_ctx, [&](int done, int total) { status.advance(done, total); });
+            ModelRuntime model(spec, a.max_ctx, a.max_batch_tokens,
+                               [&](int done, int total) { status.advance(done, total); });
 
             status.set_phase("allocating kv pool");
-            KVCache kv(spec, a.max_ctx, a.gpu_mem_fraction);
-            model.attach_kv(kv);
+            BlockPool pool(spec, a.max_ctx, a.gpu_mem_fraction);
+            model.attach_pool(pool);
+            KVCacheManager kv(pool);
 
             int n_slots = a.slots;
             if (n_slots > model.max_batch()) n_slots = model.max_batch();
             int max_queue = a.max_queue <= 0 ? 4 * n_slots : a.max_queue;
-            EngineLoop engine{model, kv, rng, n_slots, max_queue};
+            int max_prefill = a.max_prefill_tokens > 0 ? a.max_prefill_tokens : a.max_batch_tokens;
+            EngineLoop engine{model, kv, rng, n_slots, max_queue, a.max_batch_tokens, max_prefill};
             service.set_ready(&engine, model_id, model.max_ctx(), spec.vocab_size);
             status.mark_ready();
-            std::fprintf(stderr, "[engine] ready: %d slots, max_queue %d, model %s\n",
-                         n_slots, max_queue, model_id.c_str());
+            std::fprintf(stderr, "[engine] ready: %d slots, max_queue %d, max_batch_tokens %d, "
+                         "max_prefill %d, model %s\n",
+                         n_slots, max_queue, a.max_batch_tokens, max_prefill, model_id.c_str());
             engine.run();   // becomes the engine thread; blocks for the process lifetime
         } catch (const std::exception& e) {
             status.mark_failed(std::string("model load failed: ") + e.what());
