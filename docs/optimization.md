@@ -49,6 +49,7 @@ FlashQwen's single-stream decode.)
 | S3 | bf16 weights + cuBLAS GEMM + FlashAttention-2 | 38.2 | **350.0** | **50.1%** | 7650654 |
 | S5 | kernel fusion: fused QKV/gate-up GEMM, add+rmsnorm, RoPE table | 39.1 | 356.1 | 51.0% | c2f98a0 |
 | S6 | FlashDecoding decode-attention kernel (split by request type) | 44.7 | **455.2** | **65.2%** | f0b1499 |
+| S7 | WMMA tensor-core prefill attention | 44.9 | **493.4** | **70.7%** | 0dd4010 |
 
 ## Step entries
 
@@ -173,6 +174,28 @@ FlashQwen's single-stream decode.)
   fix. Confirms the rule from the profiling sweep: GEMM/elementwise/scheduling were dead ends; the one
   hand-rolled kernel with headroom delivered. Next gap to vLLM (455→698) is likely prefill-side
   attention + the GQA 4× redundant KV read (a GQA-shared decode kernel) and CUDA graphs for conc=1.
+
+### S7 — WMMA tensor-core prefill attention (0dd4010)
+- **Target**: after S6 split decode off, the prefill-only attention kernel still used CUDA-core FMA dot
+  products (per-key warp-shuffle reductions) for what is a compute-bound 512×L×128 matmul — no tensor
+  cores. S4's WMMA attempt failed because it was applied to *decode* (q_len=1 wastes 15/16 of a 16-row
+  WMMA tile + per-kv-head grouping starved the grid); with decode now on its own kernel, WMMA on the
+  prefill path (q_len up to 512, full tiles) is the right application and S4's failure mode is gone.
+- **Change**: `attention_prefill_wmma_kernel` — FlashAttention-2 with WMMA 16×16×16 bf16 (fp32
+  accumulate), one warp per (16-query-tile, head, request). Q read straight from the fused-QKV buffer,
+  K/V straight from the paged cache (one 16-key tile == one page, since block_size==16), all as WMMA
+  loads — no S materialization. Online softmax + deferred normalization; O kept in shared fp32 and
+  rescaled per tile (portable — no WMMA fragment-layout assumptions). Dispatched via
+  `launch_attention_prefill` on the prefill subset; FMA fallback when block_size!=16 or head_dim!=128.
+- **Result vs S6**: conc=32 **455 → 493 tok/s (+8.5%, TPOT 65.3 → 59.8 ms)**; conc=1 flat (44.7 → 44.9
+  — single-stream is decode-bound, prefill is a one-time cost amortized over the 128 outputs). **65% →
+  71% of vLLM**, 4.6× the `main` baseline. Output verified coherent.
+- **Lesson**: prefill attention WAS a meaningful conc=32 slice (the +8.5% is the proof), and the S4
+  idea (tensor cores) was right all along — just mis-applied to decode. Splitting attention by request
+  type (S6) is what unlocked it: each regime now gets the kernel it wants (FlashDecoding for decode,
+  WMMA-FA for prefill). Remaining gap to vLLM (493→698): GQA-shared decode (4× redundant KV read —
+  judged marginal, KV is ~4% of bytes + L2-cached), CUDA graphs for conc=1, and the 1-warp/block
+  occupancy of this WMMA kernel (a bigger query tile / more warps per block could push it further).
 
 #### S5 ablation — which of the three fusions actually paid (2026-06-19)
 Each change isolated on the S3 base (1024/128, temp 0); only the engine differs.
