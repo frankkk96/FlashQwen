@@ -47,7 +47,7 @@ public:
         int max_new = req->max_tokens() > 0 ? req->max_tokens() : kDefaultMaxTokens;
         int room = max_ctx_ - (int)prompt.size(); if (room < 1) room = 1;
         SampleParams sp{req->temperature(), req->top_p() > 0.f ? req->top_p() : 1.0f};
-        auto r = std::make_unique<Request>(std::move(prompt), std::min(max_new, room), sp,
+        auto r = std::make_unique<Request>(std::move(prompt), std::min(max_new, room), max_ctx_, sp,
                                            std::move(stop_ids), sink);
         sched_.submit(std::move(r));   // hand the request to the engine; we keep `sink` for the stream
 
