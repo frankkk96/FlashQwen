@@ -51,6 +51,7 @@ FlashQwen's single-stream decode.)
 | S6 | FlashDecoding decode-attention kernel (split by request type) | 44.7 | **455.2** | **65.2%** | f0b1499 |
 | S7 | WMMA tensor-core prefill attention | 44.9 | **493.4** | **70.7%** | 0dd4010 |
 | S8 | attn_prefill occupancy (shrink shared, drop PVt) | 45.2 | **528.5** | **75.7%** | 392cda5 |
+| S10 | scheduler: default max-batch-tokens 2048→1024 | ~45 | **589** | **84.4%** | 642cc28 |
 
 ## Step entries
 
@@ -212,6 +213,37 @@ FlashQwen's single-stream decode.)
   throughput looks fine — freeing shared memory to double resident warps recovered 7%. More headroom
   likely remains (a multi-warp block / KV-split would push occupancy further), but that's a bigger
   rewrite with the usual WMMA-correctness risk; the cheap shared cut banked most of the easy gain.
+
+### S10 — scheduler: default max-batch-tokens 2048 → 1024 (642cc28)
+- **Target**: sweeping the scheduler knobs (`sched_sweep.sh`) surfaced `max-batch-tokens`
+  (max_num_batched_tokens) as a big lever the earlier max-prefill-tokens sweep had missed.
+- **Root cause found**: at conc=32 / 1024-in, the KV pool (~36.7k tokens) sits right at demand
+  (32×1152 = 36864). The default mbt=2048 lets a step admit ~4 concurrent prefill chunks (4×512),
+  spiking peak KV demand past the pool → recompute-preemption thrash → 527 tok/s. mbt=1024 serializes
+  prefill enough to stay under the pool → 589 (+11%), with better TTFT/TPOT, at the **same 0.9 VRAM as
+  vLLM's default** (fair).
+- **Verified the mechanism** with a `--gpu-mem-fraction` sweep (plumbed through Go): enlarging the pool
+  to 43.5k tokens fixes mbt=2048 (527 → 588) but does **not** beat mbt=1024's 589. So ~588 is the
+  no-preemption ceiling — two paths (cap concurrency, or grow the pool) reach the same place, and the
+  remaining gap to vLLM (698) is **compute/framework, not KV/preemption**.
+- **Result vs S8**: conc=32 528 → **589 (+11%)**; conc=1 unchanged (~45, single-stream is
+  mbt-independent). **76% → 84% of vLLM**, 5.5× the `main` baseline. (gpu-mem-fraction default kept at
+  0.9; the flag is now exposed for users with other VRAM/models.)
+- **Lesson**: input-length-coupled (the user's call) — the mbt sweet spot exists because the std test
+  sits on the KV cliff; at 512-in (KV fits) mbt is irrelevant (~890 tok/s), at 2048-in (2× over) it
+  collapses. The fair, free win is capping admission via mbt; chasing past 588 means compute, not memory.
+
+#### inlen × mbt sweep — throughput is dominated by KV capacity vs demand (2026-06-20)
+`mbt_inlen.sh`, conc=32, otps by (input length, max-batch-tokens):
+
+| inlen | KV needed (32×(in+128)) | best otps | mbt effect |
+|---|---|---|---|
+| 512  | 20480 (57% of pool) | ~890 | flat (mbt irrelevant — KV fits) |
+| 1024 | 36864 (≈pool, the cliff) | ~589 | small mbt wins (eases preemption) |
+| 2048 | 69632 (190% of pool) | 78 → 7 | collapses; bigger mbt = worse (thrash) |
+
+The tracked 1024/128 metric sits exactly on the KV-capacity cliff — which is why everything here is so
+sensitive. Throughput is governed first by KV-pool capacity vs demand, then by kernels.
 
 #### S9 attempt — attn_prefill head-dim split (TRIED, REVERTED, 2026-06-20)
 After S8, tried 2 warps/block splitting the head dim (warp 0 dims [0,64), warp 1 [64,128); each
