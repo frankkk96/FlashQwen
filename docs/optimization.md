@@ -145,4 +145,24 @@ FlashQwen's single-stream decode.)
   just launch elision. The fusions are kept regardless — correct, cleaner, and they pre-stage the
   persistent-buffer layout CUDA-graph capture will want.
 
+#### S5 ablation — which of the three fusions actually paid (2026-06-19)
+Each change isolated on the S3 base (1024/128, temp 0); only the engine differs.
+
+| variant | conc=1 | conc=32 | vs S3 (conc=32) |
+|---|---|---|---|
+| S3 base | 38.2 | 350.0 | — |
+| A: #5 RoPE cos/sin table only | 38.2 | 350.2 | ~0 (noise) |
+| B: #7 add+rmsnorm fusion only | 38.3 | 350.0 | ~0 (noise) |
+| C: #6 fused QKV/gate-up GEMM only | 38.9 | 355.8 | **+1.7%** |
+| S5: all three | 39.1 | 356.1 | +1.7% |
+
+**Finding: none is a regression, but #5 and #7 are net-zero — the whole S5 gain is #6 (fused GEMMs).**
+Why #5/#7 are placebo here: RoPE and the add/rmsnorm elementwise kernels are tiny next to the GEMMs,
+and at conc=32 the step is GEMM/HBM-bound, so eliminating their launches + redundant traffic doesn't
+move the wall clock. #6 helps because folding 3→1 and 2→1 GEMMs gives cuBLAS a wider N (better tensor-
+core utilization on the skinny M=32 decode shape) on top of fewer launches. Adding #5+#7 on top of #6
+(C→S5) changes nothing (355.8→356.1). Kept all three anyway: correct, not negative, fewer launches for
+the eventual CUDA-graph capture — but the lesson is **GEMM-shape wins are the lever, elementwise/launch
+fusion is not** at this batch size.
+
 <!-- Append one ### entry per landed step: What / Why / Change / Result (vs prev) / Lesson -->
