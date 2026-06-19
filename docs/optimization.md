@@ -94,9 +94,25 @@ FlashQwen's single-stream decode.)
   bytes of INT8, and single-stream decode is weight-bandwidth-bound — the expected de-quant cost; the
   tracked metric is conc=32). Greedy generation verified coherent.
 - **Lesson**: R1/R2 were right — the gap was the kernels, not scheduling. The unified-scheduler
-  regression is not just recovered but blown past. The remaining ~2× to vLLM at conc=32: the FA2 kernel
-  is FMA-based (no tensor cores in attention yet) and one block per q-head wastes GQA's 4:1 K/V reuse;
-  a tensor-core + GQA-grouped attention is the next lever. Single-stream (conc=1) is now a separate,
-  bandwidth-bound concern (bf16 weight traffic) if we ever care about it.
+  regression is not just recovered but blown past. The remaining ~2× to vLLM at conc=32 is NOT attention
+  (see S4 below) — it's the GEMMs (cuBLAS, near-optimal) + per-step launch/scheduling overhead (~720
+  kernel launches/step, no CUDA graphs, no persistent batch, no prefix caching). Single-stream (conc=1)
+  is a separate, bandwidth-bound concern (bf16 weight traffic) if we ever care about it.
+
+### S4 — tensor-core + GQA-grouped attention (TRIED, REVERTED)
+- **Change**: rewrote the attention kernel to use WMMA (16×16×16 tensor cores) for S=Q·Kᵀ and O=P·V,
+  and grouped one block per (q-tile, **KV head**, request) so all 4 q-heads of a GQA group reuse one
+  staged K/V tile (4× less K/V traffic). O accumulator kept in shared (fp32), rescaled by a thread
+  loop, P·V added via load/store_matrix_sync — no WMMA fragment-layout assumptions. Greedy output was
+  bit-identical to S3 (correct).
+- **Result vs S3**: conc=32 350.0 → 355.5 (flat, noise); conc=1 **38.2 → 25.1 (−34%)**. Net negative.
+- **Why it didn't pay off**: (1) after S3's BM=16 K/V tiling, **attention is no longer the conc=32
+  bottleneck** — the GEMMs/launch overhead dominate, so a 2–3× faster attention barely moves total
+  throughput. (2) At conc=1, decode rows have q_len=1 but WMMA forces a full 16-row tile (16× wasted
+  compute), and the per-KV-head grouping leaves only 8 grid blocks (vs 32) → the GPU is starved and
+  attention latency grows, dragging single-stream TPOT (26→40 ms).
+- **Decision**: reverted to S3 (commit 7650654). Kept here as the record that the attention lever is
+  spent — the next real levers are launch-overhead (CUDA graphs / kernel fusion) and the throughput
+  features vLLM has (persistent batch, prefix caching).
 
 <!-- Append one ### entry per landed step: What / Why / Change / Result (vs prev) / Lesson -->
