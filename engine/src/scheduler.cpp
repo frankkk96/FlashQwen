@@ -164,3 +164,36 @@ void Scheduler::step() {
     run_forward(batch_, sampled_);
     apply_results(batch_, sampled_);
 }
+
+void Scheduler::submit(std::unique_ptr<Request> r) {
+    { std::lock_guard<std::mutex> lk(inbound_mu_); inbound_.push_back(std::move(r)); }
+    inbound_cv_.notify_one();
+}
+
+// The engine thread: drain submitted requests (rejecting any that overflow the queue), then advance
+// one scheduling iteration. Blocks for the process lifetime.
+void Scheduler::run() {
+    std::deque<std::unique_ptr<Request>> incoming;
+    while (true) {
+        {
+            std::unique_lock<std::mutex> lk(inbound_mu_);
+            if (inbound_.empty() && !busy())
+                inbound_cv_.wait(lk, [&] { return !inbound_.empty(); });
+            incoming.swap(inbound_);
+        }
+        while (!incoming.empty()) {
+            auto r = std::move(incoming.front()); incoming.pop_front();
+            if (!can_admit()) {   // admission control: queue full -> reject as over-capacity
+                if (r->sink) r->sink->error(EngineErrc::OverCapacity,
+                    "request queue full: " + std::to_string(queue_depth()) +
+                    " requests already waiting (limit " + std::to_string(max_queue_) +
+                    "), engine running up to " + std::to_string(n_slots_) +
+                    " concurrent sequences; retry shortly");
+                // r is dropped here; the handler's sink ref still delivers the error event.
+            } else {
+                add(std::move(r));
+            }
+        }
+        if (busy()) step();
+    }
+}

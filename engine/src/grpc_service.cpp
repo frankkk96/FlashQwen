@@ -1,6 +1,5 @@
 #include "grpc_service.hpp"
 #include "grpc_sink.hpp"
-#include "engine_loop.hpp"
 #include "model_spec.hpp"
 #include "model_runtime.hpp"
 #include "block_pool.hpp"
@@ -37,10 +36,10 @@ class ServiceImpl final : public Engine::Service {
 public:
     explicit ServiceImpl(StartupStatus& status) : status_(status) {}
 
-    // Published once by the loader thread when the model is resident and the engine loop is running.
-    void set_ready(EngineLoop* eng, std::string model_id, int max_ctx, int vocab) {
+    // Published once by the loader thread when the model is resident and the scheduler is running.
+    void set_ready(Scheduler* sched, std::string model_id, int max_ctx, int vocab) {
         std::lock_guard<std::mutex> lk(rmu_);
-        eng_ = eng; model_id_ = std::move(model_id); max_ctx_ = max_ctx; vocab_ = vocab;
+        sched_ = sched; model_id_ = std::move(model_id); max_ctx_ = max_ctx; vocab_ = vocab;
     }
 
     grpc::Status GetStatus(grpc::ServerContext*, const StatusRequest*, StatusResponse* out) override {
@@ -55,7 +54,7 @@ public:
 
     grpc::Status GetModel(grpc::ServerContext*, const ModelRequest*, ModelInfo* out) override {
         std::lock_guard<std::mutex> lk(rmu_);
-        if (!eng_) return grpc::Status(grpc::StatusCode::UNAVAILABLE, "engine is still loading the model");
+        if (!sched_) return grpc::Status(grpc::StatusCode::UNAVAILABLE, "engine is still loading the model");
         out->set_id(model_id_);
         out->set_max_ctx(max_ctx_);
         out->set_vocab_size(vocab_);
@@ -64,9 +63,9 @@ public:
 
     grpc::Status Generate(grpc::ServerContext* ctx, const GenerateRequest* req,
                           grpc::ServerWriter<GenerateEvent>* writer) override {
-        EngineLoop* eng; int max_ctx;
-        { std::lock_guard<std::mutex> lk(rmu_); eng = eng_; max_ctx = max_ctx_; }
-        if (!eng) return grpc::Status(grpc::StatusCode::UNAVAILABLE, "engine is still loading the model");
+        Scheduler* sched; int max_ctx;
+        { std::lock_guard<std::mutex> lk(rmu_); sched = sched_; max_ctx = max_ctx_; }
+        if (!sched) return grpc::Status(grpc::StatusCode::UNAVAILABLE, "engine is still loading the model");
 
         auto sink = std::make_shared<GrpcSink>();
         auto r = std::make_unique<Request>();
@@ -77,7 +76,7 @@ public:
         r->max_new = std::min(max_new, room);
         r->sp = SampleParams{req->temperature(), req->top_p() > 0.f ? req->top_p() : 1.0f};
         r->sink = sink;
-        eng->submit(std::move(r));   // hand the request to the engine; we keep `sink` for the stream
+        sched->submit(std::move(r));   // hand the request to the engine; we keep `sink` for the stream
 
         while (true) {
             GenerateEvent ev;
@@ -97,7 +96,7 @@ public:
 private:
     StartupStatus& status_;
     std::mutex rmu_;                 // guards the fields published by set_ready
-    EngineLoop* eng_ = nullptr;
+    Scheduler* sched_ = nullptr;
     std::string model_id_;
     int max_ctx_ = 0, vocab_ = 0;
 };
@@ -143,12 +142,12 @@ int run_engine(const Args& a, const std::string& model_id, std::mt19937& rng) {
             if (n_slots > model.max_batch()) n_slots = model.max_batch();
             int max_queue = a.max_queue <= 0 ? 4 * n_slots : a.max_queue;
             int max_prefill = a.max_prefill_tokens > 0 ? a.max_prefill_tokens : a.max_batch_tokens;
-            EngineLoop engine{model, kv, rng, n_slots, max_queue, a.max_batch_tokens, max_prefill};
-            service.set_ready(&engine, model_id, model.max_ctx(), spec.vocab_size);
+            Scheduler sched(model, kv, n_slots, max_queue, a.max_batch_tokens, max_prefill, rng);
+            service.set_ready(&sched, model_id, model.max_ctx(), spec.vocab_size);
             status.mark_ready();
             LOG_INFO("[engine] ready: %d slots, max_queue %d, max_batch_tokens %d, max_prefill %d, "
                      "model %s", n_slots, max_queue, a.max_batch_tokens, max_prefill, model_id.c_str());
-            engine.run();   // becomes the engine thread; blocks for the process lifetime
+            sched.run();   // becomes the engine thread; blocks for the process lifetime
         } catch (const std::exception& e) {
             status.mark_failed(std::string("model load failed: ") + e.what());
         }

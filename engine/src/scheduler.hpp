@@ -7,10 +7,12 @@
 // when the pool is exhausted the youngest running request is preempted (its blocks freed, its KV
 // recomputed from prompt+output when it is later resumed).
 //
-// The scheduler OWNS its requests (unique_ptr). Results stream out through each request's OutputSink
-// (token / done / error) — no callbacks, no central registry. Cancellation is a flag the transport
-// sets on the sink, polled at the top of each step. Three knobs: n_slots (max concurrent requests),
-// max_batch_tokens (total query rows per step), max_prefill (per-request prefill chunk cap).
+// The scheduler OWNS its requests (unique_ptr) and IS the engine thread: handler threads hand
+// Requests in via submit(); run() drains them, drives the batching loop, and streams results out
+// through each request's OutputSink (token / done / error) — no callbacks, no central registry.
+// Cancellation is a flag the transport sets on the sink, polled at the top of each step. Three knobs:
+// n_slots (max concurrent requests), max_batch_tokens (total query rows per step), max_prefill
+// (per-request prefill chunk cap).
 #pragma once
 #include "model_runtime.hpp"
 #include "kv_cache.hpp"
@@ -20,6 +22,8 @@
 #include <vector>
 #include <deque>
 #include <memory>
+#include <mutex>
+#include <condition_variable>
 #include <random>
 #include <string>
 
@@ -69,21 +73,24 @@ public:
     Scheduler(ModelRuntime& model, KVCacheManager& kv, int n_slots, int max_queue,
               int max_batch_tokens, int max_prefill, std::mt19937& rng);
 
-    // Admission: can_admit() reports whether another request may be queued (false once the waiting
-    // queue is at max_queue); callers reject with OverCapacity instead of enqueuing.
+    // submit() hands a new request to the engine (thread-safe; called by gRPC handler threads).
+    // run() is the engine thread: it drains submitted requests and drives the batching loop forever.
+    void submit(std::unique_ptr<Request> r);
+    void run();
+
+private:
+    // Admission: can_admit() is false once the waiting queue is at max_queue; run() then rejects the
+    // request with OverCapacity instead of enqueuing it.
     bool can_admit() const { return max_queue_ <= 0 || (int)waiting_.size() < max_queue_; }
     int  queue_depth() const { return (int)waiting_.size(); }
-    int  max_queue() const { return max_queue_; }
-
-    void add(std::unique_ptr<Request> r);   // enqueue a new request (engine takes ownership)
     bool busy() const { return !waiting_.empty() || !running_.empty(); }
 
+    void add(std::unique_ptr<Request> r);   // move a submitted request into the waiting set
     // Advance one scheduling iteration: drop cancelled requests, admit, build a token-budget batch
     // (preempting if the pool is exhausted), run one merged forward, and stream tokens / finishes /
     // errors out through each request's sink.
     void step();
 
-private:
     void drop_cancelled();                  // release + free any request whose sink was cancelled
     void admit();                           // waiting -> running while slots are free
     int  chunk_size(const Request* r, int pass, int budget) const;   // tokens to advance this step
@@ -101,6 +108,11 @@ private:
     KVCacheManager& kv_;
     int  n_slots_, max_queue_, max_ctx_, V_, bsz_, max_batch_tokens_, max_prefill_;
     std::mt19937& rng_;
+
+    // cross-thread handoff: handler threads push to inbound_ via submit(); run() drains it.
+    std::mutex inbound_mu_;
+    std::condition_variable inbound_cv_;
+    std::deque<std::unique_ptr<Request>> inbound_;
 
     std::deque<std::unique_ptr<Request>>  waiting_;   // not yet started / resumed
     std::vector<std::unique_ptr<Request>> running_;   // resident (prefilling or decoding)

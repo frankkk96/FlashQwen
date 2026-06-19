@@ -63,7 +63,6 @@ add_executable(flashqwen-engine
   src/args.cpp
   src/sampler.cpp
   src/scheduler.cpp
-  src/engine_loop.cpp
   src/grpc_service.cpp
   src/safetensors.cpp
   src/kernels.cu
