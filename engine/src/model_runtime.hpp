@@ -7,6 +7,7 @@
 #include "kernels.cuh"
 #include "block_pool.hpp"
 #include "sampler.hpp"
+#include <cublas_v2.h>
 #include <vector>
 #include <string>
 #include <random>
@@ -72,21 +73,18 @@ public:
     int max_batch() const { return MAX_DECODE_B; }                 // concurrent request cap
 
 private:
-    struct QWeight { int8_t* w = nullptr; float* scale = nullptr; };  // INT8 + per-row scale
     struct Layer {
-        QWeight q_proj, k_proj, v_proj, o_proj, gate, up, down;
+        bf16 *q_proj, *k_proj, *v_proj, *o_proj, *gate, *up, *down;   // BF16, HF layout [OUT, IN]
         float *in_norm, *post_norm, *q_norm, *k_norm;
     };
 
-    bf16*   upload_bf16(const std::string& name);
+    bf16*   upload_bf16(const std::string& name);   // weight, kept BF16
     float*  upload_norm(const std::string& name);   // bf16 -> fp32
-    QWeight upload_int8(const std::string& name);    // bf16 -> int8 + per-row scale
 
-    // Pick the matmul kernel for the layer stack: pure-decode steps (1 token per request) use the
-    // batched INT8 GEMV (reads weights once, amortised across the batch — the decode-throughput
-    // win); steps that include any prefill rows use the WMMA path (dequantise to BF16, tensor cores).
-    void mm(const float* x, const QWeight& w, float* y, int M, int IN, int OUT, bool pure_decode);
-    void run_layers(int T, bool pure_decode);
+    // y[M,OUT] = x[M,IN] @ W[OUT,IN]^T via cuBLAS (BF16 in, FP32 accumulate). Ytype picks the output
+    // element type: CUDA_R_16BF for activations, CUDA_R_32F for the lm_head logits.
+    void gemm(const bf16* x, const bf16* W, void* y, int M, int IN, int OUT, cudaDataType_t Ytype);
+    void run_layers(int T, int R, int max_qlen);
     void upload_block_tables(const std::vector<std::vector<int>>& bts);   // -> d_bt_, sets bt_stride_
     void forward_core(const ForwardInput& in);   // -> logits_ [S, vocab]
 
@@ -99,27 +97,28 @@ private:
 
     const BlockPool* pool_ = nullptr;   // paged KV storage the attention kernels read/write (non-owning)
 
-    bf16*   embed_  = nullptr;
-    float*  fnorm_  = nullptr;
-    QWeight lm_head_;
+    bf16*  embed_  = nullptr;
+    float* fnorm_  = nullptr;
+    bf16*  lm_head_ = nullptr;
     std::vector<Layer> layers_;
 
-    // activation scratch (sized to max_rows_ query rows)
-    float *x_, *xb_, *xb2_, *q_, *k_, *v_, *attn_, *gate_, *up_, *hmlp_, *logits_;
-    float *xg_ = nullptr;    // gathered sampling rows [MAX_DECODE_B, H] before final norm + lm_head
-    bf16  *xbf_ = nullptr;   // BF16 activation scratch for the tensor-core matmul
-    bf16  *w_dq_ = nullptr;  // BF16 dequantized-weight scratch for the tensor-core matmul
+    // activation scratch (BF16, sized to max_rows_ query rows); logits stay FP32 for sampling.
+    bf16  *x_, *xb_, *xb2_, *q_, *k_, *v_, *attn_, *gate_, *up_, *hmlp_;
+    bf16  *xg_ = nullptr;    // gathered sampling rows [MAX_DECODE_B, H] before final norm + lm_head
+    float *logits_ = nullptr;          // [S, vocab] FP32 (lm_head output -> sampling)
     int   *d_ids_, *d_pos_, *d_req_;   // per-row: token id, absolute position, request index
+    int   *d_qstart_, *d_qlen_;        // per-request: flat row offset, row count (attention grouping)
     int   *d_bt_;                      // packed per-request block tables [R, bt_stride_]
     int   *d_lrows_, *d_arg_;          // sampling-row indices [S]; sampled-token output [S]
     float *d_invT_, *d_topp_, *d_u_;   // per-sampling-row: 1/temp, nucleus cutoff, uniform draw [S]
     std::vector<int>   host_bt_;       // scratch to pack padded block tables for upload
+    std::vector<int>   host_qstart_, host_qlen_;          // scratch for the per-request attention grouping
     std::vector<float> host_invT_, host_topp_, host_u_;   // scratch for the per-row sampling inputs
     std::mt19937 rng_;                 // sampling RNG (per-row uniforms generated on the host)
 
-    cudaStream_t stream_ = nullptr;
+    cudaStream_t  stream_ = nullptr;
+    cublasHandle_t cublas_ = nullptr;
 
-    std::vector<bf16*>   all_bufs_;   // for cleanup
-    std::vector<float*>  all_fbufs_;
-    std::vector<int8_t*> all_i8_;
+    std::vector<bf16*>  all_bufs_;    // for cleanup (weights)
+    std::vector<float*> all_fbufs_;
 };

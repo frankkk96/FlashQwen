@@ -69,8 +69,10 @@ add_executable(flashqwen-engine
   src/model_runtime.cu
   ${PROTO_SRCS}
 )
+find_package(CUDAToolkit REQUIRED)   # cuBLAS for the matmuls
+
 target_include_directories(flashqwen-engine PRIVATE src third_party ${GEN_DIR})  # third_party: RapidJSON + CLI11
-target_link_libraries(flashqwen-engine PRIVATE ${GRPC_LIBS})
+target_link_libraries(flashqwen-engine PRIVATE ${GRPC_LIBS} CUDA::cublas)
 # Prefer the source-built gRPC/protobuf in /usr/local over any system (apt) copy at runtime.
 set_target_properties(flashqwen-engine PROPERTIES CUDA_SEPARABLE_COMPILATION ON
                                                   BUILD_RPATH /usr/local/lib)
