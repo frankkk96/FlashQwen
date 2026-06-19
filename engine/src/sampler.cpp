@@ -9,10 +9,6 @@ static int argmax(const float* v, int V) {
     return best;
 }
 
-int sample(const std::vector<float>& logits, const SampleParams& sp, std::mt19937& rng) {
-    return sample(logits.data(), (int)logits.size(), sp, rng);
-}
-
 // Temperature + top-p sampling. The softmax denominator inherently scans the whole vocab (O(V),
 // cheap), but we avoid the O(V log V) of sorting all of it: with no nucleus truncation we sample
 // the full distribution in one pass, and with top_p<1 we pop a max-heap only until the nucleus

@@ -1,5 +1,5 @@
 #include "kernels.cuh"
-#include "kv_cache.cuh"   // kv_phys_row: the paged-KV addressing contract (shared with kv_cache.cu)
+#include "kv_cache.cuh"   // kv_phys_row: the paged-KV addressing contract (shared with block_pool.cu)
 #include <mma.h>
 using namespace nvcuda;
 
@@ -37,8 +37,8 @@ __global__ void gemv_kernel(const float* __restrict__ x, const int8_t* __restric
 
 // Dequantize an INT8 weight matrix (+ per-row scale) to BF16, for the prefill WMMA path.
 __global__ void dequant_kernel(const int8_t* __restrict__ W, const float* __restrict__ scale,
-                               bf16* __restrict__ out, int IN, long n) {
-    long idx = (long)blockIdx.x * blockDim.x + threadIdx.x;
+                               bf16* __restrict__ out, int IN, int64_t n) {
+    int64_t idx = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= n) return;
     out[idx] = __float2bfloat16((float)W[idx] * scale[idx / IN]);
 }
@@ -87,7 +87,7 @@ void launch_matmul(const float* x, const int8_t* W, const float* scale, float* y
     }
     // prefill: dequantize the INT8 weights to BF16, convert activations to BF16, then run the
     // tensor-core GEMM. (Dequant cost is amortized — prefill runs once per request.)
-    long wn = (long)OUT * IN; int blk = 256;
+    int64_t wn = (int64_t)OUT * IN; int blk = 256;
     dequant_kernel<<<(wn + blk - 1) / blk, blk, 0, s>>>(W, scale, w_dq, IN, wn);
 
     int Mp = ((M + 15) / 16) * 16;
@@ -333,10 +333,12 @@ void launch_silu_mul(const float* gate, const float* up, float* h, int N, cudaSt
     silu_mul_kernel<<<(N + block - 1) / block, block, 0, s>>>(gate, up, h, N);
 }
 
-// Batched argmax: one block per row of logits[B, N]; d_out[b] = argmax over row b.
+// Batched argmax: one block per row of logits[B, N]; d_out[b] = argmax over row b. The shared-array
+// size is tied to the launch width below through kArgmaxThreads.
+static constexpr int kArgmaxThreads = 256;
 __global__ void argmax_batch_kernel(const float* __restrict__ logits, int N, int* __restrict__ out) {
-    __shared__ float sval[256];
-    __shared__ int   sidx[256];
+    __shared__ float sval[kArgmaxThreads];
+    __shared__ int   sidx[kArgmaxThreads];
     int b = blockIdx.x, tid = threadIdx.x;
     const float* lg = logits + (size_t)b * N;
     float best = -1e30f; int bi = 0;
@@ -354,6 +356,6 @@ __global__ void argmax_batch_kernel(const float* __restrict__ logits, int N, int
 }
 
 void launch_argmax_batch(const float* logits, int B, int N, int* d_out, cudaStream_t s) {
-    argmax_batch_kernel<<<B, 256, 0, s>>>(logits, N, d_out);
+    argmax_batch_kernel<<<B, kArgmaxThreads, 0, s>>>(logits, N, d_out);
 }
 

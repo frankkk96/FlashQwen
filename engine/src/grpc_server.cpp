@@ -26,6 +26,10 @@ using flashqwen::ModelInfo;
 using flashqwen::StatusRequest;
 using flashqwen::StatusResponse;
 
+// Generate-stream tuning.
+constexpr int kDefaultMaxTokens = 512;   // used when a request omits max_tokens
+constexpr int kStreamPollMs     = 100;   // how often the handler re-checks for client cancellation
+
 // The single place that maps the engine's domain error taxonomy to the proto wire codes.
 static flashqwen::ErrorCode to_proto(EngineErrc e) {
     switch (e) {
@@ -51,18 +55,29 @@ static flashqwen::EngineState to_proto(LoadState s) {
 // by the scheduler) and the handler each hold a shared_ptr to it, so it lives until both are done;
 // cancellation is a flag the handler sets and the scheduler polls.
 struct EventQueue {
-    std::mutex m; std::condition_variable cv;
-    std::deque<GenerateEvent> q; bool closed = false;
-    void push(GenerateEvent e) { { std::lock_guard<std::mutex> lk(m); q.push_back(std::move(e)); } cv.notify_one(); }
-    void close() { { std::lock_guard<std::mutex> lk(m); closed = true; } cv.notify_all(); }
+    void push(GenerateEvent e) {
+        { std::lock_guard<std::mutex> lk(m_); q_.push_back(std::move(e)); }
+        cv_.notify_one();
+    }
+    void close() {
+        { std::lock_guard<std::mutex> lk(m_); closed_ = true; }
+        cv_.notify_all();
+    }
     // Wait up to timeout_ms for an event. Returns true with `out` set, or false on timeout/closed.
     bool pop(GenerateEvent& out, int timeout_ms) {
-        std::unique_lock<std::mutex> lk(m);
-        cv.wait_for(lk, std::chrono::milliseconds(timeout_ms), [&] { return !q.empty() || closed; });
-        if (q.empty()) return false;
-        out = std::move(q.front()); q.pop_front(); return true;
+        std::unique_lock<std::mutex> lk(m_);
+        cv_.wait_for(lk, std::chrono::milliseconds(timeout_ms), [&] { return !q_.empty() || closed_; });
+        if (q_.empty()) return false;
+        out = std::move(q_.front()); q_.pop_front();
+        return true;
     }
-    bool is_closed() { std::lock_guard<std::mutex> lk(m); return closed && q.empty(); }
+    bool is_closed() { std::lock_guard<std::mutex> lk(m_); return closed_ && q_.empty(); }
+
+private:
+    std::mutex m_;
+    std::condition_variable cv_;
+    std::deque<GenerateEvent> q_;
+    bool closed_ = false;
 };
 
 struct GrpcSink : OutputSink {
@@ -173,7 +188,7 @@ public:
         auto r = std::make_unique<Request>();
         r->prompt.assign(req->input_ids().begin(), req->input_ids().end());
         r->stop_ids.assign(req->stop_token_ids().begin(), req->stop_token_ids().end());
-        int max_new = req->max_tokens() > 0 ? req->max_tokens() : 512;
+        int max_new = req->max_tokens() > 0 ? req->max_tokens() : kDefaultMaxTokens;
         int room = max_ctx - (int)r->prompt.size(); if (room < 1) room = 1;
         r->max_new = std::min(max_new, room);
         r->sp = SampleParams{req->temperature(), req->top_p() > 0.f ? req->top_p() : 1.0f};
@@ -182,7 +197,7 @@ public:
 
         while (true) {
             GenerateEvent ev;
-            if (sink->queue.pop(ev, 100)) {
+            if (sink->queue.pop(ev, kStreamPollMs)) {
                 if (!writer->Write(ev)) { sink->cancel.store(true); break; }   // client write failed
                 // Done and Error are both terminal; the client decodes Error into a typed failure.
                 if (ev.event_case() == GenerateEvent::kDone ||

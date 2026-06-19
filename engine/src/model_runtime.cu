@@ -38,19 +38,19 @@ float* ModelRuntime::upload_norm(const std::string& name) {
 ModelRuntime::QWeight ModelRuntime::upload_int8(const std::string& name) {
     const TensorView& tv = st_.get(name);
     int OUT = (int)tv.shape[0], IN = (int)tv.shape[1];
-    long n = (long)OUT * IN;
+    int64_t n = (int64_t)OUT * IN;
     const uint16_t* src = (const uint16_t*)tv.data;
     std::vector<int8_t> q(n);
     std::vector<float> scale(OUT);
 
     auto worker = [&](int r0, int r1) {
         for (int r = r0; r < r1; ++r) {
-            const uint16_t* row = src + (long)r * IN;
+            const uint16_t* row = src + (int64_t)r * IN;
             float maxabs = 0.f;
             for (int i = 0; i < IN; ++i) maxabs = std::max(maxabs, std::fabs(bf16_to_f32(row[i])));
             float sc = maxabs / 127.0f; if (sc == 0.f) sc = 1.f;
             float inv = 1.0f / sc;
-            int8_t* qr = q.data() + (long)r * IN;
+            int8_t* qr = q.data() + (int64_t)r * IN;
             for (int i = 0; i < IN; ++i) {
                 int v = (int)lrintf(bf16_to_f32(row[i]) * inv);
                 qr[i] = (int8_t)std::max(-127, std::min(127, v));

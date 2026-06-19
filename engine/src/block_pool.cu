@@ -1,7 +1,7 @@
 #include "block_pool.hpp"
 #include "kv_cache.cuh"   // kv_phys_row: shared addressing contract
 #include <cstdio>
-#include <cstdlib>
+#include <stdexcept>
 
 BlockPool::BlockPool(const ModelSpec& spec, int max_ctx, float gpu_mem_fraction) {
     int kvd = spec.kv_dim();
@@ -18,11 +18,13 @@ BlockPool::BlockPool(const ModelSpec& spec, int max_ctx, float gpu_mem_fraction)
     size_t per_block = (size_t)spec.num_layers * 2 * BLOCK * kvd * sizeof(bf16);
     num_blocks_ = (int)(kv_avail / per_block);
     if (num_blocks_ < max_blocks_) {
-        std::fprintf(stderr, "error: not enough VRAM for even one full-length sequence at "
-                     "max_ctx=%d (need %d blocks = %.1f GB, have %d blocks = %.1f GB under the "
-                     "%.0f%% cap).\n", max_ctx, max_blocks_, max_blocks_ * per_block / 1e9,
-                     num_blocks_, kv_avail / 1e9, gpu_mem_fraction * 100);
-        std::exit(1);
+        char msg[256];
+        std::snprintf(msg, sizeof msg,
+                      "not enough VRAM for even one full-length sequence at max_ctx=%d "
+                      "(need %d blocks = %.1f GB, have %d blocks = %.1f GB under the %.0f%% cap)",
+                      max_ctx, max_blocks_, max_blocks_ * per_block / 1e9,
+                      num_blocks_, kv_avail / 1e9, gpu_mem_fraction * 100);
+        throw std::runtime_error(msg);
     }
 
     k_.resize(spec.num_layers);

@@ -1,7 +1,7 @@
 // Device-side layout contract for the paged KV pool. The pool for a layer is
 // [num_blocks, BLOCK, kv_dim] BF16; a sequence's KV is a list of physical block ids (its block
 // table). This is the SINGLE definition of "logical position -> physical row" — the store kernel
-// (kv_cache.cu) and the attention kernels (kernels.cu) both resolve addresses through it, so the
+// (block_pool.cu) and the attention kernels (kernels.cu) both resolve addresses through it, so the
 // layout lives in exactly one place.
 #pragma once
 #include <cstddef>

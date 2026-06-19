@@ -30,7 +30,7 @@ void launch_matmul(const float* x, const int8_t* W, const float* scale, float* y
 
 // Largest decode batch a single GEMV pass supports (register-array bound). Decode batches are
 // capped at this; KV slots (B_max) may exceed it but never the per-step token count.
-#define MAX_DECODE_B 32
+constexpr int MAX_DECODE_B = 32;
 
 // Batched decode GEMV: y[B,OUT] = x[B,IN] @ W[OUT,IN]^T, INT8 W + per-row scale. Each warp
 // reads one weight row ONCE and computes all B dot products (weight traffic amortized across

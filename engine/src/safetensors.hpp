@@ -26,10 +26,7 @@ public:
     // model.safetensors if no index is present.
     void load_dir(const std::string& dir);
 
-    bool has(const std::string& name) const { return tensors_.count(name) > 0; }
     const TensorView& get(const std::string& name) const;
-
-    size_t num_tensors() const { return tensors_.size(); }
 
 private:
     void map_shard(const std::string& path);
