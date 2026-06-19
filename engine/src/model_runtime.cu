@@ -1,4 +1,5 @@
 #include "model_runtime.hpp"
+#include "log.hpp"
 #include <cmath>
 #include <cstring>
 #include <cstdio>
@@ -81,7 +82,7 @@ ModelRuntime::ModelRuntime(const ModelSpec& spec, int max_ctx, int max_batch_tok
     : spec_(spec) {
     max_ctx_  = ((max_ctx + 15) / 16) * 16;   // round up so WMMA tiles never read past buffers
     max_rows_ = std::max(max_ctx_, ((max_batch_tokens + 15) / 16) * 16);  // query rows per forward
-    std::fprintf(stderr, "[model] loading weights from %s ...\n", spec_.dir.c_str());
+    LOG_INFO("[model] loading weights from %s ...", spec_.dir.c_str());
     st_.load_dir(spec_.dir);
 
     embed_   = upload_bf16("model.embed_tokens.weight");   // gather, kept BF16
@@ -104,7 +105,7 @@ ModelRuntime::ModelRuntime(const ModelSpec& spec, int max_ctx, int max_batch_tok
         L.in_norm   = upload_norm(p + "input_layernorm.weight");
         L.post_norm = upload_norm(p + "post_attention_layernorm.weight");
         if ((l + 1) % 8 == 0 || l + 1 == spec_.num_layers)
-            std::fprintf(stderr, "[model] uploaded layer %d/%d\n", l + 1, spec_.num_layers);
+            LOG_INFO("[model] uploaded layer %d/%d", l + 1, spec_.num_layers);
         if (on_progress) on_progress(l + 1, spec_.num_layers);
     }
 
@@ -143,9 +144,9 @@ ModelRuntime::ModelRuntime(const ModelSpec& spec, int max_ctx, int max_batch_tok
 
     size_t freeb, totalb;
     CUDA_CHECK(cudaMemGetInfo(&freeb, &totalb));
-    std::fprintf(stderr, "[model] weights + activations ready (max_ctx=%d, max_rows=%d, up to %d "
-                 "concurrent). GPU mem: %.1f GB used / %.1f GB total. KV pool allocated separately.\n",
-                 max_ctx_, max_rows_, max_batch(), (totalb - freeb) / 1e9, totalb / 1e9);
+    LOG_INFO("[model] weights + activations ready (max_ctx=%d, max_rows=%d, up to %d concurrent). "
+             "GPU mem: %.1f GB used / %.1f GB total. KV pool allocated separately.",
+             max_ctx_, max_rows_, max_batch(), (totalb - freeb) / 1e9, totalb / 1e9);
 }
 
 void ModelRuntime::mm(const float* x, const QWeight& w, float* y, int M, int IN, int OUT, bool pure_decode) {

@@ -7,6 +7,7 @@
 #include "kv_cache.hpp"
 #include "scheduler.hpp"
 #include "startup.hpp"
+#include "log.hpp"
 #include "engine.grpc.pb.h"
 #include <grpcpp/grpcpp.h>
 #include <algorithm>
@@ -115,9 +116,8 @@ int run_engine(const Args& a, const std::string& model_id, std::mt19937& rng) {
     builder.RegisterService(&service);
     builder.SetMaxReceiveMessageSize(64 * 1024 * 1024);
     std::unique_ptr<grpc::Server> server(builder.BuildAndStart());
-    if (!server) { std::fprintf(stderr, "[engine] failed to bind %s\n", a.address.c_str()); return 1; }
-    std::fprintf(stderr, "[engine] gRPC listening on %s; loading model %s ...\n",
-                 a.address.c_str(), model_id.c_str());
+    if (!server) { LOG_ERROR("[engine] failed to bind %s", a.address.c_str()); return 1; }
+    LOG_INFO("[engine] gRPC listening on %s; loading model %s ...", a.address.c_str(), model_id.c_str());
 
     std::thread loader([&] {
         try {
@@ -146,9 +146,8 @@ int run_engine(const Args& a, const std::string& model_id, std::mt19937& rng) {
             EngineLoop engine{model, kv, rng, n_slots, max_queue, a.max_batch_tokens, max_prefill};
             service.set_ready(&engine, model_id, model.max_ctx(), spec.vocab_size);
             status.mark_ready();
-            std::fprintf(stderr, "[engine] ready: %d slots, max_queue %d, max_batch_tokens %d, "
-                         "max_prefill %d, model %s\n",
-                         n_slots, max_queue, a.max_batch_tokens, max_prefill, model_id.c_str());
+            LOG_INFO("[engine] ready: %d slots, max_queue %d, max_batch_tokens %d, max_prefill %d, "
+                     "model %s", n_slots, max_queue, a.max_batch_tokens, max_prefill, model_id.c_str());
             engine.run();   // becomes the engine thread; blocks for the process lifetime
         } catch (const std::exception& e) {
             status.mark_failed(std::string("model load failed: ") + e.what());

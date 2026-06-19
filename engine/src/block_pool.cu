@@ -1,5 +1,6 @@
 #include "block_pool.hpp"
 #include "kv_cache.cuh"   // kv_phys_row: shared addressing contract
+#include "log.hpp"
 #include <cstdio>
 #include <stdexcept>
 
@@ -39,10 +40,8 @@ BlockPool::BlockPool(const ModelSpec& spec, int max_ctx, float gpu_mem_fraction)
     for (int b = num_blocks_ - 1; b >= 0; --b) free_blocks_.push_back(b);
 
     CUDA_CHECK(cudaMemGetInfo(&freeb, &totalb));
-    std::fprintf(stderr, "[kv] %d blocks x %d tok = %d-token pool (max_ctx=%d). "
-                 "GPU mem: %.1f GB used / %.1f GB total\n",
-                 num_blocks_, BLOCK, num_blocks_ * BLOCK, max_ctx,
-                 (totalb - freeb) / 1e9, totalb / 1e9);
+    LOG_INFO("[kv] %d blocks x %d tok = %d-token pool (max_ctx=%d). GPU mem: %.1f GB used / %.1f GB total",
+             num_blocks_, BLOCK, num_blocks_ * BLOCK, max_ctx, (totalb - freeb) / 1e9, totalb / 1e9);
 }
 
 BlockPool::~BlockPool() {
