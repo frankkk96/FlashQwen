@@ -50,6 +50,7 @@ FlashQwen's single-stream decode.)
 | S5 | kernel fusion: fused QKV/gate-up GEMM, add+rmsnorm, RoPE table | 39.1 | 356.1 | 51.0% | c2f98a0 |
 | S6 | FlashDecoding decode-attention kernel (split by request type) | 44.7 | **455.2** | **65.2%** | f0b1499 |
 | S7 | WMMA tensor-core prefill attention | 44.9 | **493.4** | **70.7%** | 0dd4010 |
+| S8 | attn_prefill occupancy (shrink shared, drop PVt) | 45.2 | **528.5** | **75.7%** | 392cda5 |
 
 ## Step entries
 
@@ -196,6 +197,21 @@ FlashQwen's single-stream decode.)
   WMMA-FA for prefill). Remaining gap to vLLM (493→698): GQA-shared decode (4× redundant KV read —
   judged marginal, KV is ~4% of bytes + L2-cached), CUDA graphs for conc=1, and the 1-warp/block
   occupancy of this WMMA kernel (a bigger query tile / more warps per block could push it further).
+
+### S8 — attn_prefill occupancy: shrink shared memory (392cda5)
+- **Target**: the S7 WMMA prefill kernel was 1 warp/block with ~18 KB shared → only ~5 blocks/SM
+  resident (~8% warp occupancy). With so few warps, the tensor cores stall during the per-tile softmax
+  (CUDA-core work) — nothing else to overlap.
+- **Change**: drop the `[16,128]` `PVt` temp (8 KB). Instead of "rescale all of O, then add the full
+  P·V", fold both per 16×16 d-tile through a small `[16,16]` temp: `O[:,d] = O[:,d]*corr + (P·V)[:,d]`.
+  Each O element is still rescaled once and gets its P·V once — bit-identical math. Shared ~18 KB →
+  ~11 KB → ~9 blocks/SM (~2× resident warps).
+- **Result vs S7**: conc=32 **493 → 528 tok/s (+7.1%, TPOT 59.8 → 55.5 ms)**; conc=1 flat (44.9 → 45.2).
+  **71% → 76% of vLLM**, 4.94× the `main` baseline. Output coherent.
+- **Lesson**: a hand-rolled WMMA kernel at 1 warp/block is occupancy-starved even though tensor-core
+  throughput looks fine — freeing shared memory to double resident warps recovered 7%. More headroom
+  likely remains (a multi-warp block / KV-split would push occupancy further), but that's a bigger
+  rewrite with the usual WMMA-correctness risk; the cheap shared cut banked most of the easy gain.
 
 #### S5 ablation — which of the three fusions actually paid (2026-06-19)
 Each change isolated on the S3 base (1024/128, temp 0); only the engine differs.
