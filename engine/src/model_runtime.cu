@@ -200,9 +200,9 @@ void ModelRuntime::run_layers(int T, int R, int max_qlen) {
         launch_store_kv_paged(qkv_, QD,        QKV, pool_->k(l), d_bt_, bt_stride_, blk, KVD, d_req_, d_pos_, T, s);
         launch_store_kv_paged(qkv_, QD + KVD,  QKV, pool_->v(l), d_bt_, bt_stride_, blk, KVD, d_req_, d_pos_, T, s);
         // attention, dispatched per request type (both write disjoint rows of attn_):
-        launch_decode_attention(qkv_, QKV, pool_->k(l), pool_->v(l), attn_, nH, nKV, hd,
+        launch_attn_decode(qkv_, QKV, pool_->k(l), pool_->v(l), attn_, nH, nKV, hd,
                                 d_pos_, d_qstart_, d_decode_rids_, n_decode_, d_bt_, bt_stride_, blk, scale, s);
-        launch_attention_prefill(qkv_, QKV, pool_->k(l), pool_->v(l), attn_, nH, nKV, hd,
+        launch_attn_prefill(qkv_, QKV, pool_->k(l), pool_->v(l), attn_, nH, nKV, hd,
                                  d_pos_, d_qstart_, d_qlen_, d_prefill_rids_, n_prefill_, prefill_max_qlen_,
                                  d_bt_, bt_stride_, blk, scale, s);
 

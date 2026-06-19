@@ -45,49 +45,33 @@ void launch_head_norm_rope(bf16* buf, const float* w, const float* cos_tab, cons
                            const int* pos, int M, int n_heads, int head_dim, int stride, float eps,
                            cudaStream_t s);
 
-// ---- Paged KV cache attention -----------------------------------------------------------
-// The KV pool for a layer is [num_blocks, BLOCK, kv_dim] BF16. A sequence's KV is a list of physical
-// block ids — its "block table"; the logical->physical addressing lives in kv_cache.cuh
-// (kv_phys_row), and the write side (store) in block_pool.* . `bt` holds one block table per request
-// (stride `max_blocks`).
+// ---- Paged-KV attention -----------------------------------------------------------------
+// The KV pool for a layer is [num_blocks, BLOCK, kv_dim] BF16; a sequence's KV is a list of physical
+// block ids (its "block table") — logical->physical addressing lives in kv_cache.cuh (kv_phys_row),
+// the write side in block_pool.*. `bt` holds one block table per request (stride `max_blocks`).
 //
-// FlashAttention-2 style paged varlen attention over the whole mixed batch (prefill chunks + decodes
-// together). q/out are [T, n_heads, head_dim] BF16 (T = total query rows). The batch is grouped by
-// request: request r owns the contiguous rows [qstart[r], qstart[r]+qlen[r]); each of its rows m is
-// at absolute position pos[m] and attends that request's keys [0, pos[m]] (causal). One thread block
-// handles (query-tile, head, request): BM query rows (one warp each) stream the request's K/V in
-// BLOCK-sized tiles through shared memory — reused across all BM rows — with online softmax in
-// registers and deferred normalization. max_qlen = max over requests of qlen (sets the q-tile grid).
-// q_stride = elements between consecutive query rows in `q` (n_heads*head_dim for a packed q buffer,
-// or the fused-QKV row width when q points at the q slice of a [T, q+2kv] buffer). `rids` maps the grid
-// request slot (blockIdx.z) to the actual request id, so this can run on a subset of the batch (the
-// prefill requests); R = number of entries in rids.
-void launch_attention_flash(const bf16* q, int q_stride, const bf16* cache_k, const bf16* cache_v,
-                            bf16* out, int n_heads, int n_kv, int head_dim,
-                            const int* pos, const int* qstart, const int* qlen,
-                            const int* rids, int R, int max_qlen,
-                            const int* bt, int max_blocks, int block_size, float scale,
-                            cudaStream_t s);
+// Attention is split by request type (run_layers dispatches each on its subset): prefill rows
+// (q_len>1) and decode rows (q_len==1). Shared contract for both: q is read from the fused-QKV buffer
+// (row stride `q_stride`), out is [T, n_heads, head_dim]; request r owns rows [qstart[r], +qlen[r]) at
+// absolute positions pos[], attending keys [0, pos] (causal); `rids[grid_slot]` -> actual request id
+// so each kernel runs on its request subset (R / n_decode = number of entries).
 
-// Prefill attention (q_len>1 per request) — tensor-core (WMMA) FlashAttention over the prefill request
-// subset. Same contract/args as launch_attention_flash (rids selects the prefill requests). Falls back
-// to the FMA kernel when the tile assumptions (block_size==16, head_dim==128) don't hold.
-void launch_attention_prefill(const bf16* q, int q_stride, const bf16* cache_k, const bf16* cache_v,
-                              bf16* out, int n_heads, int n_kv, int head_dim,
-                              const int* pos, const int* qstart, const int* qlen,
-                              const int* rids, int R, int max_qlen,
-                              const int* bt, int max_blocks, int block_size, float scale,
-                              cudaStream_t s);
+// Prefill (q_len>1): tensor-core WMMA FlashAttention-2 (see kernels.cu). Requires head_dim==128 and
+// block_size==16 (the engine's only layout: Qwen3 + BlockPool::BLOCK). max_qlen sets the q-tile grid.
+void launch_attn_prefill(const bf16* q, int q_stride, const bf16* cache_k, const bf16* cache_v,
+                         bf16* out, int n_heads, int n_kv, int head_dim,
+                         const int* pos, const int* qstart, const int* qlen,
+                         const int* rids, int R, int max_qlen,
+                         const int* bt, int max_blocks, int block_size, float scale,
+                         cudaStream_t s);
 
-// Decode-only attention (one query row per request, q_len==1). One block per (head, decode-request);
-// the block's warps split that request's KV range, each warp online-softmaxes its slice in registers
-// reading K/V straight from global (a single query has no cross-row reuse, so shared-memory staging
-// would be pure overhead), then an in-block combine merges the per-warp partials. decode_rids[di] is
-// the actual request id for grid-row di; n_decode = number of decode requests.
-void launch_decode_attention(const bf16* q, int q_stride, const bf16* cache_k, const bf16* cache_v,
-                             bf16* out, int n_heads, int n_kv, int head_dim,
-                             const int* pos, const int* qstart, const int* decode_rids, int n_decode,
-                             const int* bt, int max_blocks, int block_size, float scale, cudaStream_t s);
+// Decode (q_len==1): FlashDecoding — one block per (head, decode-request), warps split the request's
+// KV range and online-softmax their slices reading K/V straight from the cache (no staging: a single
+// query has no reuse), then an in-block combine merges the per-warp partials.
+void launch_attn_decode(const bf16* q, int q_stride, const bf16* cache_k, const bf16* cache_v,
+                        bf16* out, int n_heads, int n_kv, int head_dim,
+                        const int* pos, const int* qstart, const int* decode_rids, int n_decode,
+                        const int* bt, int max_blocks, int block_size, float scale, cudaStream_t s);
 
 // Gather S rows from x[*, H] into out[S, H]: out[i] = x[rows[i]] (BF16). Used to pull the per-request
 // "last token" rows out of the flattened batch before the final norm + lm_head.

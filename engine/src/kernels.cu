@@ -128,138 +128,20 @@ void launch_head_norm_rope(bf16* buf, const float* w, const float* cos_tab, cons
         buf, w, cos_tab, sin_tab, pos, n_heads, head_dim, stride, eps);
 }
 
-// ---------------------------------------------------------------------------------------
-// FlashAttention-2 style paged varlen attention.
-//
-// One thread block = (query-tile blockIdx.x, query head blockIdx.y, request blockIdx.z). The block
-// owns BM query rows of that request/head (one warp each, DPL = head_dim/32 dims per lane). It walks
-// the request's keys in BLOCK-sized tiles: all threads cooperatively stage one tile of K and V (this
-// kv-head's slice) into shared memory, then every query warp reuses that tile — this is the K/V
-// reuse the per-row kernel lacked. Softmax is online in registers with deferred normalization (divide
-// by the running sum only at the very end, FA2's fewer-non-matmul-ops trick). Causal: query row at
-// pos p attends keys [0,p]; whole key tiles past the block's max query pos are skipped, and within a
-// tile each warp stops at its own pos.
-// ---------------------------------------------------------------------------------------
-template<int BM, int DPL>
-__global__ void attention_flash_kernel(const bf16* __restrict__ q, int q_stride,
-                                       const bf16* __restrict__ cache_k,
-                                       const bf16* __restrict__ cache_v, bf16* __restrict__ out,
-                                       int n_heads, int n_kv, int head_dim,
-                                       const int* __restrict__ pos, const int* __restrict__ qstart,
-                                       const int* __restrict__ qlen, const int* __restrict__ rids,
-                                       const int* __restrict__ bt,
-                                       int max_blocks, int block_size, float scale) {
-    int r     = rids[blockIdx.z];      // request (grid slot -> actual request id)
-    int h     = blockIdx.y;            // query head
-    int qtile = blockIdx.x;            // query-row tile within the request
-    int warp  = threadIdx.x >> 5;      // 0..BM-1: this warp's query row within the tile
-    int lane  = threadIdx.x & 31;
+// ======================================================================================
+// Paged-KV attention. Split by request type (dispatched from run_layers): prefill rows
+// (q_len>1) go to attn_prefill (WMMA tensor cores), decode rows (q_len==1) to attn_decode
+// (FlashDecoding). Both read the paged KV pool [num_blocks, BLOCK, kv_dim] via per-request
+// block tables `bt` (stride max_blocks); q comes from the fused-QKV buffer at row stride
+// q_stride. `rids[grid_slot]` -> actual request id, so each runs on its request subset.
+// ======================================================================================
 
-    int ql = qlen[r];
-    int row_in_req = qtile * BM + warp;
-    bool active = row_in_req < ql;     // last tile may have idle warps (they still help stage K/V)
-
-    int kvh = h / (n_heads / n_kv);
-    int kv_dim = n_kv * head_dim;
-    const int* btr = bt + (size_t)r * max_blocks;
-
-    int flat = qstart[r] + row_in_req;            // this warp's flattened query-row index
-    int qpos = active ? pos[flat] : -1;           // its absolute position (attends keys [0, qpos])
-
-    float qreg[DPL], acc[DPL];
-    #pragma unroll
-    for (int i = 0; i < DPL; ++i) acc[i] = 0.f;
-    if (active) {
-        const bf16* qv = q + (size_t)flat * q_stride + (size_t)h * head_dim;
-        #pragma unroll
-        for (int i = 0; i < DPL; ++i) qreg[i] = __bfloat162float(qv[lane + (i << 5)]);
-    } else {
-        #pragma unroll
-        for (int i = 0; i < DPL; ++i) qreg[i] = 0.f;
-    }
-    float m_run = -1e30f, l_run = 0.f;
-
-    // Block-wide key extent: the max query pos over this tile's active rows (the last row's pos, since
-    // pos increases within a request). Key tiles beyond it are fully causally masked for every warp.
-    int last_row = min((qtile + 1) * BM, ql) - 1;
-    int block_qpos_max = last_row >= qtile * BM ? pos[qstart[r] + last_row] : -1;
-    int ntiles = (block_qpos_max + block_size) / block_size;   // ceil((block_qpos_max+1)/block_size)
-
-    extern __shared__ bf16 smem[];
-    bf16* ks = smem;                              // [block_size, head_dim]
-    bf16* vs = smem + block_size * head_dim;      // [block_size, head_dim]
-
-    for (int j = 0; j < ntiles; ++j) {
-        // cooperatively stage one key block's K/V (this kv-head's head_dim slice) into shared memory
-        size_t base = (size_t)btr[j] * block_size * kv_dim + (size_t)kvh * head_dim;
-        for (int e = threadIdx.x; e < block_size * head_dim; e += blockDim.x) {
-            int c = e / head_dim, d = e % head_dim;
-            ks[e] = cache_k[base + (size_t)c * kv_dim + d];
-            vs[e] = cache_v[base + (size_t)c * kv_dim + d];
-        }
-        __syncthreads();
-
-        if (active) {
-            int base_pos = j * block_size;
-            int cmax = min(block_size, qpos - base_pos + 1);   // keys with key_pos <= qpos
-            for (int c = 0; c < cmax; ++c) {
-                const bf16* kc = ks + c * head_dim;
-                float partial = 0.f;
-                #pragma unroll
-                for (int i = 0; i < DPL; ++i) partial += qreg[i] * __bfloat162float(kc[lane + (i << 5)]);
-                #pragma unroll
-                for (int o = 16; o > 0; o >>= 1) partial += __shfl_xor_sync(0xffffffff, partial, o);
-                float score = partial * scale;            // identical on all lanes
-
-                float m_new = fmaxf(m_run, score);
-                float corr  = __expf(m_run - m_new);
-                float p     = __expf(score - m_new);
-                l_run = l_run * corr + p;
-                const bf16* vc = vs + c * head_dim;
-                #pragma unroll
-                for (int i = 0; i < DPL; ++i) acc[i] = acc[i] * corr + p * __bfloat162float(vc[lane + (i << 5)]);
-                m_run = m_new;
-            }
-        }
-        __syncthreads();   // all warps done reading the tile before it is overwritten
-    }
-
-    if (active) {
-        float inv = l_run > 0.f ? 1.0f / l_run : 0.f;
-        bf16* o = out + ((size_t)flat * n_heads + h) * head_dim;
-        #pragma unroll
-        for (int i = 0; i < DPL; ++i) o[lane + (i << 5)] = __float2bfloat16(acc[i] * inv);
-    }
-}
-
-void launch_attention_flash(const bf16* q, int q_stride, const bf16* cache_k, const bf16* cache_v,
-                            bf16* out, int n_heads, int n_kv, int head_dim,
-                            const int* pos, const int* qstart, const int* qlen,
-                            const int* rids, int R, int max_qlen,
-                            const int* bt, int max_blocks, int block_size, float scale,
-                            cudaStream_t s) {
-    if (R <= 0) return;
-    constexpr int BM = 16;                         // query rows (warps) per block
-    int qtiles = (max_qlen + BM - 1) / BM;
-    dim3 grid(qtiles, n_heads, R);
-    size_t shmem = 2 * (size_t)block_size * head_dim * sizeof(bf16);
-    // head_dim 128 -> DPL 4 (one warp covers 128 dims, 4 per lane). Qwen3 head_dim is always 128.
-    attention_flash_kernel<BM, 4><<<grid, BM * 32, shmem, s>>>(
-        q, q_stride, cache_k, cache_v, out, n_heads, n_kv, head_dim, pos, qstart, qlen, rids, bt,
-        max_blocks, block_size, scale);
-}
-
-// ---------------------------------------------------------------------------------------
-// Decode-only attention (q_len == 1 per request). One block = (query head blockIdx.x, decode-request
-// blockIdx.y). The block's NW warps split the request's KV [0, qpos] into strided slices (warp w takes
-// key positions w, w+NW, ...), each running an online softmax in registers over its slice — K/V are
-// read straight from the paged cache (one query row has no cross-row reuse, so shared-memory staging
-// would only add traffic + syncs). The NW per-warp partials (m, l, acc) are then merged by one warp
-// through shared memory. This gives full warp occupancy and NW-way KV parallelism, unlike the unified
-// kernel's single active warp serially scanning all KV tiles in the q_len==1 case.
-// ---------------------------------------------------------------------------------------
+// --- decode: one block per (head, decode-request); NW warps split the request's KV [0,qpos] into
+// strided slices (warp w takes key positions w, w+NW, ...), each online-softmaxing its slice in
+// registers — K/V read straight from the cache (a single query row has no cross-row reuse, so
+// shared staging would only add traffic + syncs) — then an in-block combine merges the NW partials.
 template<int NW, int DPL>
-__global__ void decode_attn_kernel(const bf16* __restrict__ q, int q_stride,
+__global__ void attn_decode_kernel(const bf16* __restrict__ q, int q_stride,
                                    const bf16* __restrict__ cache_k, const bf16* __restrict__ cache_v,
                                    bf16* __restrict__ out, int n_heads, int n_kv, int head_dim,
                                    const int* __restrict__ pos, const int* __restrict__ qstart,
@@ -335,33 +217,29 @@ __global__ void decode_attn_kernel(const bf16* __restrict__ q, int q_stride,
     }
 }
 
-void launch_decode_attention(const bf16* q, int q_stride, const bf16* cache_k, const bf16* cache_v,
-                             bf16* out, int n_heads, int n_kv, int head_dim,
-                             const int* pos, const int* qstart, const int* decode_rids, int n_decode,
-                             const int* bt, int max_blocks, int block_size, float scale, cudaStream_t s) {
+void launch_attn_decode(const bf16* q, int q_stride, const bf16* cache_k, const bf16* cache_v,
+                        bf16* out, int n_heads, int n_kv, int head_dim,
+                        const int* pos, const int* qstart, const int* decode_rids, int n_decode,
+                        const int* bt, int max_blocks, int block_size, float scale, cudaStream_t s) {
     if (n_decode <= 0) return;
     constexpr int NW = 8;              // warps per block = KV splits
     dim3 grid(n_heads, n_decode);
-    decode_attn_kernel<NW, 4><<<grid, NW * 32, 0, s>>>(
+    attn_decode_kernel<NW, 4><<<grid, NW * 32, 0, s>>>(
         q, q_stride, cache_k, cache_v, out, n_heads, n_kv, head_dim, pos, qstart, decode_rids, bt,
         max_blocks, block_size, scale);
 }
 
-// ---------------------------------------------------------------------------------------
-// Prefill attention via tensor cores (WMMA 16x16x16, bf16 in / fp32 accumulate). FlashAttention-2:
-// streams K/V in 16-key tiles (= one paged block, since block_size==16), no S materialization, online
-// softmax with deferred normalization, O kept in shared fp32 and rescaled per tile (no WMMA
-// fragment-layout assumptions). One warp per (16-query-tile, head, request). Q is read straight from
-// the fused-QKV buffer and K/V straight from the paged cache (one tile == one page), all as WMMA loads.
-// HD == 128 (8 d-steps of 16); requires block_size == 16.
-// ---------------------------------------------------------------------------------------
-__global__ void attention_prefill_wmma_kernel(const bf16* __restrict__ q, int q_stride,
-                                              const bf16* __restrict__ cache_k,
-                                              const bf16* __restrict__ cache_v, bf16* __restrict__ out,
-                                              int n_heads, int n_kv,
-                                              const int* __restrict__ pos, const int* __restrict__ qstart,
-                                              const int* __restrict__ qlen, const int* __restrict__ rids,
-                                              const int* __restrict__ bt, int max_blocks, float scale) {
+// --- prefill: tensor-core (WMMA 16x16x16 bf16 in / fp32 accumulate) FlashAttention-2. One warp per
+// (16-query-tile, head, request); streams K/V in 16-key tiles (one tile == one paged block, since
+// block_size==16), no S materialization, online softmax with deferred normalization, O kept in shared
+// fp32 and rescaled per tile (portable — no WMMA fragment-layout assumptions). HD==128 (8 d-steps).
+__global__ void attn_prefill_kernel(const bf16* __restrict__ q, int q_stride,
+                                    const bf16* __restrict__ cache_k,
+                                    const bf16* __restrict__ cache_v, bf16* __restrict__ out,
+                                    int n_heads, int n_kv,
+                                    const int* __restrict__ pos, const int* __restrict__ qstart,
+                                    const int* __restrict__ qlen, const int* __restrict__ rids,
+                                    const int* __restrict__ bt, int max_blocks, float scale) {
     constexpr int HD = 128, ND = HD / 16, TILE = 16;
     int r  = rids[blockIdx.z];
     int h  = blockIdx.y;
@@ -464,21 +342,18 @@ __global__ void attention_prefill_wmma_kernel(const bf16* __restrict__ q, int q_
     }
 }
 
-void launch_attention_prefill(const bf16* q, int q_stride, const bf16* cache_k, const bf16* cache_v,
-                              bf16* out, int n_heads, int n_kv, int head_dim,
-                              const int* pos, const int* qstart, const int* qlen,
-                              const int* rids, int R, int max_qlen,
-                              const int* bt, int max_blocks, int block_size, float scale,
-                              cudaStream_t s) {
+void launch_attn_prefill(const bf16* q, int q_stride, const bf16* cache_k, const bf16* cache_v,
+                         bf16* out, int n_heads, int n_kv, int head_dim,
+                         const int* pos, const int* qstart, const int* qlen,
+                         const int* rids, int R, int max_qlen,
+                         const int* bt, int max_blocks, int block_size, float scale,
+                         cudaStream_t s) {
     if (R <= 0) return;
-    if (block_size != 16 || head_dim != 128) {   // tile assumptions don't hold -> FMA fallback
-        launch_attention_flash(q, q_stride, cache_k, cache_v, out, n_heads, n_kv, head_dim,
-                               pos, qstart, qlen, rids, R, max_qlen, bt, max_blocks, block_size, scale, s);
-        return;
-    }
+    // The WMMA kernel hardwires head_dim==128 (8 d-steps) and one 16-key tile per paged block
+    // (block_size==16) — the engine's only supported layout (Qwen3, BlockPool::BLOCK==16).
     int qtiles = (max_qlen + 15) / 16;
     dim3 grid(qtiles, n_heads, R);
-    attention_prefill_wmma_kernel<<<grid, 32, 0, s>>>(
+    attn_prefill_kernel<<<grid, 32, 0, s>>>(
         q, q_stride, cache_k, cache_v, out, n_heads, n_kv, pos, qstart, qlen, rids, bt, max_blocks, scale);
 }
 
