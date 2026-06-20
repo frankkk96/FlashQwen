@@ -315,4 +315,20 @@ fusion is not** at this batch size.
   a minority of GPU time on a prefill-heavy workload. The remaining hand-rolled hot kernel is
   **attn_prefill** (~11%), which still re-reads K/V 4× per GQA group — the next attention lever.
 
+#### S13 attempt — GQA-shared PREFILL attention (TRIED via microbench, REJECTED, not landed)
+After S12's decode win, tried the same GQA-sharing on `attn_prefill`: one block per (q-tile, kv-head,
+request) with G=4 warps (one per q-head of the group) sharing one K/V page staged in shared, so each
+K/V tile is read from global ONCE instead of 4× (once per q-head). Microbench (`prefill_probe.cu`,
+R=4 reqs × qlen 512) verdict: **0.73× — 37% SLOWER** (0.684 vs 0.499 ms/call), and that's the
+*favorable* build (Os shrunk to bf16; the natural fp32-Os version needs 51968 B shared > the 48 KB
+static cap and won't even compile). Why it loses, unlike decode:
+- **Prefill attention is compute(WMMA)/occupancy-bound, not K/V-load-bound.** Sharing the K/V *load*
+  saves the thing that wasn't the bottleneck, while the 4× persistent `Os[16,128]` accumulator + the
+  cross-warp `__syncthreads` barriers cost occupancy and stalls. (Decode has no big O accumulator —
+  just DPL=4 registers/head — and gains because it IS bandwidth/L2-bound.)
+- Consistent with S8 (prefill occupancy-bound; the win was *shrinking* shared) and S9 (more warps via
+  head-dim split → flat). Prefill attention's occupancy is tapped; GQA-sharing only adds shared.
+**Lesson: GQA K/V-sharing pays for the bandwidth-bound decode path (S12) but is net-negative for the
+compute/occupancy-bound prefill path. Don't retry it on prefill on this architecture.**
+
 <!-- Append one ### entry per landed step: What / Why / Change / Result (vs prev) / Lesson -->
