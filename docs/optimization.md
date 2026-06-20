@@ -332,3 +332,32 @@ static cap and won't even compile). Why it loses, unlike decode:
 compute/occupancy-bound prefill path. Don't retry it on prefill on this architecture.**
 
 <!-- Append one ### entry per landed step: What / Why / Change / Result (vs prev) / Lesson -->
+
+### S14 — activation scratch sized to the real per-step bound (2026-06-20)
+- **What**: `max_rows_` (the row count all activation buffers are sized to) was `max(max_ctx=4096,
+  max_batch_tokens=1024)` = 4096, but a forward never exceeds `max_batch_tokens` rows (the scheduler's
+  per-step budget caps T; prefills are chunked under it). Sized it to `max_batch_tokens + 16` instead.
+- **Why the +16**: surfaced a latent OOB — the WMMA prefill-attention `load_matrix_sync` reads a full
+  16-row Q tile, so a non-16-aligned last chunk over-reads up to 15 rows past T (harmless, masked by
+  `grow<ql`). The old 4096 sizing absorbed it; sizing to exactly 1024 made T=1024 over-read past the
+  buffer → illegal memory access (model_runtime.cu:272). +16 gives one Q-tile of headroom.
+- **Result**: weights+activations 17.3→17.0 GB; KV pool **36,656 → 39,040 tokens** (2291→2440 blocks),
+  now ABOVE the conc=32/1024 peak demand (36,864) → the KV-capacity cliff is eliminated. Throughput:
+  conc=32 512 912.8→915.0, 1024 605.6→606.0 — **unchanged (noise)**. Coherent.
+- **Lesson (settles the KV hypothesis)**: growing the pool past peak demand — guaranteeing zero
+  preemption — moves throughput by 0. **KV cache size / eviction is NOT the conc=32 bottleneck**
+  (re-confirms S10 post-S12, now with a fair memory fix rather than an unfair gpu-mem bump). Kept anyway:
+  fixes the latent OOB, reclaims 0.36 GB (pool now ≈ vLLM's 40,816), and removes the cliff for
+  robustness at higher concurrency / longer context.
+
+#### Fair-baseline correction (2026-06-20)
+Same-machine A/B at equal features (vLLM `--no-enable-prefix-caching`, both bf16, 0.9 mem):
+| in | FlashQwen S12/S14 | vLLM (no prefix cache) | ratio |  | vLLM (default, prefix cache) |
+|---|---|---|---|---|---|
+| 512  | 915 | 946 | **96.7%** | | 1031 |
+| 1024 | 606 | 652 | **92.9%** | | 698 |
+The long-standing "84%/698" gap was measured against vLLM **with prefix caching ON** (its default),
+which caches the bench's shared chat-template prefix (~7% free on this workload — the FlashInfer
+cascade/shared-prefix feature we lack). Against a **feature-matched** vLLM we are at **92.9% (1024) /
+96.7% (512)**. vLLM KV pool = 40,816 tokens (we are now 39,040, near parity). The residual gap is
+compute (prefill GEMM at the cuBLAS limit + longer-context attention), and shrinks at shorter inputs.

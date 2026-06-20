@@ -81,7 +81,14 @@ void ModelRuntime::precompute_rope() {
 ModelRuntime::ModelRuntime(const ModelSpec& spec, const RuntimeConfig& cfg)
     : spec_(spec), rng_(cfg.seed) {
     max_ctx_  = cfg.max_ctx;
-    max_rows_ = std::max(max_ctx_, cfg.max_batch_tokens);   // query rows per forward
+    // A forward never exceeds max_batch_tokens rows (the scheduler's per-step budget caps T, and
+    // prefills are chunked under it), so the activation scratch only needs that many rows — NOT max_ctx.
+    // Sizing to max_ctx (4096) over-allocated the big buffers ~4x (~0.36 GB), shrinking the KV pool and
+    // pushing us onto the KV-capacity cliff; sizing to the real bound reclaims it for the pool.
+    // +16: the WMMA prefill-attention kernel load_matrix_sync reads a full 16-row Q tile, so the last
+    // (non-16-aligned) chunk can over-read up to 15 rows past T — give it a tile of headroom so that
+    // harmless over-read (masked out by grow<ql) stays in-bounds (was masked by the old 4096 sizing).
+    max_rows_ = std::max(1, cfg.max_batch_tokens) + 16;     // per-step budget + one WMMA Q-tile margin
     LOG_INFO("[model] loading weights from %s ...", spec_.dir.c_str());
     st_.load_dir(spec_.dir);
 
