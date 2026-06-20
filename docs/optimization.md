@@ -1,9 +1,9 @@
 # FlashQwen optimization log — catching up to vLLM
 
-The single main-line record of the throughput-optimization journey. One curated entry per landed
-step: **what changed, the bottleneck it targeted, the measured effect, the lesson.** Throwaway
-experiment notes (tuning sweeps, dead ends, profiler dumps) live under `docs/exps/` so this file
-stays readable.
+The single, self-contained record of the throughput-optimization journey. One curated entry per
+landed step: **what changed, the bottleneck it targeted, the measured effect, the lesson.** All
+numbers and tables are inline; granular raw assets (per-run CSVs, profiler dumps, bench scripts) are
+intentionally kept out of the repo.
 
 ## Executive summary
 
@@ -13,8 +13,7 @@ parity (no quantization)**. Starting from `main` (INT8, a per-sequence scheduler
 scheduler, the GEMM path, and the attention kernels.
 
 **Final result** — fresh same-machine replay of every landed step, conc=32, output 128, vs a
-**feature-matched** vLLM (`--no-enable-prefix-caching`, bf16, 0.9 mem). Chart:
-`docs/exps/2026-06-20-journey.png`; data: `docs/exps/2026-06-20-journey.csv`.
+**feature-matched** vLLM (`--no-enable-prefix-caching`, bf16, 0.9 mem):
 
 | input | FlashQwen (S14) | vLLM (no prefix cache) | **% of vLLM** |
 |---|---|---|---|
@@ -32,8 +31,8 @@ conc=1 single-stream: 56.4 / 54.6 / 51.3 ≈ 92–97% of vLLM across the same in
 - Decode, KV-cache capacity/eviction, and CPU/scheduling overhead were each measured and **ruled out**
   as the conc=32 bottleneck (see Conclusions).
 - All comparisons here are against a **feature-matched** vLLM (no prefix caching). vLLM's default
-  (prefix-cache ON) was a non-equal earlier baseline and is retained only as a record:
-  `docs/exps/2026-06-20-vllm-baseline-prefix-cache-deprecated.md`.
+  (prefix-cache ON, ~698/1031) was a non-equal earlier baseline — it caches the bench's shared
+  chat-template prefix, which FlashQwen has no equivalent of — and is no longer used as the reference.
 
 ## Goal & constraints
 
@@ -55,7 +54,7 @@ conc=1 single-stream: 56.4 / 54.6 / 51.3 ≈ 92–97% of vLLM across the same in
 ## Baselines & reference (canonical: the 2026-06-20 journey replay)
 
 All numbers in this report are from the **single canonical dataset** — the same-machine journey replay
-(`docs/exps/2026-06-20-journey.csv`): every landed step rebuilt clean and benched at 128/512/1024
+(2026-06-20): every landed step rebuilt clean and benched at 128/512/1024
 input vs a **feature-matched vLLM** (`--no-enable-prefix-caching`, bf16, 0.9 mem). Aligned
 `vllm bench serve --dataset-name random`, output 128, temp 0.
 
@@ -67,9 +66,9 @@ the original record, not re-run in the bf16 replay. INT8 makes its single-stream
 good (lighter weight traffic) but it **collapses under concurrency** — that collapse is what the
 journey fixes.
 
-> Earlier revisions of this log compared against vLLM with **prefix caching ON** (its default → 698 /
-> 1031), which is not feature-matched (FlashQwen has no prefix sharing). That deprecated comparison is
-> kept only as a record: `docs/exps/2026-06-20-vllm-baseline-prefix-cache-deprecated.md`.
+> Earlier revisions of this log compared against vLLM with **prefix caching ON** (its default → ~698 /
+> 1031), which is not feature-matched (FlashQwen has no prefix sharing). That comparison is deprecated
+> and no longer used here.
 
 ## Progress
 
@@ -400,9 +399,7 @@ compute/occupancy-bound prefill path. Don't retry it on prefill on this architec
 ## Final results — journey replay across input lengths (2026-06-20)
 
 Every landed step `git checkout`'d, rebuilt clean, benched at 128/512/1024 input (output 128) on one
-machine/day, vs a feature-matched vLLM (`--no-enable-prefix-caching`). Plan + driver:
-`docs/exps/2026-06-20-journey-replay.md` / `/root/bench-compare/journey_replay.sh`. Chart:
-`docs/exps/2026-06-20-journey.png`. Full CSV: `docs/exps/2026-06-20-journey.csv`.
+machine/day, vs a feature-matched vLLM (`--no-enable-prefix-caching`).
 
 **conc=32 output tok/s (and % of feature-matched vLLM):**
 
