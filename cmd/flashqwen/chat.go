@@ -23,7 +23,7 @@ func runChat(args []string) {
 		log.Fatal("chat: --model is required")
 	}
 
-	s, err := open(*model, 1, *maxCtx, 0)
+	s, err := open(*model, 1, *maxCtx, 0, 1024, 512, 0.9)
 	if err != nil {
 		log.Fatalf("chat: %v", err)
 	}

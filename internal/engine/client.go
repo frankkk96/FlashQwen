@@ -60,94 +60,26 @@ func Dial(addr string) (*Client, error) {
 
 func (c *Client) Close() error { return c.conn.Close() }
 
-// StatusState is the engine's startup lifecycle, mirroring the proto EngineState.
-type StatusState int
-
-const (
-	StateLoading StatusState = iota // binding done; weights / KV pool loading
-	StateReady                      // serving
-	StateFailed                     // load failed (terminal); Message has the cause
-)
-
-// Status is a snapshot of the engine's startup progress (one GetStatus reply).
-type Status struct {
-	State       StatusState
-	Phase       string // e.g. "loading weights" / "allocating kv pool"
-	Done, Total int    // progress within Phase (e.g. layers); 0 when not countable
-	Message     string // failure cause when State == StateFailed
-}
-
-func stateFromProto(s pb.EngineState) StatusState {
-	switch s {
-	case pb.EngineState_ENGINE_STATE_READY:
-		return StateReady
-	case pb.EngineState_ENGINE_STATE_FAILED:
-		return StateFailed
-	default:
-		return StateLoading
-	}
-}
-
-// GetStatus returns the engine's current startup status. It is answerable from the moment the engine
-// binds its port — before the model is loaded — so callers can show progress and detect failure.
-func (c *Client) GetStatus(ctx context.Context) (*Status, error) {
-	s, err := c.cli.GetStatus(ctx, &pb.StatusRequest{})
-	if err != nil {
-		return nil, err
-	}
-	return &Status{State: stateFromProto(s.GetState()), Phase: s.GetPhase(),
-		Done: int(s.GetDone()), Total: int(s.GetTotal()), Message: s.GetMessage()}, nil
-}
-
-// WaitReady polls GetStatus until the engine is ready (returning its authoritative metadata via
-// GetModel), the load fails, or it stalls. aliveCheck (may be nil) fails fast if the engine process
-// dies. onStatus (may be nil) is invoked on every poll so callers can render a progress bar.
-//
-// The watchdog is stall-based, not an absolute deadline: as long as the load keeps making progress
-// (phase or done/total advancing) it waits indefinitely, so a slow load of a large model is never
-// killed prematurely; only genuinely stuck progress (no change for stallTimeout, process still
-// alive) gives up.
-func (c *Client) WaitReady(stallTimeout time.Duration, aliveCheck func() error, onStatus func(Status)) (*ModelInfo, error) {
-	var last Status
-	haveStatus := false
-	lastChange := time.Now()
+// WaitReady polls GetModel until the engine answers — which, since the engine loads the model before
+// binding its port, means it is loaded and serving — and returns its metadata. It fails if the engine
+// process dies (aliveCheck, may be nil) or if `timeout` elapses first. Load progress is written to the
+// engine's stderr.
+func (c *Client) WaitReady(timeout time.Duration, aliveCheck func() error) (*ModelInfo, error) {
+	deadline := time.Now().Add(timeout)
 	for {
 		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-		st, err := c.GetStatus(ctx)
+		info, err := c.GetModel(ctx)
 		cancel()
 		if err == nil {
-			if !haveStatus || st.State != last.State || st.Phase != last.Phase ||
-				st.Done != last.Done || st.Total != last.Total {
-				lastChange = time.Now()
-			}
-			last, haveStatus = *st, true
-			if onStatus != nil {
-				onStatus(*st)
-			}
-			switch st.State {
-			case StateReady:
-				ctx2, cancel2 := context.WithTimeout(context.Background(), 3*time.Second)
-				info, ierr := c.GetModel(ctx2)
-				cancel2()
-				if ierr == nil {
-					return info, nil
-				}
-				// Ready but GetModel raced the publish; retry on the next tick.
-			case StateFailed:
-				return nil, fmt.Errorf("engine failed to start: %s", st.Message)
-			}
+			return info, nil
 		}
 		if aliveCheck != nil {
 			if exitErr := aliveCheck(); exitErr != nil {
 				return nil, exitErr
 			}
 		}
-		if time.Since(lastChange) > stallTimeout {
-			if haveStatus {
-				return nil, fmt.Errorf("engine load stalled at %q (%d/%d) for %s",
-					last.Phase, last.Done, last.Total, stallTimeout)
-			}
-			return nil, fmt.Errorf("engine did not start within %s", stallTimeout)
+		if time.Now().After(deadline) {
+			return nil, fmt.Errorf("engine did not become ready within %s", timeout)
 		}
 		time.Sleep(300 * time.Millisecond)
 	}
@@ -160,21 +92,6 @@ func (c *Client) GetModel(ctx context.Context) (*ModelInfo, error) {
 		return nil, err
 	}
 	return &ModelInfo{ID: mi.Id, MaxCtx: int(mi.MaxCtx), VocabSize: int(mi.VocabSize)}, nil
-}
-
-// Stream is the low-level token API: it sends the given prompt ids and invokes onToken for each
-// sampled id, returning the terminal Stats. temperature<=0 means greedy; topP=1 disables nucleus;
-// stopIDs (may be nil) stop generation as soon as one is sampled. Used by the synthetic-id
-// benchmark; Generate is the text-level path.
-func (c *Client) Stream(ctx context.Context, ids []int32, maxTokens int,
-	temperature, topP float32, stopIDs []int32, onToken func(int32)) (*Stats, error) {
-	return c.stream(ctx, &pb.GenerateRequest{
-		InputIds:     ids,
-		MaxTokens:    int32(maxTokens),
-		Temperature:  temperature,
-		TopP:         topP,
-		StopTokenIds: stopIDs,
-	}, onToken)
 }
 
 // stream is the shared gRPC driver: it opens the Generate RPC and pumps token-id events into

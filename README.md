@@ -5,203 +5,128 @@ A from-scratch **Qwen3-8B inference stack** (C++/CUDA + Go).
 > **FlashQwen deliberately stays small, trading breadth of model support for a clean codebase.**
 > We believe that in the age of AI-assisted programming, giving the AI clean context and a tight
 > feedback loop is worth more than piling on dependencies, abstractions, adapters, and compromises.
-> So there is no general framework and no heavy dependencies here — just one narrow, complete
-> inference path that is easy to read and easy to run.
+> So there is no general framework here — just one narrow, complete inference path that is easy to
+> read and easy to run.
 
 中文: [README.zh-CN.md](README.zh-CN.md)
 
-The project has two layers that communicate over gRPC:
+---
 
-- **The outer layer is a Go application** (the root module; it builds to `./flashqwen`). It handles
-  everything text-related: tokenisation, rendering the Qwen3 ChatML template, detecting tool calls
-  in the token stream, and serving both an OpenAI-compatible HTTP API and an interactive CLI. It
-  bundles the compiled C++ engine into itself via `//go:embed`, then at runtime extracts it to a
-  temp directory and launches it as a child process — so you start this one binary and never manage
-  an engine process yourself.
-- **The inner layer is a C++/CUDA token engine** (`engine/`). It does all the GPU work: loading
-  weights, prefill, decode, and sampling. It only accepts token ids and returns sampled token ids —
-  it does no tokenisation and knows nothing about text formats. Its model stack depends on no
-  machine-learning library (no PyTorch, cuBLAS, or HuggingFace tokenizers); INT8 weight
-  quantisation, continuous batching, and PagedAttention are all implemented from scratch.
+## 1. Project & version evolution
+
+FlashQwen grew in three stages. Each stage is a self-contained version with its own goal; together
+they trace the path from a single-file teaching engine to a serving runtime that is competitive with
+vLLM.
+
+### Stage 1 — from-scratch terminal engine
+The earliest version (on `main`): a single C++/CUDA program, **under 2000 lines with zero
+dependencies** (no PyTorch, no cuBLAS, no HuggingFace tokenizers). It loads Qwen3-8B weights directly
+from `.safetensors`, runs prefill + decode + sampling, and is driven entirely from the **terminal**.
+This stage also includes the single-stream optimization study (scalar matmul → tensor-core WMMA →
+flash-decoding split-K → INT8 weight quantization).
+
+### Stage 2 — scheduling + an OpenAI-compatible API service
+Added a real serving layer: continuous batching + PagedAttention in the C++ engine, wrapped in a
+**Go/Gin gateway that exposes the standard OpenAI API** over gRPC. From this stage on you start a
+*service* (`flashqwen serve`) and talk to it with any OpenAI client, instead of running a one-shot
+terminal program.
+
+### Stage 3 — serving performance optimization (current)
+The current focus: closing the serving-throughput gap to **vLLM** at **bf16 parity (no
+quantization)**. Through a series of kernel and scheduler rewrites (bf16 + cuBLAS GEMM,
+FlashAttention-2 prefill, GQA-shared FlashDecoding, a unified token-budget scheduler, …), FlashQwen
+now reaches **~95% of vLLM's serving throughput with prefix caching disabled** on a single RTX 4090,
+and ~5.5× its own Stage-1/2 baseline. Full report: [`docs/optimization.md`](docs/optimization.md).
+
+### Architecture (Stage 2+)
+
+Two layers communicating over gRPC:
+
+- **Outer layer — a Go application** (the root module; builds to `./flashqwen`). Handles everything
+  text-related: tokenisation, the Qwen3 ChatML template, tool-call detection, and serving both an
+  OpenAI-compatible HTTP API and an interactive CLI. It bundles the compiled C++ engine via
+  `//go:embed`, extracts it at runtime, and launches it as a child process — so you run one binary.
+- **Inner layer — a C++/CUDA token engine** (`engine/`). All the GPU work: weight loading, prefill,
+  decode, sampling, the paged KV cache, and the continuous-batching scheduler. It only accepts token
+  ids and returns sampled token ids — it does no tokenisation and knows nothing about text formats.
 
 ---
 
-## Usage
+## 2. Usage
 
-### 1. Get the model
+### Get the model
 
-`--model` points at a local directory holding the model. FlashQwen does not download anything itself;
-fetch the weights once with the official Hugging Face CLI:
+`--model` points at a local directory; FlashQwen downloads nothing itself:
 
 ```bash
 pip install -U "huggingface_hub[cli]"
 huggingface-cli download Qwen/Qwen3-8B --local-dir models/qwen3-8b
 ```
 
-(Set `HF_ENDPOINT=https://hf-mirror.com` first if you need a mirror.) Then point FlashQwen at that
-directory:
+(Set `HF_ENDPOINT=https://hf-mirror.com` first if you need a mirror.) The directory must contain
+`config.json`, the `*.safetensors` shards + `model.safetensors.index.json`, and the tokenizer files
+(`tokenizer.json`, `vocab.json`, `merges.txt`, `generation_config.json`). The engine reads the BF16
+safetensors directly — no offline conversion or repacking.
+
+### Build
 
 ```bash
-./flashqwen chat --model models/qwen3-8b
+make            # build C++ engine → embed into Go → go build, producing ./flashqwen
 ```
 
-The directory must contain `config.json`, the `*.safetensors` shards,
-`model.safetensors.index.json`, `tokenizer.json`, `vocab.json`, `merges.txt`, and
-`generation_config.json`. The engine reads these BF16 files directly and quantises the matmul weights
-to INT8 at load time, and the Go side loads the tokenizer from
-`tokenizer.json` / `vocab.json` / `merges.txt` — so no offline conversion or repacking is needed.
+`make` runs three steps: cmake builds the C++ engine, the engine binary is copied into
+`internal/supervisor/bin/` (for `//go:embed`), and `go build` produces the final binary. Needs a CUDA
+toolkit (12.x), Go 1.26+, gRPC/protobuf, **cuBLAS**, and an NVIDIA GPU with ≥20 GB. Targets `sm_89`
+(RTX 4090 / Ada) by default; for other cards set `-DCMAKE_CUDA_ARCHITECTURES=<arch>` before
+`make engine`.
 
-### 2. Build
-
-```bash
-make            # build the C++ engine → embed → go build, producing ./flashqwen
-```
-
-`make` runs three steps in a fixed order: cmake builds the C++ engine, the engine binary is copied
-into `internal/supervisor/bin/` (so `//go:embed` can bundle it), and `go build` produces the final
-binary. Building needs a CUDA toolkit (12.x recommended), Go 1.26+, gRPC/protobuf, and an NVIDIA GPU
-with ≥20 GB of memory. It targets `sm_89` (RTX 4090 / Ada) by default; for other cards set
-`-DCMAKE_CUDA_ARCHITECTURES=<arch>` before `make engine`. The final binary is a single file, but at
-runtime it still needs the CUDA and libgrpc++ shared libraries on the host (`//go:embed` bundles the
-executable, not its `.so` dependencies).
-
-### 3. Run
-
-Each subcommand extracts and launches the embedded engine itself; `--model` is required:
+### Run
 
 ```bash
-./flashqwen serve     --model models/qwen3-8b   # start the OpenAI-compatible server (default :8000)
-./flashqwen chat      --model models/qwen3-8b   # enter an interactive multi-turn chat
-./flashqwen benchmark --model models/qwen3-8b   # run the end-to-end serving benchmark (latency + throughput)
+./flashqwen serve --model models/qwen3-8b    # OpenAI-compatible server (default :8000)
+./flashqwen chat  --model models/qwen3-8b    # interactive multi-turn chat
 ./flashqwen --help
 ```
 
-- **In-chat commands:** `/exit` and `/quit` leave, `/reset` clears the context, `/think on|off`
-  toggles thinking mode.
-- **Common flags:** `--max-ctx N` sets the KV cache size (the max context length), `--slots N` sets
-  the max number of concurrent sequences, `--addr` sets the serve HTTP listen address; sampling
-  params such as temperature and top_p are passed per request through the OpenAI API.
-- **OpenAI endpoints:** `POST /v1/chat/completions` (streaming, non-streaming, and tools),
+- **OpenAI endpoints:** `POST /v1/chat/completions` (streaming / non-streaming / tools),
   `GET /v1/models`, `GET /healthz`.
-- **Supported models:** any dense Qwen3 (architecture `Qwen3ForCausalLM` in `config.json`, with
-  dimensions read from that file). Qwen3 MoE, multimodal models, and non-Qwen architectures are not
+- **Common flags:** `--max-ctx N` (KV/context length), `--slots N` (max concurrent sequences),
+  `--max-batch-tokens N` (tokens computed per scheduler step), `--addr` (listen address). Sampling
+  params (temperature, top_p) are per-request via the API.
+- **In-chat commands:** `/exit` `/quit` leave, `/reset` clears context, `/think on|off` toggles
+  thinking mode.
+- **Supported models:** dense Qwen3 (`Qwen3ForCausalLM`). MoE / multimodal / non-Qwen are not
   supported.
 
 ---
 
-## How it works
+## 3. Stages, characteristics & history
 
-### Bridging Go and C++
+| Stage | Theme | Characteristics | Branch | Commits |
+|---|---|---|---|---|
+| **1** | From-scratch terminal engine | Single C++/CUDA binary, <2000 LOC, **zero deps**, terminal-only. INT8 weights, CUDA-graph decode, flash-decoding split-K. Single-stream study. | `main` | `7d6764c` (initial) → `89318c5` |
+| **2** | Batching + OpenAI API service | Continuous batching + PagedAttention; Go/Gin **OpenAI-compatible API** over gRPC. Starts a service. | `main` | `566fac6` → `08392df` |
+| **3** | Serving performance optimization | bf16 + cuBLAS GEMM, FlashAttention-2 prefill, GQA-shared FlashDecoding, unified token-budget scheduler. **~95% of vLLM** (no prefix cache), bf16 parity. | `perf/serving-optimization` | `08392df` (baseline) → `53ac297` |
 
-The compiled C++ engine binary is bundled into the Go binary with `//go:embed`. At startup the Go
-supervisor writes it to a temp directory, picks a free localhost port, launches it as a child
-process, polls `GetModel` until it answers, and sends it `SIGTERM` on exit — so there is one binary
-to run and no engine process to manage by hand.
+### Stage 3 — optimization steps (branch `perf/serving-optimization`)
 
-The two sides talk over gRPC, defined by `proto/engine.proto`. Only token ids cross the wire: Go
-tokenises the prompt and sends `GenerateRequest{input_ids, max_tokens, temperature, top_p,
-stop_token_ids}`; `Generate` is server-streaming, so the engine replies with a stream of `token_id`
-events followed by a `Done{finish_reason, prompt_tokens, completion_tokens}`. `GetModel` reports the
-engine's authoritative context window and vocab size. A client disconnect cancels the RPC, which the
-engine turns into a sequence abort that frees the sequence's KV.
+The detailed report — what each step changed, the bottleneck it targeted, the measured effect, and
+the dead-ends — is in [`docs/optimization.md`](docs/optimization.md). Headline progression
+(conc=32, 1024-in/128-out, % of feature-matched vLLM):
 
-### Weight loading and INT8 quantisation
+| Step | change | commit | % vLLM |
+|---|---|---|---|
+| baseline | bf16 unified scheduler (INT8 main = the Stage-2 starting point) | `08392df` | 13% |
+| S3 | bf16 weights + cuBLAS GEMM + FlashAttention-2 | `7650654` | 53% |
+| S5 | fused QKV / gate-up GEMM | `c2f98a0` | 55% |
+| S6 | FlashDecoding decode-attention (split by request type) | `f0b1499` | 70% |
+| S7 | WMMA tensor-core prefill attention | `0dd4010` | 77% |
+| S8 | prefill-attention occupancy | `392cda5` | 81% |
+| S10 | scheduler: max-batch-tokens 2048→1024 | `642cc28` | 89% |
+| S12 | GQA-shared FlashDecoding (read K/V once per group) | `240aaa1` | 93% |
+| S14 | activation scratch right-sizing + KV-pool / OOB fix | `e5a99c8` | 93% |
 
-The engine mmaps the `.safetensors` shards and parses their header with RapidJSON, reading the
-weights as BF16. At load time it quantises every matmul weight (the attention q/k/v/o projections,
-the MLP gate/up/down, and `lm_head`) to INT8 with one scale per output row (symmetric, clamped to
-[-127, 127]); embeddings and norms stay BF16. This roughly halves weight memory (~16 GB → ~9 GB).
-Prefill dequantises the INT8 weights back to BF16 to feed the tensor cores; decode reads the INT8
-bytes directly, which is what matters since decode is memory-bound.
-
-### Prefill vs decode
-
-A forward pass takes one of two paths. **Prefill** (many prompt tokens at once) is compute-bound, so
-its matmuls run on the tensor cores via WMMA. **Decode** (one token per step) is memory-bound, so it
-uses a vectorised INT8 GEMV; the fixed single-token kernel sequence is captured once into a CUDA
-graph and replayed each step (the token id, position, and `past_len` live in device buffers, so the
-graph stays valid as the context grows). Greedy decoding does the argmax on the GPU and returns just
-one int; temperature / top-p sampling copies the logits to the host instead.
-
-### Attention: flash-decoding split-K
-
-Prefill attention assigns one warp per (head, query) and runs an online softmax entirely in
-registers, with no block barriers. At decode time with batch 1 that scheme exposes only ~32 parallel
-units (one per head), so each head's key range is split into `ATTN_SPLITS` (16) chunks computed by
-separate blocks as partial online-softmaxes and then combined — about 16× more parallelism, which
-keeps decode latency nearly flat as the context grows.
-
-### Paged KV cache (PagedAttention)
-
-Each layer's KV is a single `[num_blocks, BLOCK=16, kv_dim]` BF16 pool sized from the VRAM left after
-weights and activations. A sequence owns a *block table* — a list of physical block ids — and a
-logical position `p` maps to physical row `block_table[p/BLOCK]*BLOCK + p%BLOCK` (the addressing is
-shared in `kv_cache.cuh`). Blocks are handed out on demand, so VRAM grows with the actual sequence
-length and the number of concurrent sequences is decoupled from `max_ctx`: on a 24 GB 4090 the same
-memory becomes one shared ~87k-token pool instead of a fixed per-sequence reservation. Three KV
-kernels address through the block table: `store_kv_paged` (prefill and decode), `attention_paged`
-(prefill), and the split-K `attention_decode_paged`.
-
-### Continuous batching and preemption
-
-The scheduler (`engine/src/scheduler.*`) keeps all `n_slots` busy: as soon as a slot frees it admits
-a waiting request, and each iteration decodes the whole running set together. Prefill is chunked
-(`PREFILL_CHUNK` = 256 tokens per iteration) and interleaved with decode, so a long prompt never
-stalls the running sequences. When the block pool runs dry it preempts the youngest running sequence
-— freeing its blocks and requeuing it — and recomputes its KV from prompt + output on resume (the
-vLLM strategy), which keeps the engine correct under memory pressure rather than deadlocking. Each
-request carries its own sampling parameters; an all-greedy batch uses the GPU argmax, and a single
-sampling request makes the batch fall back to host-side per-row sampling.
-
-The staged history behind these — the single-stream optimisation journey (scalar matmul → WMMA →
-split-K → INT8, 49.7 → 104 tok/s) and the batching work — lives on the `optimization-study` and
-`feature/batching` branches.
-
----
-
-## Benchmark
-
-`./flashqwen benchmark` is an end-to-end serving benchmark, modelled on vLLM's `vllm bench serve`.
-It fires synthetic OpenAI chat requests at the server over HTTP — the full path through
-tokenisation, ChatML, gRPC, and sampling, i.e. what a real client sees — and reports the standard
-latency and throughput metrics. With no `--base-url` it spawns the embedded engine and an in-process
-server; with `--base-url http://host:port` it benchmarks an already-running `serve`.
-
-It measures, per request: **TTFT** (time to first token), **TPOT** (time per output token,
-`(E2EL − TTFT) / (output_tokens − 1)`), **ITL** (inter-token latency), and **E2EL** (end-to-end
-latency) — each reported as mean / median / configurable percentiles — plus request and token
-throughput. Load is either saturation (`--request-rate inf`, the default) or a Poisson arrival
-process (`--request-rate` + `--burstiness`), capped by `--max-concurrency`. Optional `--goodput`
-SLOs (e.g. `ttft:1000,tpot:50`, in ms) report the rate of requests that met every target, and
-`--output-json` writes the full report for tracking across runs.
-
-**Setup:** NVIDIA RTX 4090 (24 GB), Qwen3-8B with INT8-quantised matmul weights, continuous batching
-+ PagedAttention.
-**Config:** `--num-prompts 64 --input-len 512 --output-len 128 --max-concurrency 16` (saturation,
-greedy), goodput SLOs `ttft:1000,tpot:50`.
-
-```
-================ FlashQwen Serving Benchmark =================
-Successful requests:                       64
-Benchmark duration (s):                    53.98
-Maximum request concurrency:               16
-Total input tokens:                        34384
-Total generated tokens:                    7382
-Request throughput (req/s):                1.19
-Request goodput (req/s):                   0.02
-Output token throughput (tok/s):           136.76
-Total token throughput (tok/s):            773.76
--------------------- Time to First Token ---------------------
-Mean TTFT (ms):     1742.29   Median: 787.07   P99: 8082.02
-------------- Time per Output Token (excl. 1st) --------------
-Mean TPOT (ms):       98.74   Median: 106.44   P99:  123.86
---------------------- End-to-end Latency ---------------------
-Mean E2EL (ms):    13053.17   Median: 14174.81 P99: 20440.08
-==============================================================
-```
-
-At 16-way saturation, continuous batching pushes aggregate output to ~137 tok/s (~774 tok/s
-including prompt tokens). Median TTFT is 0.79 s but the P90 climbs to ~4.8 s as requests queue for an
-admission slot — which is what `goodput` captures: throughput counts every token produced, while
-goodput (here near zero, against a 1 s TTFT target) counts only requests served within the latency
-SLO. The two diverging is the signal that the system is past its latency-bounded capacity.
+The gap to vLLM **shrinks as input gets shorter** (decode-heavy): at 128-token input FlashQwen is
+**97.5%** of vLLM, at 512 **96.2%**, at 1024 **92.8%**. The remaining gap is prefill-side compute.
+See the report for the full cross-input data and the levers that were measured and ruled out
+(CUDA graphs, async scheduling, KV-cache sizing, GEMM autotuning).

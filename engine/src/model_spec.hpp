@@ -22,7 +22,6 @@ struct ModelSpec {
     int vocab_size   = 151936;
     float rms_eps    = 1e-6f;
     float rope_theta = 1000000.0f;
-    int max_pos      = 40960;
     std::string arch;        // architectures[0] from config.json ("" if unreadable)
     std::string dir;         // directory it was loaded from (config.json + weights + vocab live here)
 
@@ -57,8 +56,6 @@ struct ModelSpec {
         c.vocab_size   = o["vocab_size"].GetInt();
         c.rms_eps      = (float)o["rms_norm_eps"].GetDouble();
         c.rope_theta   = (float)o["rope_theta"].GetDouble();
-        if (o.HasMember("max_position_embeddings"))
-            c.max_pos  = o["max_position_embeddings"].GetInt();
         return c;
     }
 };

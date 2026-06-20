@@ -1,175 +1,20 @@
 #include "kernels.cuh"
-#include "kv_cache.cuh"   // kv_phys_row: the paged-KV addressing contract (shared with kv_cache.cu)
+#include "kv_cache.cuh"   // kv_phys_row: the paged-KV addressing contract (shared with block_pool.cu)
 #include <mma.h>
 using namespace nvcuda;
 
 // ---------------------------------------------------------------------------------------
-// GEMV (decode, M==1): one warp per output row. Weights are INT8 with a per-row scale; the
-// row is dequantized as it's read (acc * scale at the end). Reading 1-byte weights instead
-// of 2-byte halves the decode memory traffic. Each lane reads 16 INT8 per pass (16-byte
-// load), striding by 32*16. Requires IN % 16 == 0.
+// rmsnorm: one block per row, block-reduction over H. BF16 in/out, FP32 reduction + scale.
 // ---------------------------------------------------------------------------------------
-__global__ void gemv_kernel(const float* __restrict__ x, const int8_t* __restrict__ W,
-                            const float* __restrict__ scale, float* __restrict__ y, int IN, int OUT) {
-    int warp = threadIdx.x >> 5;
-    int lane = threadIdx.x & 31;
-    int row = blockIdx.x * (blockDim.x >> 5) + warp;   // output feature
-    if (row >= OUT) return;
-
-    const int8_t* wr = W + (size_t)row * IN;
-    float acc = 0.f;
-    for (int i = lane * 16; i + 16 <= IN; i += 512) {
-        int4 wpack = *reinterpret_cast<const int4*>(wr + i);          // 16 INT8 weights
-        const int8_t* wb = reinterpret_cast<const int8_t*>(&wpack);
-        const float4* xv = reinterpret_cast<const float4*>(x + i);
-        #pragma unroll
-        for (int q = 0; q < 4; ++q) {
-            float4 xx = xv[q];
-            acc += xx.x * (float)wb[q*4+0] + xx.y * (float)wb[q*4+1]
-                 + xx.z * (float)wb[q*4+2] + xx.w * (float)wb[q*4+3];
-        }
-    }
-    #pragma unroll
-    for (int o = 16; o > 0; o >>= 1)
-        acc += __shfl_down_sync(0xffffffff, acc, o);
-    if (lane == 0) y[row] = acc * scale[row];
-}
-
-// Dequantize an INT8 weight matrix (+ per-row scale) to BF16, for the prefill WMMA path.
-__global__ void dequant_kernel(const int8_t* __restrict__ W, const float* __restrict__ scale,
-                               bf16* __restrict__ out, int IN, long n) {
-    long idx = (long)blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= n) return;
-    out[idx] = __float2bfloat16((float)W[idx] * scale[idx / IN]);
-}
-
-// ---------------------------------------------------------------------------------------
-// FP32 -> BF16 convert with zero-padding of the tail rows (so the last WMMA tile is clean).
-// ---------------------------------------------------------------------------------------
-__global__ void f32_to_bf16_kernel(const float* __restrict__ in, bf16* __restrict__ out,
-                                   int valid, int total) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < total) out[i] = __float2bfloat16(i < valid ? in[i] : 0.0f);
-}
-
-// ---------------------------------------------------------------------------------------
-// Tensor-core GEMM (prefill, M>1): y[M,OUT] = x[M,IN] @ W[OUT,IN]^T, BF16 in / FP32 acc.
-// One warp computes a 16x16 output tile; 8 warps per block. W (row-major [OUT,IN]) is fed
-// as the matrix_b operand in col_major with leading dim IN, which is exactly W^T.
-// ---------------------------------------------------------------------------------------
-__global__ void wmma_kernel(const bf16* __restrict__ x, const bf16* __restrict__ W,
-                            float* __restrict__ y, int IN, int OUT) {
-    int warp = threadIdx.x >> 5;
-    int tile_n = blockIdx.x * 8 + warp;        // output-feature tile (16 wide)
-    int tile_m = blockIdx.y;                   // token tile (16 tall)
-    if (tile_n * 16 >= OUT) return;
-
-    wmma::fragment<wmma::matrix_a, 16, 16, 16, __nv_bfloat16, wmma::row_major> a;
-    wmma::fragment<wmma::matrix_b, 16, 16, 16, __nv_bfloat16, wmma::col_major> b;
-    wmma::fragment<wmma::accumulator, 16, 16, 16, float> c;
-    wmma::fill_fragment(c, 0.0f);
-
-    int m0 = tile_m * 16, n0 = tile_n * 16;
-    for (int k0 = 0; k0 < IN; k0 += 16) {
-        wmma::load_matrix_sync(a, x + (size_t)m0 * IN + k0, IN);
-        wmma::load_matrix_sync(b, W + (size_t)n0 * IN + k0, IN);   // col_major load == W^T
-        wmma::mma_sync(c, a, b, c);
-    }
-    wmma::store_matrix_sync(y + (size_t)m0 * OUT + n0, c, OUT, wmma::mem_row_major);
-}
-
-void launch_matmul(const float* x, const int8_t* W, const float* scale, float* y,
-                   int M, int IN, int OUT, bf16* x_bf16, bf16* w_dq, cudaStream_t s) {
-    if (M <= 1) {                              // decode: memory-bound INT8 GEMV
-        const int warps = 8;
-        gemv_kernel<<<(OUT + warps - 1) / warps, warps * 32, 0, s>>>(x, W, scale, y, IN, OUT);
-        return;
-    }
-    // prefill: dequantize the INT8 weights to BF16, convert activations to BF16, then run the
-    // tensor-core GEMM. (Dequant cost is amortized — prefill runs once per request.)
-    long wn = (long)OUT * IN; int blk = 256;
-    dequant_kernel<<<(wn + blk - 1) / blk, blk, 0, s>>>(W, scale, w_dq, IN, wn);
-
-    int Mp = ((M + 15) / 16) * 16;
-    int total = Mp * IN, valid = M * IN;
-    f32_to_bf16_kernel<<<(total + blk - 1) / blk, blk, 0, s>>>(x, x_bf16, valid, total);
-
-    dim3 block(256);                           // 8 warps
-    dim3 grid((OUT / 16 + 7) / 8, Mp / 16);
-    wmma_kernel<<<grid, block, 0, s>>>(x_bf16, w_dq, y, IN, OUT);
-}
-
-// ---------------------------------------------------------------------------------------
-// Batched decode GEMV: y[B,OUT] = x[B,IN] @ W[OUT,IN]^T. One warp per output row reads the
-// INT8 weight row ONCE (16-byte loads) and computes all B dot products, so weight traffic is
-// amortized across the batch — this is what makes batched decode faster per token than B
-// separate single-token GEMVs. B is a compile-time template so the acc[] array stays in
-// registers (a runtime-bounded array would spill to local memory). Requires IN % 16 == 0.
-// ---------------------------------------------------------------------------------------
-template<int B>
-__global__ void gemv_batch_kernel(const float* __restrict__ x, const int8_t* __restrict__ W,
-                                  const float* __restrict__ scale, float* __restrict__ y,
-                                  int IN, int OUT) {
-    int warp = threadIdx.x >> 5;
-    int lane = threadIdx.x & 31;
-    int row = blockIdx.x * (blockDim.x >> 5) + warp;
-    if (row >= OUT) return;
-
-    const int8_t* wr = W + (size_t)row * IN;
-    float acc[B];
-    #pragma unroll
-    for (int b = 0; b < B; ++b) acc[b] = 0.f;
-
-    for (int i = lane * 16; i + 16 <= IN; i += 512) {
-        int4 wpack = *reinterpret_cast<const int4*>(wr + i);     // 16 INT8 weights, read once
-        const int8_t* wb = reinterpret_cast<const int8_t*>(&wpack);
-        #pragma unroll
-        for (int b = 0; b < B; ++b) {
-            const float4* xv = reinterpret_cast<const float4*>(x + (size_t)b * IN + i);
-            #pragma unroll
-            for (int q = 0; q < 4; ++q) {
-                float4 xx = xv[q];
-                acc[b] += xx.x * (float)wb[q*4+0] + xx.y * (float)wb[q*4+1]
-                        + xx.z * (float)wb[q*4+2] + xx.w * (float)wb[q*4+3];
-            }
-        }
-    }
-    #pragma unroll
-    for (int b = 0; b < B; ++b) {
-        #pragma unroll
-        for (int o = 16; o > 0; o >>= 1) acc[b] += __shfl_down_sync(0xffffffff, acc[b], o);
-        if (lane == 0) y[(size_t)b * OUT + row] = acc[b] * scale[row];
-    }
-}
-
-void launch_matmul_decode(const float* x, const int8_t* W, const float* scale, float* y,
-                          int B, int IN, int OUT, cudaStream_t s) {
-    const int warps = 8;
-    int blocks = (OUT + warps - 1) / warps, th = warps * 32;
-    // Round B up to the nearest instantiated template size; extra rows compute from (unused)
-    // activation rows and their outputs are ignored by the caller.
-    #define LAUNCH_GEMV_B(T) gemv_batch_kernel<T><<<blocks, th, 0, s>>>(x, W, scale, y, IN, OUT)
-    if      (B <= 1)  LAUNCH_GEMV_B(1);
-    else if (B <= 2)  LAUNCH_GEMV_B(2);
-    else if (B <= 4)  LAUNCH_GEMV_B(4);
-    else if (B <= 8)  LAUNCH_GEMV_B(8);
-    else if (B <= 16) LAUNCH_GEMV_B(16);
-    else              LAUNCH_GEMV_B(32);
-    #undef LAUNCH_GEMV_B
-}
-
-// ---------------------------------------------------------------------------------------
-// rmsnorm: one block per row, block-reduction over H.
-// ---------------------------------------------------------------------------------------
-__global__ void rmsnorm_kernel(const float* __restrict__ x, const float* __restrict__ w,
-                               float* __restrict__ out, int M, int H, float eps) {
+__global__ void rmsnorm_kernel(const bf16* __restrict__ x, const float* __restrict__ w,
+                               bf16* __restrict__ out, int M, int H, float eps) {
     int m = blockIdx.x;
-    const float* xr = x + (size_t)m * H;
-    float* outr = out + (size_t)m * H;
+    const bf16* xr = x + (size_t)m * H;
+    bf16* outr = out + (size_t)m * H;
 
     extern __shared__ float red[];
     float local = 0.f;
-    for (int i = threadIdx.x; i < H; i += blockDim.x) local += xr[i] * xr[i];
+    for (int i = threadIdx.x; i < H; i += blockDim.x) { float v = __bfloat162float(xr[i]); local += v * v; }
     red[threadIdx.x] = local;
     __syncthreads();
     for (int s = blockDim.x >> 1; s > 0; s >>= 1) {
@@ -178,268 +23,638 @@ __global__ void rmsnorm_kernel(const float* __restrict__ x, const float* __restr
     }
     float inv = rsqrtf(red[0] / H + eps);
     for (int i = threadIdx.x; i < H; i += blockDim.x)
-        outr[i] = xr[i] * inv * w[i];
+        outr[i] = __float2bfloat16(__bfloat162float(xr[i]) * inv * w[i]);
 }
 
-void launch_rmsnorm(const float* x, const float* w, float* out, int M, int H, float eps, cudaStream_t s) {
+void launch_rmsnorm(const bf16* x, const float* w, bf16* out, int M, int H, float eps, cudaStream_t s) {
     int block = 256;
     rmsnorm_kernel<<<M, block, block * sizeof(float), s>>>(x, w, out, M, H, eps);
 }
 
 // ---------------------------------------------------------------------------------------
-// embedding gather
+// fused residual-add + rmsnorm: x += res (stored back, carries the residual forward), out = rmsnorm(x)
 // ---------------------------------------------------------------------------------------
-__global__ void embed_kernel(const int* __restrict__ ids, const bf16* __restrict__ embed,
-                             float* __restrict__ out, int M, int H) {
+__global__ void add_rmsnorm_kernel(bf16* __restrict__ x, const bf16* __restrict__ res,
+                                   const float* __restrict__ w, bf16* __restrict__ out,
+                                   int M, int H, float eps) {
     int m = blockIdx.x;
-    int id = ids[m];
-    const bf16* src = embed + (size_t)id * H;
-    float* dst = out + (size_t)m * H;
+    bf16* xr = x + (size_t)m * H;
+    const bf16* rr = res + (size_t)m * H;
+    bf16* outr = out + (size_t)m * H;
+
+    extern __shared__ float red[];
+    float local = 0.f;
+    for (int i = threadIdx.x; i < H; i += blockDim.x) {
+        float v = __bfloat162float(xr[i]) + __bfloat162float(rr[i]);
+        xr[i] = __float2bfloat16(v);          // updated residual stays in x for the next layer
+        local += v * v;
+    }
+    red[threadIdx.x] = local;
+    __syncthreads();
+    for (int s = blockDim.x >> 1; s > 0; s >>= 1) {
+        if (threadIdx.x < s) red[threadIdx.x] += red[threadIdx.x + s];
+        __syncthreads();
+    }
+    float inv = rsqrtf(red[0] / H + eps);
     for (int i = threadIdx.x; i < H; i += blockDim.x)
-        dst[i] = __bfloat162float(src[i]);
+        outr[i] = __float2bfloat16(__bfloat162float(xr[i]) * inv * w[i]);
 }
 
-void launch_embed(const int* ids, const bf16* embed, float* out, int M, int H, cudaStream_t s) {
+void launch_add_rmsnorm(bf16* x, const bf16* res, const float* w, bf16* out,
+                        int M, int H, float eps, cudaStream_t s) {
+    int block = 256;
+    add_rmsnorm_kernel<<<M, block, block * sizeof(float), s>>>(x, res, w, out, M, H, eps);
+}
+
+// ---------------------------------------------------------------------------------------
+// embedding gather (BF16 -> BF16, straight copy)
+// ---------------------------------------------------------------------------------------
+__global__ void embed_kernel(const int* __restrict__ ids, const bf16* __restrict__ embed,
+                             bf16* __restrict__ out, int M, int H) {
+    int m = blockIdx.x;
+    const bf16* src = embed + (size_t)ids[m] * H;
+    bf16* dst = out + (size_t)m * H;
+    for (int i = threadIdx.x; i < H; i += blockDim.x) dst[i] = src[i];
+}
+
+void launch_embed(const int* ids, const bf16* embed, bf16* out, int M, int H, cudaStream_t s) {
     embed_kernel<<<M, 256, 0, s>>>(ids, embed, out, M, H);
 }
 
 // ---------------------------------------------------------------------------------------
-// RoPE (rotate-half convention, matching HF Qwen)
+// Fused per-head RMSNorm + RoPE (rotate-half, matching HF Qwen). Operates in place on one sub-tensor
+// (q or k) of a fused QKV row of width `stride`: head (m,h) is at buf + m*stride + h*head_dim. The
+// rotation angles come from precomputed cos/sin tables ([max_pos, head_dim/2]) indexed by pos[m] —
+// no per-call transcendental, and they're identical across all 36 layers so the table is built once.
+// One block per (token, head); blockDim == head_dim. FP32 math.
 // ---------------------------------------------------------------------------------------
-__global__ void rope_kernel(float* __restrict__ x, const int* __restrict__ pos,
-                            int M, int n_heads, int head_dim, float theta) {
-    int idx = blockIdx.x;            // over M * n_heads
-    int m = idx / n_heads;
-    int i = threadIdx.x;             // over head_dim/2
+__global__ void head_norm_rope_kernel(bf16* __restrict__ buf, const float* __restrict__ w,
+                                      const float* __restrict__ cos_tab, const float* __restrict__ sin_tab,
+                                      const int* __restrict__ pos, int n_heads, int head_dim,
+                                      int stride, float eps) {
+    int row = blockIdx.x;            // over M * n_heads
+    int m = row / n_heads, h = row % n_heads;
+    int t = threadIdx.x;             // 0..head_dim-1
     int half = head_dim >> 1;
-    if (i >= half) return;
+    bf16* v = buf + (size_t)m * stride + (size_t)h * head_dim;
 
-    float* v = x + (size_t)idx * head_dim;
-    float inv = powf(theta, -2.0f * i / head_dim);
-    float ang = pos[m] * inv;
-    float cs = cosf(ang), sn = sinf(ang);
-    float x1 = v[i], x2 = v[i + half];
-    v[i]        = x1 * cs - x2 * sn;
-    v[i + half] = x2 * cs + x1 * sn;
+    extern __shared__ float sh[];    // [0,head_dim): reduction then normed values
+    float x = __bfloat162float(v[t]);
+    sh[t] = x * x;
+    __syncthreads();
+    for (int s = blockDim.x >> 1; s > 0; s >>= 1) {
+        if (t < s) sh[t] += sh[t + s];
+        __syncthreads();
+    }
+    float inv = rsqrtf(sh[0] / head_dim + eps);
+    __syncthreads();
+    sh[t] = x * inv * w[t];          // normed value
+    __syncthreads();
+
+    if (t < half) {
+        const float* cb = cos_tab + (size_t)pos[m] * half;
+        const float* sb = sin_tab + (size_t)pos[m] * half;
+        float cs = cb[t], sn = sb[t];
+        float x1 = sh[t], x2 = sh[t + half];
+        v[t]        = __float2bfloat16(x1 * cs - x2 * sn);
+        v[t + half] = __float2bfloat16(x2 * cs + x1 * sn);
+    }
 }
 
-void launch_rope(float* x, const int* pos, int M, int n_heads, int head_dim, float theta, cudaStream_t s) {
-    rope_kernel<<<M * n_heads, head_dim / 2, 0, s>>>(x, pos, M, n_heads, head_dim, theta);
+void launch_head_norm_rope(bf16* buf, const float* w, const float* cos_tab, const float* sin_tab,
+                           const int* pos, int M, int n_heads, int head_dim, int stride, float eps,
+                           cudaStream_t s) {
+    head_norm_rope_kernel<<<M * n_heads, head_dim, head_dim * sizeof(float), s>>>(
+        buf, w, cos_tab, sin_tab, pos, n_heads, head_dim, stride, eps);
 }
 
-// ---------------------------------------------------------------------------------------
-// Paged KV cache: a layer's pool is [num_blocks, BLOCK, kv_dim]; a sequence's KV is a list of
-// block ids (its block table). Logical position p -> physical row bt[p/BLOCK]*BLOCK + p%BLOCK,
-// addressed as cache + row*kv_dim. The math below is identical to the contiguous version; only
-// the per-token / per-key row lookup now goes through the block table.
-// ---------------------------------------------------------------------------------------
+// ======================================================================================
+// Paged-KV attention. Split by request type (dispatched from run_layers): prefill rows
+// (q_len>1) go to attn_prefill (WMMA tensor cores), decode rows (q_len==1) to attn_decode
+// (FlashDecoding). Both read the paged KV pool [num_blocks, BLOCK, kv_dim] via per-request
+// block tables `bt` (stride max_blocks); q comes from the fused-QKV buffer at row stride
+// q_stride. `rids[grid_slot]` -> actual request id, so each runs on its request subset.
+// ======================================================================================
 
-// Prefill attention — one WARP per (head, query token), online softmax over the paged KV. Each
-// lane owns head_dim/32 dims; the per-key q.k dot is a warp-shuffle reduction (no __syncthreads).
-__global__ void attention_paged_kernel(const float* __restrict__ q, const bf16* __restrict__ cache_k,
-                                       const bf16* __restrict__ cache_v, float* __restrict__ out,
-                                       int M, int n_heads, int n_kv, int head_dim,
-                                       const int* __restrict__ d_past, float scale,
-                                       const int* __restrict__ bt, int max_blocks, int block_size) {
-    constexpr int DPL = 4;
-    int h = blockIdx.x;              // query head
-    int m = blockIdx.y;              // query token
-    int lane = threadIdx.x;          // 0..31
-    int kvh = h / (n_heads / n_kv);
+// --- decode: one block per (head, decode-request); NW warps split the request's KV [0,qpos] into
+// strided slices (warp w takes key positions w, w+NW, ...), each online-softmaxing its slice in
+// registers — K/V read straight from the cache (a single query row has no cross-row reuse, so
+// shared staging would only add traffic + syncs) — then an in-block combine merges the NW partials.
+template<int NW, int DPL>
+__global__ void attn_decode_kernel(const bf16* __restrict__ q, int q_stride,
+                                   const bf16* __restrict__ cache_k, const bf16* __restrict__ cache_v,
+                                   bf16* __restrict__ out, int n_heads, int n_kv, int head_dim,
+                                   const int* __restrict__ pos, const int* __restrict__ qstart,
+                                   const int* __restrict__ decode_rids, const int* __restrict__ bt,
+                                   int max_blocks, int block_size, float scale) {
+    int h    = blockIdx.x;             // query head
+    int di   = blockIdx.y;             // decode-request slot
+    int w    = threadIdx.x >> 5;       // 0..NW-1: this warp's KV split
+    int lane = threadIdx.x & 31;
+
+    int r    = decode_rids[di];
+    int flat = qstart[r];              // the single query row (q_len == 1)
+    int qpos = pos[flat];              // attends keys [0, qpos]
+    int kvh  = h / (n_heads / n_kv);
     int kv_dim = n_kv * head_dim;
-    int qpos = *d_past + m;          // attend keys [0, qpos]
+    const int* btr = bt + (size_t)r * max_blocks;
 
-    const float* qv = q + ((size_t)m * n_heads + h) * head_dim;
-    float qreg[DPL], acc[DPL];
+    float qreg[DPL];
+    const bf16* qv = q + (size_t)flat * q_stride + (size_t)h * head_dim;
     #pragma unroll
-    for (int i = 0; i < DPL; ++i) { qreg[i] = qv[lane + (i << 5)]; acc[i] = 0.f; }
-    float m_run = -1e30f, l_run = 0.f;
+    for (int i = 0; i < DPL; ++i) qreg[i] = __bfloat162float(qv[lane + (i << 5)]);
 
-    for (int j = 0; j <= qpos; ++j) {
-        size_t phys = kv_phys_row(bt, j, block_size);            // block table row 0
-        const bf16* kj = cache_k + phys * kv_dim + kvh * head_dim;
+    float m_run = -1e30f, l_run = 0.f, acc[DPL];
+    #pragma unroll
+    for (int i = 0; i < DPL; ++i) acc[i] = 0.f;
+
+    // warp w streams key positions w, w+NW, w+2NW, ... <= qpos, reading K/V directly from the pool.
+    for (int kpos = w; kpos <= qpos; kpos += NW) {
+        size_t base = (size_t)btr[kpos / block_size] * block_size * kv_dim
+                    + (size_t)(kpos % block_size) * kv_dim + (size_t)kvh * head_dim;
+        const bf16* kc = cache_k + base;
         float partial = 0.f;
         #pragma unroll
-        for (int i = 0; i < DPL; ++i) partial += qreg[i] * __bfloat162float(kj[lane + (i << 5)]);
+        for (int i = 0; i < DPL; ++i) partial += qreg[i] * __bfloat162float(kc[lane + (i << 5)]);
         #pragma unroll
         for (int o = 16; o > 0; o >>= 1) partial += __shfl_xor_sync(0xffffffff, partial, o);
-        float score = partial * scale;          // identical on all lanes
+        float score = partial * scale;
 
         float m_new = fmaxf(m_run, score);
         float corr  = __expf(m_run - m_new);
         float p     = __expf(score - m_new);
         l_run = l_run * corr + p;
-        const bf16* vj = cache_v + phys * kv_dim + kvh * head_dim;
+        const bf16* vc = cache_v + base;
         #pragma unroll
-        for (int i = 0; i < DPL; ++i) acc[i] = acc[i] * corr + p * __bfloat162float(vj[lane + (i << 5)]);
+        for (int i = 0; i < DPL; ++i) acc[i] = acc[i] * corr + p * __bfloat162float(vc[lane + (i << 5)]);
         m_run = m_new;
     }
-    float inv = 1.0f / l_run;
-    float* o = out + ((size_t)m * n_heads + h) * head_dim;
+
+    // in-block combine of the NW partials (online-softmax merge), done by warp 0.
+    __shared__ float sm[NW], sl[NW], sacc[NW][DPL * 32];
+    sm[w] = m_run; sl[w] = l_run;
     #pragma unroll
-    for (int i = 0; i < DPL; ++i) o[lane + (i << 5)] = acc[i] * inv;
+    for (int i = 0; i < DPL; ++i) sacc[w][lane + (i << 5)] = acc[i];
+    __syncthreads();
+
+    if (w == 0) {
+        float gm = -1e30f;
+        #pragma unroll
+        for (int s = 0; s < NW; ++s) gm = fmaxf(gm, sm[s]);
+        float gl = 0.f, gacc[DPL];
+        #pragma unroll
+        for (int i = 0; i < DPL; ++i) gacc[i] = 0.f;
+        for (int s = 0; s < NW; ++s) {
+            float sc = __expf(sm[s] - gm);
+            gl += sl[s] * sc;
+            #pragma unroll
+            for (int i = 0; i < DPL; ++i) gacc[i] += sacc[s][lane + (i << 5)] * sc;
+        }
+        float inv = gl > 0.f ? 1.0f / gl : 0.f;
+        bf16* o = out + ((size_t)flat * n_heads + h) * head_dim;
+        #pragma unroll
+        for (int i = 0; i < DPL; ++i) o[lane + (i << 5)] = __float2bfloat16(gacc[i] * inv);
+    }
 }
 
-void launch_attention_paged(const float* q, const bf16* cache_k, const bf16* cache_v, float* out,
-                            int M, int n_heads, int n_kv, int head_dim, const int* d_past,
-                            float scale, const int* bt, int max_blocks, int block_size,
-                            cudaStream_t s) {
-    attention_paged_kernel<<<dim3(n_heads, M), 32, 0, s>>>(
-        q, cache_k, cache_v, out, M, n_heads, n_kv, head_dim, d_past, scale, bt, max_blocks, block_size);
-}
-
-// Batched flash-decoding phase 1: block (h, split, b) does a partial online-softmax over its key
-// chunk of sequence b (block-table row b), attending keys [0, past_len[b]].
-__global__ void attn_decode_split_paged_kernel(
-        const float* __restrict__ q, const bf16* __restrict__ cache_k, const bf16* __restrict__ cache_v,
-        float* __restrict__ part_m, float* __restrict__ part_l, float* __restrict__ part_acc,
-        int n_heads, int n_kv, int head_dim, const int* __restrict__ past_len,
-        const int* __restrict__ bt, int max_blocks, int block_size, float scale) {
-    constexpr int DPL = 4;
-    int h = blockIdx.x, sp = blockIdx.y, b = blockIdx.z, lane = threadIdx.x;
-    int kvh = h / (n_heads / n_kv);
+// --- GQA-shared FlashDecoding (the conc>=8 fast path) ----------------------------------------
+// The per-(q-head) kernel above re-reads each kv-head's K/V once per query head in its GQA group
+// (4x for Qwen3's 4:1 ratio). Even though L2 absorbs most of the redundant HBM traffic, the redundant
+// L2 bandwidth + load instructions + score reductions cost ~2.3x. Here one block owns a (kv-head,
+// request) and computes ALL G = n_heads/n_kv query heads of the group, loading each K/V element ONCE
+// into registers and reusing it across the G heads. To keep the 4090 saturated despite n_kv being 4x
+// fewer blocks than n_heads, the KV range is split across grid.z (ksplit) FlashDecoding-style; a tiny
+// second kernel combines the per-split partials. (The S4 attempt grouped by kv-head but used only
+// n_kv blocks -> GPU starved; the KV split is what makes grouping a win.)
+//
+// Phase 1: each block (kv-head, request, split) -> NW warps stream their slice of the split's keys,
+// online-softmax per head, in-block combine across the NW warps, write G UNNORMALIZED partials
+// (m, l, acc[head_dim]) for this split into pm/pl/pa indexed [(di*n_heads + h)*ksplit + sp].
+template<int NW, int DPL, int G>
+__global__ void attn_decode_gqa_kernel(const bf16* __restrict__ q, int q_stride,
+                                       const bf16* __restrict__ cache_k, const bf16* __restrict__ cache_v,
+                                       float* __restrict__ pm, float* __restrict__ pl, float* __restrict__ pa,
+                                       int n_heads, int n_kv, int head_dim,
+                                       const int* __restrict__ pos, const int* __restrict__ qstart,
+                                       const int* __restrict__ decode_rids, const int* __restrict__ bt,
+                                       int max_blocks, int block_size, float scale, int ksplit) {
+    int kvh = blockIdx.x;              // kv head (owns this GQA group)
+    int di  = blockIdx.y;             // decode-request slot
+    int sp  = blockIdx.z;             // KV split
+    int w   = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    int r = decode_rids[di], flat = qstart[r], qpos = pos[flat];
     int kv_dim = n_kv * head_dim;
-    int L = past_len[b] + 1;                        // keys [0, past_len[b]]
-    int per = (L + ATTN_SPLITS - 1) / ATTN_SPLITS;
-    int kb = sp * per, ke = min(kb + per, L);
+    const int* btr = bt + (size_t)r * max_blocks;
 
-    const int* btb = bt + (size_t)b * max_blocks;   // this sequence's block table
-    const float* qv = q + ((size_t)b * n_heads + h) * head_dim;
-    float qreg[DPL], acc[DPL];
+    float qreg[G][DPL];               // the G query heads of this group, in registers
     #pragma unroll
-    for (int i = 0; i < DPL; ++i) { qreg[i] = qv[lane + (i << 5)]; acc[i] = 0.f; }
-    float m_run = -1e30f, l_run = 0.f;
-
-    for (int j = kb; j < ke; ++j) {
-        size_t phys = kv_phys_row(btb, j, block_size);
-        const bf16* kj = cache_k + phys * kv_dim + kvh * head_dim;
-        float p = 0.f;
+    for (int g = 0; g < G; ++g) {
+        const bf16* qv = q + (size_t)flat * q_stride + (size_t)(kvh * G + g) * head_dim;
         #pragma unroll
-        for (int i = 0; i < DPL; ++i) p += qreg[i] * __bfloat162float(kj[lane + (i << 5)]);
-        #pragma unroll
-        for (int o = 16; o > 0; o >>= 1) p += __shfl_xor_sync(0xffffffff, p, o);
-        float score = p * scale;
-        float m_new = fmaxf(m_run, score);
-        float corr = __expf(m_run - m_new), pp = __expf(score - m_new);
-        l_run = l_run * corr + pp;
-        const bf16* vj = cache_v + phys * kv_dim + kvh * head_dim;
-        #pragma unroll
-        for (int i = 0; i < DPL; ++i) acc[i] = acc[i] * corr + pp * __bfloat162float(vj[lane + (i << 5)]);
-        m_run = m_new;
+        for (int i = 0; i < DPL; ++i) qreg[g][i] = __bfloat162float(qv[lane + (i << 5)]);
     }
-    int slot_idx = ((size_t)b * n_heads + h) * ATTN_SPLITS + sp;
-    if (lane == 0) { part_m[slot_idx] = m_run; part_l[slot_idx] = l_run; }
+    float m_run[G], l_run[G], acc[G][DPL];
     #pragma unroll
-    for (int i = 0; i < DPL; ++i) part_acc[(size_t)slot_idx * head_dim + lane + (i << 5)] = acc[i];
+    for (int g = 0; g < G; ++g) { m_run[g] = -1e30f; l_run[g] = 0.f;
+        #pragma unroll
+        for (int i = 0; i < DPL; ++i) acc[g][i] = 0.f; }
+
+    // warp w of split sp streams keys sp*NW+w, +NW*ksplit, ... (every key hits exactly one (sp,w)).
+    for (int kpos = sp * NW + w; kpos <= qpos; kpos += NW * ksplit) {
+        size_t base = (size_t)btr[kpos / block_size] * block_size * kv_dim
+                    + (size_t)(kpos % block_size) * kv_dim + (size_t)kvh * head_dim;
+        const bf16* kc = cache_k + base; const bf16* vc = cache_v + base;
+        float kreg[DPL], vreg[DPL];   // K/V loaded ONCE, reused across the G heads
+        #pragma unroll
+        for (int i = 0; i < DPL; ++i) { kreg[i] = __bfloat162float(kc[lane + (i << 5)]);
+                                        vreg[i] = __bfloat162float(vc[lane + (i << 5)]); }
+        #pragma unroll
+        for (int g = 0; g < G; ++g) {
+            float partial = 0.f;
+            #pragma unroll
+            for (int i = 0; i < DPL; ++i) partial += qreg[g][i] * kreg[i];
+            #pragma unroll
+            for (int o = 16; o > 0; o >>= 1) partial += __shfl_xor_sync(0xffffffff, partial, o);
+            float score = partial * scale;
+            float m_new = fmaxf(m_run[g], score), corr = __expf(m_run[g] - m_new), p = __expf(score - m_new);
+            l_run[g] = l_run[g] * corr + p;
+            #pragma unroll
+            for (int i = 0; i < DPL; ++i) acc[g][i] = acc[g][i] * corr + p * vreg[i];
+            m_run[g] = m_new;
+        }
+    }
+
+    __shared__ float sm[G][NW], sl[G][NW], sa[G][NW][DPL * 32];
+    #pragma unroll
+    for (int g = 0; g < G; ++g) { sm[g][w] = m_run[g]; sl[g][w] = l_run[g];
+        #pragma unroll
+        for (int i = 0; i < DPL; ++i) sa[g][w][lane + (i << 5)] = acc[g][i]; }
+    __syncthreads();
+
+    if (w == 0) {   // merge the NW warps' partials, write one (m,l,acc) per head for this split
+        #pragma unroll
+        for (int g = 0; g < G; ++g) {
+            float gm = -1e30f;
+            #pragma unroll
+            for (int t = 0; t < NW; ++t) gm = fmaxf(gm, sm[g][t]);
+            float gl = 0.f, gacc[DPL];
+            #pragma unroll
+            for (int i = 0; i < DPL; ++i) gacc[i] = 0.f;
+            for (int t = 0; t < NW; ++t) { float c = __expf(sm[g][t] - gm); gl += sl[g][t] * c;
+                #pragma unroll
+                for (int i = 0; i < DPL; ++i) gacc[i] += sa[g][t][lane + (i << 5)] * c; }
+            int h = kvh * G + g;
+            size_t idx = ((size_t)di * n_heads + h) * ksplit + sp;
+            if (lane == 0) { pm[idx] = gm; pl[idx] = gl; }
+            #pragma unroll
+            for (int i = 0; i < DPL; ++i) pa[idx * head_dim + lane + (i << 5)] = gacc[i];
+        }
+    }
 }
 
-// Batched flash-decoding phase 2: one warp per (b, head) merges the ATTN_SPLITS partials.
-__global__ void attn_decode_combine_paged_kernel(
-        const float* __restrict__ part_m, const float* __restrict__ part_l,
-        const float* __restrict__ part_acc, float* __restrict__ out, int n_heads, int head_dim) {
-    constexpr int DPL = 4;
-    int h = blockIdx.x, b = blockIdx.y, lane = threadIdx.x;
-    int base = ((size_t)b * n_heads + h) * ATTN_SPLITS;
+// Phase 2: combine the ksplit partials of each (head, request) -> the final normalized output row.
+// One block per (head, decode-request); head_dim threads, each owns one output element.
+__global__ void attn_decode_combine_kernel(const float* __restrict__ pm, const float* __restrict__ pl,
+                                           const float* __restrict__ pa, bf16* __restrict__ out,
+                                           int n_heads, int head_dim, const int* __restrict__ qstart,
+                                           const int* __restrict__ decode_rids, int ksplit) {
+    int h = blockIdx.x, di = blockIdx.y, d = threadIdx.x;
+    int r = decode_rids[di], flat = qstart[r];
+    size_t base = ((size_t)di * n_heads + h) * ksplit;
     float gm = -1e30f;
-    #pragma unroll
-    for (int sp = 0; sp < ATTN_SPLITS; ++sp) gm = fmaxf(gm, part_m[base + sp]);
-    float gl = 0.f, gacc[DPL];
-    #pragma unroll
-    for (int i = 0; i < DPL; ++i) gacc[i] = 0.f;
-    #pragma unroll
-    for (int sp = 0; sp < ATTN_SPLITS; ++sp) {
-        int slot_idx = base + sp;
-        float w = __expf(part_m[slot_idx] - gm);
-        gl += part_l[slot_idx] * w;
-        #pragma unroll
-        for (int i = 0; i < DPL; ++i) gacc[i] += part_acc[(size_t)slot_idx * head_dim + lane + (i << 5)] * w;
+    for (int s = 0; s < ksplit; ++s) gm = fmaxf(gm, pm[base + s]);
+    float gl = 0.f, gacc = 0.f;
+    for (int s = 0; s < ksplit; ++s) {
+        float c = __expf(pm[base + s] - gm);
+        gl   += pl[base + s] * c;                     // ksplit is small; recomputing gl per thread is cheap
+        gacc += pa[(base + s) * head_dim + d] * c;
     }
-    float inv = 1.0f / gl;
-    float* o = out + ((size_t)b * n_heads + h) * head_dim;
-    #pragma unroll
-    for (int i = 0; i < DPL; ++i) o[lane + (i << 5)] = gacc[i] * inv;
+    float inv = gl > 0.f ? 1.0f / gl : 0.f;
+    out[((size_t)flat * n_heads + h) * head_dim + d] = __float2bfloat16(gacc * inv);
 }
 
-void launch_attention_decode_paged(const float* q, const bf16* cache_k, const bf16* cache_v,
-                                   float* out, int B, int n_heads, int n_kv, int head_dim,
-                                   const int* past_len, const int* bt, int max_blocks, int block_size,
-                                   float scale, float* part_m, float* part_l, float* part_acc,
-                                   cudaStream_t s) {
-    attn_decode_split_paged_kernel<<<dim3(n_heads, ATTN_SPLITS, B), 32, 0, s>>>(
-        q, cache_k, cache_v, part_m, part_l, part_acc, n_heads, n_kv, head_dim,
-        past_len, bt, max_blocks, block_size, scale);
-    attn_decode_combine_paged_kernel<<<dim3(n_heads, B), 32, 0, s>>>(
-        part_m, part_l, part_acc, out, n_heads, head_dim);
+void launch_attn_decode(const bf16* q, int q_stride, const bf16* cache_k, const bf16* cache_v,
+                        bf16* out, int n_heads, int n_kv, int head_dim,
+                        const int* pos, const int* qstart, const int* decode_rids, int n_decode,
+                        const int* bt, int max_blocks, int block_size, float scale, cudaStream_t s) {
+    if (n_decode <= 0) return;
+    constexpr int NW = 8;              // warps per block
+    int G = n_heads / n_kv;            // GQA group size (4 for Qwen3-8B)
+
+    // GQA-shared fast path: head_dim==128 (DPL=4) and a supported group size. Split the KV range over
+    // grid.z so n_kv (< n_heads) blocks still saturate the GPU.
+    if (head_dim == 128 && (G == 1 || G == 2 || G == 4 || G == 8)) {
+        constexpr int MAX_KSPLIT = 16;
+        int ksplit = 128 / (n_decode > 0 ? n_decode : 1);   // ~enough blocks: n_kv*n_decode*ksplit
+        if (ksplit < 1) ksplit = 1; if (ksplit > MAX_KSPLIT) ksplit = MAX_KSPLIT;
+
+        // persistent FlashDecoding partials, reused across layers/steps (sized for the worst case).
+        static float *pm = nullptr, *pl = nullptr, *pa = nullptr;
+        if (!pm) {
+            size_t nent = (size_t)MAX_DECODE_B * 64 /*heads guard*/ * MAX_KSPLIT;
+            cudaMalloc(&pm, nent * sizeof(float));
+            cudaMalloc(&pl, nent * sizeof(float));
+            cudaMalloc(&pa, nent * 128 * sizeof(float));
+        }
+        dim3 g1(n_kv, n_decode, ksplit);
+        #define FQ_DEC_GQA(GG) attn_decode_gqa_kernel<NW, 4, GG><<<g1, NW * 32, 0, s>>>(            \
+            q, q_stride, cache_k, cache_v, pm, pl, pa, n_heads, n_kv, head_dim, pos, qstart,        \
+            decode_rids, bt, max_blocks, block_size, scale, ksplit)
+        if      (G == 4) FQ_DEC_GQA(4);
+        else if (G == 2) FQ_DEC_GQA(2);
+        else if (G == 8) FQ_DEC_GQA(8);
+        else             FQ_DEC_GQA(1);
+        #undef FQ_DEC_GQA
+        dim3 g2(n_heads, n_decode);
+        attn_decode_combine_kernel<<<g2, head_dim, 0, s>>>(pm, pl, pa, out, n_heads, head_dim,
+                                                           qstart, decode_rids, ksplit);
+        return;
+    }
+
+    // fallback: original one-block-per-(head,request) kernel (re-reads K/V per GQA group).
+    dim3 grid(n_heads, n_decode);
+    attn_decode_kernel<NW, 4><<<grid, NW * 32, 0, s>>>(
+        q, q_stride, cache_k, cache_v, out, n_heads, n_kv, head_dim, pos, qstart, decode_rids, bt,
+        max_blocks, block_size, scale);
+}
+
+// --- prefill: tensor-core (WMMA 16x16x16 bf16 in / fp32 accumulate) FlashAttention-2. One warp per
+// (16-query-tile, head, request); streams K/V in 16-key tiles (one tile == one paged block, since
+// block_size==16), no S materialization, online softmax with deferred normalization, O kept in shared
+// fp32 and rescaled per tile (portable — no WMMA fragment-layout assumptions). HD==128 (8 d-steps).
+__global__ void attn_prefill_kernel(const bf16* __restrict__ q, int q_stride,
+                                    const bf16* __restrict__ cache_k,
+                                    const bf16* __restrict__ cache_v, bf16* __restrict__ out,
+                                    int n_heads, int n_kv,
+                                    const int* __restrict__ pos, const int* __restrict__ qstart,
+                                    const int* __restrict__ qlen, const int* __restrict__ rids,
+                                    const int* __restrict__ bt, int max_blocks, float scale) {
+    constexpr int HD = 128, ND = HD / 16, TILE = 16;
+    int r  = rids[blockIdx.z];
+    int h  = blockIdx.y;
+    int qt = blockIdx.x;
+    int lane = threadIdx.x & 31;
+
+    int ql = qlen[r];
+    int q0 = qt * TILE;                       // first query row (within request) of this tile
+    if (q0 >= ql) return;                     // tile entirely past the request's rows
+    int qs  = qstart[r];
+    int kvh = h / (n_heads / n_kv);
+    int kv_dim = n_kv * HD;
+    const int* btr = bt + (size_t)r * max_blocks;
+
+    // last active row's position bounds the key range (positions increase within a request).
+    int last = min(q0 + TILE - 1, ql - 1);
+    int maxqpos = pos[qs + last];
+    int ntiles = maxqpos / TILE + 1;
+
+    __shared__ float Ss[TILE * TILE];         // S tile scratch (fp32)
+    __shared__ __nv_bfloat16 Ps[TILE * TILE]; // softmaxed P tile (bf16) for P*V
+    __shared__ float Os[TILE * HD];           // O accumulator (fp32, persists across K tiles)
+    __shared__ float Ot[TILE * TILE];         // one 16x16 P*V d-tile (folded into Os immediately)
+    __shared__ float m_[TILE], l_[TILE], corr_[TILE];
+
+    for (int e = lane; e < TILE * HD; e += 32) Os[e] = 0.f;
+    if (lane < TILE) { m_[lane] = -1e30f; l_[lane] = 0.f; }
+    __syncthreads();
+
+    wmma::fragment<wmma::matrix_a, 16, 16, 16, __nv_bfloat16, wmma::row_major> qf;
+    wmma::fragment<wmma::matrix_b, 16, 16, 16, __nv_bfloat16, wmma::col_major> kf;
+    wmma::fragment<wmma::matrix_a, 16, 16, 16, __nv_bfloat16, wmma::row_major> pf;
+    wmma::fragment<wmma::matrix_b, 16, 16, 16, __nv_bfloat16, wmma::row_major> vf;
+
+    for (int kt = 0; kt < ntiles; ++kt) {
+        size_t kvbase = (size_t)btr[kt] * TILE * kv_dim + (size_t)kvh * HD;   // page kt, this kv-head
+
+        // S = Q * K^T  (accumulate over the 8 head-dim steps)
+        wmma::fragment<wmma::accumulator, 16, 16, 16, float> sacc;
+        wmma::fill_fragment(sacc, 0.f);
+        #pragma unroll
+        for (int d = 0; d < ND; ++d) {
+            wmma::load_matrix_sync(qf, q + (size_t)(qs + q0) * q_stride + (size_t)h * HD + d * 16, q_stride);
+            wmma::load_matrix_sync(kf, cache_k + kvbase + d * 16, kv_dim);
+            wmma::mma_sync(sacc, qf, kf, sacc);
+        }
+        wmma::store_matrix_sync(Ss, sacc, TILE, wmma::mem_row_major);
+        __syncthreads();
+
+        // online softmax over this tile's 16 keys (one warp lane per query row)
+        if (lane < TILE) {
+            int grow = q0 + lane;
+            if (grow < ql) {
+                int qpos = pos[qs + grow];
+                float sc[TILE], rmax = -1e30f;
+                #pragma unroll
+                for (int c = 0; c < TILE; ++c) {
+                    int kpos = kt * TILE + c;
+                    sc[c] = (kpos <= qpos) ? Ss[lane * TILE + c] * scale : -1e30f;
+                    rmax = fmaxf(rmax, sc[c]);
+                }
+                float mold = m_[lane], mnew = fmaxf(mold, rmax), corr = __expf(mold - mnew), rsum = 0.f;
+                #pragma unroll
+                for (int c = 0; c < TILE; ++c) { float p = __expf(sc[c] - mnew); Ps[lane * TILE + c] = __float2bfloat16(p); rsum += p; }
+                l_[lane] = l_[lane] * corr + rsum; m_[lane] = mnew; corr_[lane] = corr;
+            } else {
+                #pragma unroll
+                for (int c = 0; c < TILE; ++c) Ps[lane * TILE + c] = __float2bfloat16(0.f);
+                corr_[lane] = 1.f;
+            }
+        }
+        __syncthreads();
+
+        // P*V folded with the running-O rescale, one 16x16 d-tile at a time (no full [16,128] temp):
+        // Os[:,d] = Os[:,d]*corr + (P*V)[:,d]. Each Os element is rescaled exactly once (when its own
+        // d-tile is processed). Shrinks shared (~18KB -> ~11KB) so more blocks/warps stay resident.
+        #pragma unroll
+        for (int d = 0; d < ND; ++d) {
+            wmma::fragment<wmma::accumulator, 16, 16, 16, float> pv;
+            wmma::fill_fragment(pv, 0.f);
+            wmma::load_matrix_sync(pf, Ps, TILE);
+            wmma::load_matrix_sync(vf, cache_v + kvbase + d * 16, kv_dim);
+            wmma::mma_sync(pv, pf, vf, pv);
+            wmma::store_matrix_sync(Ot, pv, TILE, wmma::mem_row_major);
+            __syncthreads();
+            for (int e = lane; e < TILE * TILE; e += 32) {
+                int row = e / TILE, col = e % TILE;
+                int oidx = row * HD + d * 16 + col;
+                Os[oidx] = Os[oidx] * corr_[row] + Ot[e];
+            }
+            __syncthreads();
+        }
+    }
+
+    // normalize and write out the active rows
+    for (int e = lane; e < TILE * HD; e += 32) {
+        int row = e / HD, d = e % HD, grow = q0 + row;
+        if (grow < ql) {
+            float inv = l_[row] > 0.f ? 1.0f / l_[row] : 0.f;
+            out[((size_t)(qs + grow) * n_heads + h) * HD + d] = __float2bfloat16(Os[e] * inv);
+        }
+    }
+}
+
+void launch_attn_prefill(const bf16* q, int q_stride, const bf16* cache_k, const bf16* cache_v,
+                         bf16* out, int n_heads, int n_kv, int head_dim,
+                         const int* pos, const int* qstart, const int* qlen,
+                         const int* rids, int R, int max_qlen,
+                         const int* bt, int max_blocks, int block_size, float scale,
+                         cudaStream_t s) {
+    if (R <= 0) return;
+    // The WMMA kernel hardwires head_dim==128 (8 d-steps) and one 16-key tile per paged block
+    // (block_size==16) — the engine's only supported layout (Qwen3, BlockPool::BLOCK==16).
+    int qtiles = (max_qlen + 15) / 16;
+    dim3 grid(qtiles, n_heads, R);
+    attn_prefill_kernel<<<grid, 32, 0, s>>>(
+        q, q_stride, cache_k, cache_v, out, n_heads, n_kv, pos, qstart, qlen, rids, bt, max_blocks, scale);
+}
+
+// Gather S rows: out[i, :] = x[rows[i], :]   (one block per gathered row, BF16)
+__global__ void gather_rows_kernel(const bf16* __restrict__ x, const int* __restrict__ rows,
+                                   bf16* __restrict__ out, int H) {
+    int i = blockIdx.x;
+    const bf16* src = x + (size_t)rows[i] * H;
+    bf16* dst = out + (size_t)i * H;
+    for (int j = threadIdx.x; j < H; j += blockDim.x) dst[j] = src[j];
+}
+
+void launch_gather_rows(const bf16* x, const int* rows, bf16* out, int S, int H, cudaStream_t s) {
+    if (S > 0) gather_rows_kernel<<<S, 256, 0, s>>>(x, rows, out, H);
 }
 
 // ---------------------------------------------------------------------------------------
-// elementwise helpers
+// elementwise helpers (BF16 in/out, FP32 math)
 // ---------------------------------------------------------------------------------------
-__global__ void add_kernel(float* out, const float* in, int N) {
+__global__ void add_kernel(bf16* out, const bf16* in, int N) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < N) out[i] += in[i];
+    if (i < N) out[i] = __float2bfloat16(__bfloat162float(out[i]) + __bfloat162float(in[i]));
 }
-void launch_add(float* out, const float* in, int N, cudaStream_t s) {
+void launch_add(bf16* out, const bf16* in, int N, cudaStream_t s) {
     int block = 256;
     add_kernel<<<(N + block - 1) / block, block, 0, s>>>(out, in, N);
 }
 
-__global__ void silu_mul_kernel(const float* gate, const float* up, float* h, int N) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < N) {
-        float g = gate[i];
-        h[i] = (g / (1.0f + expf(-g))) * up[i];
-    }
+// h[m,i] = silu(gateup[m,i]) * gateup[m, I+i] — gate and up are the two halves of a fused row (width 2I).
+__global__ void silu_mul_kernel(const bf16* __restrict__ gateup, bf16* __restrict__ h, int M, int I) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= (size_t)M * I) return;
+    int m = idx / I, i = idx % I;
+    const bf16* row = gateup + (size_t)m * 2 * I;
+    float g = __bfloat162float(row[i]);
+    h[idx] = __float2bfloat16((g / (1.0f + expf(-g))) * __bfloat162float(row[I + i]));
 }
-void launch_silu_mul(const float* gate, const float* up, float* h, int N, cudaStream_t s) {
+void launch_silu_mul(const bf16* gateup, bf16* h, int M, int I, cudaStream_t s) {
     int block = 256;
-    silu_mul_kernel<<<(N + block - 1) / block, block, 0, s>>>(gate, up, h, N);
+    long N = (long)M * I;
+    silu_mul_kernel<<<(N + block - 1) / block, block, 0, s>>>(gateup, h, M, I);
 }
 
-// argmax over N logits in a single block (256 threads), result index in *out.
-__global__ void argmax_kernel(const float* __restrict__ logits, int N, int* __restrict__ out) {
-    __shared__ float sval[256];
-    __shared__ int   sidx[256];
-    int tid = threadIdx.x;
-    float best = -1e30f; int bi = 0;
-    for (int i = tid; i < N; i += blockDim.x) {
-        float v = logits[i];
-        if (v > best) { best = v; bi = i; }
-    }
-    sval[tid] = best; sidx[tid] = bi;
-    __syncthreads();
-    for (int s = blockDim.x >> 1; s > 0; s >>= 1) {
-        if (tid < s && sval[tid + s] > sval[tid]) { sval[tid] = sval[tid + s]; sidx[tid] = sidx[tid + s]; }
-        __syncthreads();
-    }
-    if (tid == 0) *out = sidx[0];
-}
-
-void launch_argmax(const float* logits, int N, int* d_out, cudaStream_t s) {
-    argmax_kernel<<<1, 256, 0, s>>>(logits, N, d_out);
-}
-
-// Batched argmax: one block per row of logits[B, N]; d_out[b] = argmax over row b.
-__global__ void argmax_batch_kernel(const float* __restrict__ logits, int N, int* __restrict__ out) {
-    __shared__ float sval[256];
-    __shared__ int   sidx[256];
-    int b = blockIdx.x, tid = threadIdx.x;
+// Batched sampling: one block per row of logits[B, N]. Greedy (invT[b] <= 0) reduces an argmax;
+// otherwise temperature softmax + inverse-CDF categorical sampling, restricted to the nucleus when
+// top_p[b] < 1. Each thread owns a CONTIGUOUS index range so the cumulative scan is in token-id
+// order (any consistent order gives the same distribution; contiguous makes the per-thread prefix a
+// true prefix over token ids). Nucleus = the smallest set of highest-prob tokens with cumulative
+// prob >= top_p; found by binary-searching a weight threshold wt with sum_{w_i >= wt} w_i >= top_p*Z
+// (full distribution is the wt == 0 case). No global sort — all work stays inside one block.
+static constexpr int kSampleThreads = 256;
+__global__ void sample_batch_kernel(const float* __restrict__ logits, int N,
+                                    const float* __restrict__ invT,
+                                    const float* __restrict__ topp,
+                                    const float* __restrict__ u,
+                                    int* __restrict__ out) {
+    int b = blockIdx.x, tid = threadIdx.x, nt = blockDim.x;
     const float* lg = logits + (size_t)b * N;
-    float best = -1e30f; int bi = 0;
-    for (int i = tid; i < N; i += blockDim.x) {
-        float v = lg[i];
-        if (v > best) { best = v; bi = i; }
+    float it = invT[b];
+
+    __shared__ float sval[kSampleThreads];   // per-thread reduction / partial-sum scratch
+    __shared__ int   sidx[kSampleThreads];
+
+    // ---- greedy: argmax over a strided sweep ----
+    if (it <= 0.0f) {
+        float best = -1e30f; int bi = 0;
+        for (int i = tid; i < N; i += nt) { float v = lg[i]; if (v > best) { best = v; bi = i; } }
+        sval[tid] = best; sidx[tid] = bi;
+        __syncthreads();
+        for (int s = nt >> 1; s > 0; s >>= 1) {
+            if (tid < s && sval[tid + s] > sval[tid]) { sval[tid] = sval[tid + s]; sidx[tid] = sidx[tid + s]; }
+            __syncthreads();
+        }
+        if (tid == 0) out[b] = sidx[0];
+        return;
     }
-    sval[tid] = best; sidx[tid] = bi;
+
+    // ---- temperature categorical (full distribution, or nucleus when top_p < 1) ----
+    int chunk = (N + nt - 1) / nt;
+    int lo = min(tid * chunk, N), hi = min(lo + chunk, N);
+
+    // pass 1: max logit (numerical stability), block max-reduce
+    float lmax = -1e30f;
+    for (int i = lo; i < hi; ++i) lmax = fmaxf(lmax, lg[i]);
+    sval[tid] = lmax;
     __syncthreads();
-    for (int s = blockDim.x >> 1; s > 0; s >>= 1) {
-        if (tid < s && sval[tid + s] > sval[tid]) { sval[tid] = sval[tid + s]; sidx[tid] = sidx[tid + s]; }
+    for (int s = nt >> 1; s > 0; s >>= 1) {
+        if (tid < s) sval[tid] = fmaxf(sval[tid], sval[tid + s]);
         __syncthreads();
     }
-    if (tid == 0) out[b] = sidx[0];
+    float m = sval[0];
+    __syncthreads();
+
+    // pass 2: per-thread exp-weight sum over its chunk; prefix -> base[], total Z. w_i in (0,1]
+    // since the max logit gives w = exp(0) = 1.
+    __shared__ float base[kSampleThreads];
+    __shared__ float total;            // Z first, then the nucleus mass M
+    float lsum = 0.0f;
+    for (int i = lo; i < hi; ++i) lsum += expf((lg[i] - m) * it);
+    sval[tid] = lsum;
+    __syncthreads();
+    if (tid == 0) { float acc = 0.0f; for (int t = 0; t < nt; ++t) { base[t] = acc; acc += sval[t]; } total = acc; }
+    __syncthreads();
+    float Z = total;
+
+    // nucleus: binary-search the largest weight threshold wt whose kept mass still covers top_p*Z
+    // (largest wt => smallest set), then rebuild base[]/M over the kept tokens. wt stays 0 (keep
+    // all) when top_p >= 1.
+    float wt = 0.0f;
+    if (topp[b] < 1.0f) {
+        float need = topp[b] * Z, wlo = 0.0f, whi = 1.0f;
+        for (int it2 = 0; it2 < 32; ++it2) {
+            float mid = 0.5f * (wlo + whi);
+            float mmass = 0.0f;
+            for (int i = lo; i < hi; ++i) { float w = expf((lg[i] - m) * it); if (w >= mid) mmass += w; }
+            sval[tid] = mmass;
+            __syncthreads();
+            for (int s = nt >> 1; s > 0; s >>= 1) { if (tid < s) sval[tid] += sval[tid + s]; __syncthreads(); }
+            float mass = sval[0];
+            __syncthreads();
+            if (mass >= need) wlo = mid; else whi = mid;
+        }
+        wt = wlo;
+        float km = 0.0f;
+        for (int i = lo; i < hi; ++i) { float w = expf((lg[i] - m) * it); if (w >= wt) km += w; }
+        sval[tid] = km;
+        __syncthreads();
+        if (tid == 0) { float acc = 0.0f; for (int t = 0; t < nt; ++t) { base[t] = acc; acc += sval[t]; } total = acc; }
+        __syncthreads();
+    }
+
+    // inverse-CDF within the kept set (all tokens when wt == 0): the one thread whose
+    // [base, base+sum) interval straddles the target re-scans its chunk in token-id order.
+    __shared__ int result;
+    if (tid == 0) result = N - 1;   // defensive fallback (target ~ total)
+    __syncthreads();
+    float target = u[b] * total;
+    if (target >= base[tid] && target < base[tid] + sval[tid]) {
+        float acc = base[tid];
+        for (int i = lo; i < hi; ++i) {
+            float w = expf((lg[i] - m) * it);
+            if (w >= wt) { acc += w; if (acc >= target) { result = i; break; } }
+        }
+    }
+    __syncthreads();
+    if (tid == 0) out[b] = result;
 }
 
-void launch_argmax_batch(const float* logits, int B, int N, int* d_out, cudaStream_t s) {
-    argmax_batch_kernel<<<B, 256, 0, s>>>(logits, N, d_out);
+void launch_sample_batch(const float* logits, int B, int N,
+                         const float* invT, const float* topp, const float* u,
+                         int* out, cudaStream_t s) {
+    sample_batch_kernel<<<B, kSampleThreads, 0, s>>>(logits, N, invT, topp, u, out);
 }
-

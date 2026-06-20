@@ -8,6 +8,7 @@ import (
 	_ "embed"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"os/exec"
@@ -58,7 +59,7 @@ func (t *tailBuffer) String() string {
 // spawned (call WaitReady on a client to block until it serves). Engine stderr is forwarded.
 // maxQueue caps how many requests may wait for admission before the engine rejects new ones as
 // over-capacity; <=0 lets the engine pick its default (4*slots).
-func Start(modelDir string, slots, maxCtx, maxQueue int) (*Engine, error) {
+func Start(modelDir string, slots, maxCtx, maxQueue, maxBatchTokens, maxPrefill int, gpuMemFraction float64) (*Engine, error) {
 	f, err := os.CreateTemp("", "flashqwen-engine-*")
 	if err != nil {
 		return nil, err
@@ -83,13 +84,14 @@ func Start(modelDir string, slots, maxCtx, maxQueue int) (*Engine, error) {
 		"--address", addr,
 		"--slots", strconv.Itoa(slots),
 		"--max-ctx", strconv.Itoa(maxCtx),
-		"--max-queue", strconv.Itoa(maxQueue))
-	// Capture engine stderr into a rolling tail buffer rather than the terminal: during startup the
-	// Go side shows a load progress bar (driven by GetStatus) and owns the line, and on any failure
-	// the tail is surfaced in the returned error / Exited(). This keeps the engine's verbose per-layer
-	// logging from interleaving with the bar.
+		"--max-queue", strconv.Itoa(maxQueue),
+		"--max-batch-tokens", strconv.Itoa(maxBatchTokens),
+		"--max-prefill-tokens", strconv.Itoa(maxPrefill),
+		"--gpu-mem-fraction", strconv.FormatFloat(gpuMemFraction, 'f', 4, 64))
+	// Forward engine stderr to the terminal so the user sees its load progress + logs, while also
+	// retaining the tail so a startup failure can be reported with the engine's actual cause.
 	tail := &tailBuffer{max: 8 << 10}
-	cmd.Stderr = tail
+	cmd.Stderr = io.MultiWriter(os.Stderr, tail)
 	if err := cmd.Start(); err != nil {
 		os.Remove(f.Name())
 		return nil, fmt.Errorf("start engine: %w", err)

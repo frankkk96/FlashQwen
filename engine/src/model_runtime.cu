@@ -1,9 +1,17 @@
 #include "model_runtime.hpp"
+#include "log.hpp"
 #include <cmath>
 #include <cstring>
 #include <cstdio>
-#include <thread>
 #include <algorithm>
+
+#define CUBLAS_CHECK(call) do {                                                  \
+    cublasStatus_t _s = (call);                                                  \
+    if (_s != CUBLAS_STATUS_SUCCESS) {                                           \
+        std::fprintf(stderr, "cuBLAS error %s:%d: %d\n", __FILE__, __LINE__, _s);\
+        std::exit(1);                                                            \
+    }                                                                            \
+} while (0)
 
 static inline float bf16_to_f32(uint16_t h) {
     uint32_t bits = (uint32_t)h << 16;
@@ -16,6 +24,24 @@ bf16* ModelRuntime::upload_bf16(const std::string& name) {
     bf16* d = nullptr;
     CUDA_CHECK(cudaMalloc(&d, tv.nbytes));
     CUDA_CHECK(cudaMemcpy(d, tv.data, tv.nbytes, cudaMemcpyHostToDevice));
+    all_bufs_.push_back(d);
+    return d;
+}
+
+// Upload several weights stacked back-to-back on their OUT (row) dimension into one buffer. Each is
+// HF row-major [OUT_i, IN] with the same IN, so concatenating rows is just placing them contiguously
+// — the result is [sum(OUT_i), IN], exactly what a fused projection (QKV, gate|up) needs.
+bf16* ModelRuntime::upload_concat(const std::vector<std::string>& names) {
+    size_t total = 0;
+    for (auto& n : names) total += st_.get(n).nbytes;
+    bf16* d = nullptr;
+    CUDA_CHECK(cudaMalloc(&d, total));
+    size_t off = 0;
+    for (auto& n : names) {
+        const TensorView& tv = st_.get(n);
+        CUDA_CHECK(cudaMemcpy((char*)d + off, tv.data, tv.nbytes, cudaMemcpyHostToDevice));
+        off += tv.nbytes;
+    }
     all_bufs_.push_back(d);
     return d;
 }
@@ -33,312 +59,260 @@ float* ModelRuntime::upload_norm(const std::string& name) {
     return d;
 }
 
-// Quantize a [OUT, IN] BF16 weight to INT8 with a symmetric per-row (per-output-channel)
-// scale: scale[r] = max|W[r,:]| / 127. Done on the host, parallelized across rows.
-ModelRuntime::QWeight ModelRuntime::upload_int8(const std::string& name) {
-    const TensorView& tv = st_.get(name);
-    int OUT = (int)tv.shape[0], IN = (int)tv.shape[1];
-    long n = (long)OUT * IN;
-    const uint16_t* src = (const uint16_t*)tv.data;
-    std::vector<int8_t> q(n);
-    std::vector<float> scale(OUT);
-
-    auto worker = [&](int r0, int r1) {
-        for (int r = r0; r < r1; ++r) {
-            const uint16_t* row = src + (long)r * IN;
-            float maxabs = 0.f;
-            for (int i = 0; i < IN; ++i) maxabs = std::max(maxabs, std::fabs(bf16_to_f32(row[i])));
-            float sc = maxabs / 127.0f; if (sc == 0.f) sc = 1.f;
-            float inv = 1.0f / sc;
-            int8_t* qr = q.data() + (long)r * IN;
-            for (int i = 0; i < IN; ++i) {
-                int v = (int)lrintf(bf16_to_f32(row[i]) * inv);
-                qr[i] = (int8_t)std::max(-127, std::min(127, v));
-            }
-            scale[r] = sc;
+// Precompute the RoPE cos/sin tables once: angle(pos, i) = pos * theta^(-2i/head_dim), i in
+// [0, head_dim/2). Identical for every layer, so computing it here kills the per-layer powf/cosf/sinf
+// the old in-kernel RoPE paid 36x. Tables are [max_ctx, head_dim/2] FP32 on the device.
+void ModelRuntime::precompute_rope() {
+    int half = spec_.head_dim / 2, P = max_ctx_;
+    std::vector<float> cs((size_t)P * half), sn((size_t)P * half);
+    for (int p = 0; p < P; ++p)
+        for (int i = 0; i < half; ++i) {
+            float inv = std::pow(spec_.rope_theta, -2.0f * i / spec_.head_dim);
+            float ang = p * inv;
+            cs[(size_t)p * half + i] = std::cos(ang);
+            sn[(size_t)p * half + i] = std::sin(ang);
         }
-    };
-    int nt = std::max(1u, std::thread::hardware_concurrency());
-    int chunk = (OUT + nt - 1) / nt;
-    std::vector<std::thread> ts;
-    for (int t = 0; t < nt; ++t) {
-        int a = t * chunk, b = std::min(OUT, a + chunk);
-        if (a < b) ts.emplace_back(worker, a, b);
-    }
-    for (auto& th : ts) th.join();
-
-    QWeight qw;
-    CUDA_CHECK(cudaMalloc(&qw.w, n * sizeof(int8_t)));
-    CUDA_CHECK(cudaMemcpy(qw.w, q.data(), n * sizeof(int8_t), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMalloc(&qw.scale, OUT * sizeof(float)));
-    CUDA_CHECK(cudaMemcpy(qw.scale, scale.data(), OUT * sizeof(float), cudaMemcpyHostToDevice));
-    all_i8_.push_back(qw.w);
-    all_fbufs_.push_back(qw.scale);
-    return qw;
+    CUDA_CHECK(cudaMalloc(&cos_tab_, cs.size() * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&sin_tab_, sn.size() * sizeof(float)));
+    CUDA_CHECK(cudaMemcpy(cos_tab_, cs.data(), cs.size() * sizeof(float), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(sin_tab_, sn.data(), sn.size() * sizeof(float), cudaMemcpyHostToDevice));
 }
 
-ModelRuntime::ModelRuntime(const ModelSpec& spec, int max_ctx, ProgressFn on_progress)
-    : spec_(spec) {
-    max_ctx_ = ((max_ctx + 15) / 16) * 16;   // round up so WMMA tiles never read past buffers
-    std::fprintf(stderr, "[model] loading weights from %s ...\n", spec_.dir.c_str());
+ModelRuntime::ModelRuntime(const ModelSpec& spec, const RuntimeConfig& cfg)
+    : spec_(spec), rng_(cfg.seed) {
+    max_ctx_  = cfg.max_ctx;
+    // A forward never exceeds max_batch_tokens rows (the scheduler's per-step budget caps T, and
+    // prefills are chunked under it), so the activation scratch only needs that many rows — NOT max_ctx.
+    // Sizing to max_ctx (4096) over-allocated the big buffers ~4x (~0.36 GB), shrinking the KV pool and
+    // pushing us onto the KV-capacity cliff; sizing to the real bound reclaims it for the pool.
+    // +16: the WMMA prefill-attention kernel load_matrix_sync reads a full 16-row Q tile, so the last
+    // (non-16-aligned) chunk can over-read up to 15 rows past T — give it a tile of headroom so that
+    // harmless over-read (masked out by grow<ql) stays in-bounds (was masked by the old 4096 sizing).
+    max_rows_ = std::max(1, cfg.max_batch_tokens) + 16;     // per-step budget + one WMMA Q-tile margin
+    LOG_INFO("[model] loading weights from %s ...", spec_.dir.c_str());
     st_.load_dir(spec_.dir);
 
     embed_   = upload_bf16("model.embed_tokens.weight");   // gather, kept BF16
     fnorm_   = upload_norm("model.norm.weight");
-    lm_head_ = upload_int8("lm_head.weight");
+    lm_head_ = upload_bf16("lm_head.weight");
+    precompute_rope();
 
     layers_.resize(spec_.num_layers);
     for (int l = 0; l < spec_.num_layers; ++l) {
         std::string p = "model.layers." + std::to_string(l) + ".";
         Layer& L = layers_[l];
-        L.q_proj    = upload_int8(p + "self_attn.q_proj.weight");
-        L.k_proj    = upload_int8(p + "self_attn.k_proj.weight");
-        L.v_proj    = upload_int8(p + "self_attn.v_proj.weight");
-        L.o_proj    = upload_int8(p + "self_attn.o_proj.weight");
+        L.qkv       = upload_concat({p + "self_attn.q_proj.weight",
+                                     p + "self_attn.k_proj.weight",
+                                     p + "self_attn.v_proj.weight"});   // [q_dim+2*kv_dim, H]
+        L.o_proj    = upload_bf16(p + "self_attn.o_proj.weight");
         L.q_norm    = upload_norm(p + "self_attn.q_norm.weight");
         L.k_norm    = upload_norm(p + "self_attn.k_norm.weight");
-        L.gate      = upload_int8(p + "mlp.gate_proj.weight");
-        L.up        = upload_int8(p + "mlp.up_proj.weight");
-        L.down      = upload_int8(p + "mlp.down_proj.weight");
+        L.gateup    = upload_concat({p + "mlp.gate_proj.weight",
+                                     p + "mlp.up_proj.weight"});        // [2*intermediate, H]
+        L.down      = upload_bf16(p + "mlp.down_proj.weight");
         L.in_norm   = upload_norm(p + "input_layernorm.weight");
         L.post_norm = upload_norm(p + "post_attention_layernorm.weight");
         if ((l + 1) % 8 == 0 || l + 1 == spec_.num_layers)
-            std::fprintf(stderr, "[model] uploaded layer %d/%d\n", l + 1, spec_.num_layers);
-        if (on_progress) on_progress(l + 1, spec_.num_layers);
+            LOG_INFO("[model] uploaded layer %d/%d", l + 1, spec_.num_layers);
     }
 
-    // activation scratch (sized to max_ctx tokens; a decode batch is at most MAX_DECODE_B <= that)
+    // activation scratch (BF16, sized to max_rows_ query rows); the sampling buffers are sized to the
+    // concurrent-request cap MAX_DECODE_B, since at most one logits row is produced per request.
     int H = spec_.hidden_size, QD = spec_.q_dim(), I = spec_.intermediate, V = spec_.vocab_size;
-    int kvd = spec_.kv_dim(), nh = spec_.num_heads, hd = spec_.head_dim;
-    auto fmalloc = [&](float** p, size_t n) { CUDA_CHECK(cudaMalloc(p, n * sizeof(float))); };
-    fmalloc(&x_,    (size_t)max_ctx_ * H);
-    fmalloc(&xb_,   (size_t)max_ctx_ * H);
-    fmalloc(&xb2_,  (size_t)max_ctx_ * H);
-    fmalloc(&q_,    (size_t)max_ctx_ * QD);
-    fmalloc(&k_,    (size_t)max_ctx_ * kvd);
-    fmalloc(&v_,    (size_t)max_ctx_ * kvd);
-    fmalloc(&attn_, (size_t)max_ctx_ * QD);
-    fmalloc(&gate_, (size_t)max_ctx_ * I);
-    fmalloc(&up_,   (size_t)max_ctx_ * I);
-    fmalloc(&hmlp_, (size_t)max_ctx_ * I);
-    fmalloc(&logits_, (size_t)MAX_DECODE_B * V);   // [B, vocab] logits for the whole decode batch
-    // BF16 activation scratch for the tensor-core prefill GEMM (largest IN is `I`).
-    CUDA_CHECK(cudaMalloc(&xbf_, (size_t)max_ctx_ * I * sizeof(bf16)));
-    // BF16 dequantized-weight scratch for prefill (largest matmul weight is I*H).
-    CUDA_CHECK(cudaMalloc(&w_dq_, (size_t)I * H * sizeof(bf16)));
-    CUDA_CHECK(cudaMalloc(&d_ids_,  max_ctx_ * sizeof(int)));
-    CUDA_CHECK(cudaMalloc(&d_pos_,  max_ctx_ * sizeof(int)));
-    CUDA_CHECK(cudaMalloc(&d_arg_,  MAX_DECODE_B * sizeof(int)));
-    CUDA_CHECK(cudaMalloc(&d_past_, sizeof(int)));
-    // Paged-KV indexing buffers. d_bt_ holds up to MAX_DECODE_B padded block tables (one per
-    // decode-batch row, or row 0 for prefill). d_iota_ = {0,1,..} is the decode bt_row map;
-    // d_zero_ = {0,0,..} is the prefill bt_row map (all M tokens use block-table row 0).
-    max_blocks_ = (max_ctx_ + KVCache::BLOCK - 1) / KVCache::BLOCK;
-    CUDA_CHECK(cudaMalloc(&d_bt_,   (size_t)MAX_DECODE_B * max_blocks_ * sizeof(int)));
-    CUDA_CHECK(cudaMalloc(&d_iota_, MAX_DECODE_B * sizeof(int)));
-    CUDA_CHECK(cudaMalloc(&d_zero_, max_ctx_ * sizeof(int)));
+    int kvd = spec_.kv_dim();
+    int QKV = QD + 2 * kvd;          // fused Q|K|V projection width
+    auto bmalloc = [&](bf16** p, size_t n) { CUDA_CHECK(cudaMalloc(p, n * sizeof(bf16))); };
+    bmalloc(&x_,     (size_t)max_rows_ * H);
+    bmalloc(&xb_,    (size_t)max_rows_ * H);
+    bmalloc(&xb2_,   (size_t)max_rows_ * H);
+    bmalloc(&qkv_,   (size_t)max_rows_ * QKV);
+    bmalloc(&attn_,  (size_t)max_rows_ * QD);
+    bmalloc(&gateup_,(size_t)max_rows_ * 2 * I);
+    bmalloc(&hmlp_,  (size_t)max_rows_ * I);
+    bmalloc(&xg_,   (size_t)MAX_DECODE_B * H);             // gathered sampling rows
+    CUDA_CHECK(cudaMalloc(&logits_, (size_t)MAX_DECODE_B * V * sizeof(float)));   // [S, vocab] FP32
+    CUDA_CHECK(cudaMalloc(&d_ids_, max_rows_ * sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&d_pos_, max_rows_ * sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&d_req_, max_rows_ * sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&d_qstart_, MAX_DECODE_B * sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&d_qlen_,   MAX_DECODE_B * sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&d_decode_rids_,  MAX_DECODE_B * sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&d_prefill_rids_, MAX_DECODE_B * sizeof(int)));
+    // Paged-KV block tables: up to MAX_DECODE_B requests, padded to the longest block table.
+    max_blocks_ = (max_ctx_ + BlockPool::BLOCK - 1) / BlockPool::BLOCK;
+    CUDA_CHECK(cudaMalloc(&d_bt_, (size_t)MAX_DECODE_B * max_blocks_ * sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&d_lrows_, MAX_DECODE_B * sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&d_arg_,   MAX_DECODE_B * sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&d_invT_,  MAX_DECODE_B * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_topp_,  MAX_DECODE_B * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_u_,     MAX_DECODE_B * sizeof(float)));
     host_bt_.resize((size_t)MAX_DECODE_B * max_blocks_);
-    {
-        std::vector<int> iota(MAX_DECODE_B);
-        for (int i = 0; i < MAX_DECODE_B; ++i) iota[i] = i;
-        CUDA_CHECK(cudaMemcpy(d_iota_, iota.data(), MAX_DECODE_B * sizeof(int), cudaMemcpyHostToDevice));
-        std::vector<int> zero(max_ctx_, 0);
-        CUDA_CHECK(cudaMemcpy(d_zero_, zero.data(), max_ctx_ * sizeof(int), cudaMemcpyHostToDevice));
-    }
-    // flash-decoding split-K scratch, sized for a full decode batch
-    CUDA_CHECK(cudaMalloc(&part_m_,   (size_t)MAX_DECODE_B * nh * ATTN_SPLITS * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&part_l_,   (size_t)MAX_DECODE_B * nh * ATTN_SPLITS * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&part_acc_, (size_t)MAX_DECODE_B * nh * ATTN_SPLITS * hd * sizeof(float)));
+    host_qstart_.resize(MAX_DECODE_B); host_qlen_.resize(MAX_DECODE_B);
+    host_decode_rids_.resize(MAX_DECODE_B); host_prefill_rids_.resize(MAX_DECODE_B);
+    host_invT_.resize(MAX_DECODE_B); host_topp_.resize(MAX_DECODE_B); host_u_.resize(MAX_DECODE_B);
     CUDA_CHECK(cudaStreamCreate(&stream_));
-    host_logits_.resize((size_t)MAX_DECODE_B * V);
+    CUBLAS_CHECK(cublasCreate(&cublas_));
+    CUBLAS_CHECK(cublasSetStream(cublas_, stream_));
+    CUBLAS_CHECK(cublasSetMathMode(cublas_, CUBLAS_DEFAULT_MATH));   // BF16 inputs use tensor cores
 
     size_t freeb, totalb;
     CUDA_CHECK(cudaMemGetInfo(&freeb, &totalb));
-    std::fprintf(stderr, "[model] weights + activations ready (max_ctx=%d, up to %d concurrent). "
-                 "GPU mem: %.1f GB used / %.1f GB total. KV pool allocated separately.\n",
-                 max_ctx_, max_batch(), (totalb - freeb) / 1e9, totalb / 1e9);
+    LOG_INFO("[model] weights + activations ready (max_ctx=%d, max_rows=%d, up to %d concurrent). "
+             "GPU mem: %.1f GB used / %.1f GB total. KV pool allocated separately.",
+             max_ctx_, max_rows_, max_batch(), (totalb - freeb) / 1e9, totalb / 1e9);
 }
 
-// --- single-sequence prefill: M tokens into the paged KV described by d_bt_ row 0 ----------
-// The store/attention kernels resolve every position through that block table; d_pos_ holds the
-// logical positions (past_len..past_len+M-1) and d_past_ the base offset, so a chunked prefill
-// (past_len>0) writes into the correct blocks. All M tokens use block-table row 0 (d_zero_).
-void ModelRuntime::run_layers_prefill(int M) {
+// y[M,OUT] = x[M,IN] @ W[OUT,IN]^T. cuBLAS is column-major: a row-major [a,b] buffer is a column-major
+// [b,a]. So the row-major W[OUT,IN] is column-major Wc[IN,OUT] and x[M,IN] is Xc[IN,M]; computing
+// Z = Wc^T @ Xc (m=OUT, n=M, k=IN) yields column-major [OUT,M] = row-major y[M,OUT]. BF16 in, FP32
+// accumulate; Ytype selects the output element type.
+void ModelRuntime::gemm(const bf16* x, const bf16* W, void* y, int M, int IN, int OUT,
+                        cudaDataType_t Ytype) {
+    float alpha = 1.0f, beta = 0.0f;
+    CUBLAS_CHECK(cublasGemmEx(cublas_, CUBLAS_OP_T, CUBLAS_OP_N, OUT, M, IN,
+                              &alpha, W, CUDA_R_16BF, IN, x, CUDA_R_16BF, IN,
+                              &beta, y, Ytype, OUT, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
+}
+
+// The unified layer stack over T query rows (prefill chunks + decodes together; no decode/prefill
+// split). Every per-token op runs on the flattened batch; attention resolves each request's rows
+// (qstart/qlen), positions (d_pos_) and KV (d_bt_) itself. R = number of requests, max_qlen = the
+// longest per-request row count (sets the attention q-tile grid).
+void ModelRuntime::run_layers(int T, int R, int max_qlen) {
     const ModelSpec& c = spec_;
     int H = c.hidden_size, QD = c.q_dim(), KVD = c.kv_dim(), I = c.intermediate;
+    int QKV = QD + 2 * KVD;
     int nH = c.num_heads, nKV = c.num_kv_heads, hd = c.head_dim;
     float eps = c.rms_eps, scale = 1.0f / std::sqrt((float)hd);
     cudaStream_t s = stream_;
+    int blk = pool_->block_size();
 
-    launch_embed(d_ids_, embed_, x_, M, H, s);
+    launch_embed(d_ids_, embed_, x_, T, H, s);   // x_ = residual stream
 
     for (int l = 0; l < c.num_layers; ++l) {
         Layer& L = layers_[l];
 
-        launch_rmsnorm(x_, L.in_norm, xb_, M, H, eps, s);
-        launch_matmul(xb_, L.q_proj.w, L.q_proj.scale, q_, M, H, QD,  xbf_, w_dq_, s);
-        launch_matmul(xb_, L.k_proj.w, L.k_proj.scale, k_, M, H, KVD, xbf_, w_dq_, s);
-        launch_matmul(xb_, L.v_proj.w, L.v_proj.scale, v_, M, H, KVD, xbf_, w_dq_, s);
+        // input norm: fuse the previous layer's pending MLP residual (in xb2_) into the norm. Layer 0
+        // has no pending residual (x_ is the fresh embedding), so it's a plain rmsnorm.
+        if (l == 0) launch_rmsnorm(x_, L.in_norm, xb_, T, H, eps, s);
+        else        launch_add_rmsnorm(x_, xb2_, L.in_norm, xb_, T, H, eps, s);
 
-        launch_rmsnorm(q_, L.q_norm, q_, M * nH,  hd, eps, s);
-        launch_rmsnorm(k_, L.k_norm, k_, M * nKV, hd, eps, s);
-        launch_rope(q_, d_pos_, M, nH,  hd, c.rope_theta, s);
-        launch_rope(k_, d_pos_, M, nKV, hd, c.rope_theta, s);
+        // fused Q|K|V projection -> qkv_ [T, QKV] (row = q(QD) | k(KVD) | v(KVD))
+        gemm(xb_, L.qkv, qkv_, T, H, QKV, CUDA_R_16BF);
+        // per-head RMSNorm + RoPE on q and k slices, in place (v left raw). cos/sin from the table.
+        launch_head_norm_rope(qkv_,            L.q_norm, cos_tab_, sin_tab_, d_pos_, T, nH,  hd, QKV, eps, s);
+        launch_head_norm_rope(qkv_ + QD,       L.k_norm, cos_tab_, sin_tab_, d_pos_, T, nKV, hd, QKV, eps, s);
 
-        int blk = kv_->block_size();
-        launch_store_kv_paged(k_, kv_->k(l), d_bt_, bt_stride_, blk, KVD, d_zero_, d_pos_, M, s);
-        launch_store_kv_paged(v_, kv_->v(l), d_bt_, bt_stride_, blk, KVD, d_zero_, d_pos_, M, s);
-        launch_attention_paged(q_, kv_->k(l), kv_->v(l), attn_, M, nH, nKV, hd, d_past_, scale,
-                               d_bt_, bt_stride_, blk, s);
+        // append each row's new K/V at its position, read straight from the fused buffer.
+        launch_store_kv_paged(qkv_, QD,        QKV, pool_->k(l), d_bt_, bt_stride_, blk, KVD, d_req_, d_pos_, T, s);
+        launch_store_kv_paged(qkv_, QD + KVD,  QKV, pool_->v(l), d_bt_, bt_stride_, blk, KVD, d_req_, d_pos_, T, s);
+        // attention, dispatched per request type (both write disjoint rows of attn_):
+        launch_attn_decode(qkv_, QKV, pool_->k(l), pool_->v(l), attn_, nH, nKV, hd,
+                                d_pos_, d_qstart_, d_decode_rids_, n_decode_, d_bt_, bt_stride_, blk, scale, s);
+        launch_attn_prefill(qkv_, QKV, pool_->k(l), pool_->v(l), attn_, nH, nKV, hd,
+                                 d_pos_, d_qstart_, d_qlen_, d_prefill_rids_, n_prefill_, prefill_max_qlen_,
+                                 d_bt_, bt_stride_, blk, scale, s);
 
-        launch_matmul(attn_, L.o_proj.w, L.o_proj.scale, xb2_, M, QD, H, xbf_, w_dq_, s);
-        launch_add(x_, xb2_, M * H, s);
+        gemm(attn_, L.o_proj, xb2_, T, QD, H, CUDA_R_16BF);
+        // post-attention norm: fuse the attention residual (xb2_) into the norm. x_ now carries it.
+        launch_add_rmsnorm(x_, xb2_, L.post_norm, xb_, T, H, eps, s);
 
-        launch_rmsnorm(x_, L.post_norm, xb_, M, H, eps, s);
-        launch_matmul(xb_, L.gate.w, L.gate.scale, gate_, M, H, I, xbf_, w_dq_, s);
-        launch_matmul(xb_, L.up.w,   L.up.scale,   up_,   M, H, I, xbf_, w_dq_, s);
-        launch_silu_mul(gate_, up_, hmlp_, M * I, s);
-        launch_matmul(hmlp_, L.down.w, L.down.scale, xb2_, M, I, H, xbf_, w_dq_, s);
-        launch_add(x_, xb2_, M * H, s);
+        // fused gate|up projection -> gateup_ [T, 2I]; SiLU(gate)*up; down projection.
+        gemm(xb_, L.gateup, gateup_, T, H, 2 * I, CUDA_R_16BF);
+        launch_silu_mul(gateup_, hmlp_, T, I, s);
+        gemm(hmlp_, L.down, xb2_, T, I, H, CUDA_R_16BF);   // xb2_ = MLP residual, fused into next norm
     }
 
-    // only the last token's logits are needed (GEMV) -> logits_ row 0
-    float* xlast = x_ + (size_t)(M - 1) * H;
-    launch_rmsnorm(xlast, fnorm_, xb_, 1, H, eps, s);
-    launch_matmul(xb_, lm_head_.w, lm_head_.scale, logits_, 1, H, c.vocab_size, xbf_, w_dq_, s);
+    launch_add(x_, xb2_, T * H, s);   // commit the last layer's MLP residual (no norm follows it here)
 }
 
-void ModelRuntime::prefill(const std::vector<int>& tokens, const std::vector<int>& block_table, int past_len) {
-    int M = (int)tokens.size();
-    CUDA_CHECK(cudaMemcpy(d_ids_, tokens.data(), M * sizeof(int), cudaMemcpyHostToDevice));
-    std::vector<int> pos(M);
-    for (int i = 0; i < M; ++i) pos[i] = past_len + i;
-    CUDA_CHECK(cudaMemcpy(d_pos_, pos.data(), M * sizeof(int), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_past_, &past_len, sizeof(int), cudaMemcpyHostToDevice));
-    bt_stride_ = (int)block_table.size();          // block table goes into d_bt_ row 0
-    CUDA_CHECK(cudaMemcpy(d_bt_, block_table.data(), bt_stride_ * sizeof(int), cudaMemcpyHostToDevice));
-    run_layers_prefill(M);
-    CUDA_CHECK(cudaStreamSynchronize(stream_));   // logits_ row 0 ready
-}
-
-// --- batched single-token decode for B sequences -----------------------------------------
-// Leaves the post-final-layer residual stream for all B sequences in x_ ([B, H]).
-void ModelRuntime::run_layers_decode(int B) {
-    const ModelSpec& c = spec_;
-    int H = c.hidden_size, QD = c.q_dim(), KVD = c.kv_dim(), I = c.intermediate;
-    int nH = c.num_heads, nKV = c.num_kv_heads, hd = c.head_dim;
-    float eps = c.rms_eps, scale = 1.0f / std::sqrt((float)hd);
-    cudaStream_t s = stream_;
-
-    launch_embed(d_ids_, embed_, x_, B, H, s);
-
-    for (int l = 0; l < c.num_layers; ++l) {
-        Layer& L = layers_[l];
-
-        launch_rmsnorm(x_, L.in_norm, xb_, B, H, eps, s);
-        launch_matmul_decode(xb_, L.q_proj.w, L.q_proj.scale, q_, B, H, QD,  s);
-        launch_matmul_decode(xb_, L.k_proj.w, L.k_proj.scale, k_, B, H, KVD, s);
-        launch_matmul_decode(xb_, L.v_proj.w, L.v_proj.scale, v_, B, H, KVD, s);
-
-        launch_rmsnorm(q_, L.q_norm, q_, B * nH,  hd, eps, s);
-        launch_rmsnorm(k_, L.k_norm, k_, B * nKV, hd, eps, s);
-        launch_rope(q_, d_pos_, B, nH,  hd, c.rope_theta, s);   // d_pos_[b] = past_len[b]
-        launch_rope(k_, d_pos_, B, nKV, hd, c.rope_theta, s);
-
-        // append each sequence's new K/V at its logical position past_len[b] (= d_pos_); the
-        // block table (d_bt_, row b via d_iota_) maps that to a physical block row.
-        int blk = kv_->block_size();
-        launch_store_kv_paged(k_, kv_->k(l), d_bt_, bt_stride_, blk, KVD, d_iota_, d_pos_, B, s);
-        launch_store_kv_paged(v_, kv_->v(l), d_bt_, bt_stride_, blk, KVD, d_iota_, d_pos_, B, s);
-        launch_attention_decode_paged(q_, kv_->k(l), kv_->v(l), attn_, B, nH, nKV, hd,
-                                      d_pos_, d_bt_, bt_stride_, blk, scale,
-                                      part_m_, part_l_, part_acc_, s);
-
-        launch_matmul_decode(attn_, L.o_proj.w, L.o_proj.scale, xb2_, B, QD, H, s);
-        launch_add(x_, xb2_, B * H, s);
-
-        launch_rmsnorm(x_, L.post_norm, xb_, B, H, eps, s);
-        launch_matmul_decode(xb_, L.gate.w, L.gate.scale, gate_, B, H, I, s);
-        launch_matmul_decode(xb_, L.up.w,   L.up.scale,   up_,   B, H, I, s);
-        launch_silu_mul(gate_, up_, hmlp_, B * I, s);
-        launch_matmul_decode(hmlp_, L.down.w, L.down.scale, xb2_, B, I, H, s);
-        launch_add(x_, xb2_, B * H, s);
-    }
-}
-
-// Pack B block tables, padded to the longest, into host_bt_ and upload to d_bt_; bt_stride_ is
-// the padded row length the kernels index with.
+// Pack R block tables, padded to the longest, into host_bt_ and upload to d_bt_; bt_stride_ is the
+// padded row length the kernels index with.
 void ModelRuntime::upload_block_tables(const std::vector<std::vector<int>>& bts) {
-    int B = (int)bts.size();
+    int R = (int)bts.size();
     int mb = 1;
     for (auto& t : bts) mb = std::max(mb, (int)t.size());
     bt_stride_ = mb;
-    for (int b = 0; b < B; ++b) {
-        int* row = host_bt_.data() + (size_t)b * mb;
-        for (int g = 0; g < mb; ++g) row[g] = g < (int)bts[b].size() ? bts[b][g] : 0;
+    for (int r = 0; r < R; ++r) {
+        int* row = host_bt_.data() + (size_t)r * mb;
+        for (int g = 0; g < mb; ++g) row[g] = g < (int)bts[r].size() ? bts[r][g] : 0;
     }
-    CUDA_CHECK(cudaMemcpy(d_bt_, host_bt_.data(), (size_t)B * mb * sizeof(int), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_bt_, host_bt_.data(), (size_t)R * mb * sizeof(int), cudaMemcpyHostToDevice));
 }
 
-// Shared forward for a decode batch: H2D inputs, the layer stack, final norm, and the lm_head
-// GEMV — one pass reads the lm_head weight once for the whole batch and leaves the [B, vocab]
-// logits in logits_ on the device. Async on stream_ (caller syncs).
-void ModelRuntime::decode_forward(const std::vector<int>& in_tokens, const std::vector<int>& past_len,
-                           const std::vector<std::vector<int>>& block_tables) {
-    int B = (int)in_tokens.size();
-    int V = spec_.vocab_size, H = spec_.hidden_size;
-    CUDA_CHECK(cudaMemcpy(d_ids_, in_tokens.data(), B * sizeof(int), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(d_pos_, past_len.data(),  B * sizeof(int), cudaMemcpyHostToDevice));
-    upload_block_tables(block_tables);
+// Shared forward: H2D inputs, the unified layer stack, then gather the per-request sampling rows and
+// run final norm + lm_head only on those -> logits_ [S, vocab] on the device. Async on stream_.
+void ModelRuntime::forward_core(const ForwardInput& in) {
+    int T = in.rows(), R = (int)in.block_tables.size(), S = (int)in.logits_rows.size();
+    int H = spec_.hidden_size, V = spec_.vocab_size;
+    CUDA_CHECK(cudaMemcpy(d_ids_, in.tokens.data(),    T * sizeof(int), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_pos_, in.positions.data(), T * sizeof(int), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_req_, in.req_index.data(), T * sizeof(int), cudaMemcpyHostToDevice));
+    upload_block_tables(in.block_tables);
 
-    run_layers_decode(B);
-    launch_rmsnorm(x_, fnorm_, xb_, B, H, spec_.rms_eps, stream_);          // final norm, all B rows
-    launch_matmul_decode(xb_, lm_head_.w, lm_head_.scale, logits_, B, H, V, stream_);
+    // Per-request attention grouping: rows are contiguous and ordered by request (the batch is built
+    // request by request), so qstart is a prefix sum of the per-request row counts.
+    for (int r = 0; r < R; ++r) host_qlen_[r] = 0;
+    for (int t = 0; t < T; ++t) host_qlen_[in.req_index[t]]++;
+    int acc = 0, max_qlen = 1;
+    for (int r = 0; r < R; ++r) { host_qstart_[r] = acc; acc += host_qlen_[r]; max_qlen = std::max(max_qlen, host_qlen_[r]); }
+    CUDA_CHECK(cudaMemcpy(d_qstart_, host_qstart_.data(), R * sizeof(int), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_qlen_,   host_qlen_.data(),   R * sizeof(int), cudaMemcpyHostToDevice));
+
+    // Split requests by type so attention runs the right kernel on each: decode (q_len==1) gets the
+    // FlashDecoding kernel, prefill (q_len>1) the tiled kernel. Both write disjoint rows of attn_.
+    n_decode_ = n_prefill_ = 0; prefill_max_qlen_ = 1;
+    for (int r = 0; r < R; ++r) {
+        if (host_qlen_[r] == 1) host_decode_rids_[n_decode_++] = r;
+        else { host_prefill_rids_[n_prefill_++] = r; prefill_max_qlen_ = std::max(prefill_max_qlen_, host_qlen_[r]); }
+    }
+    if (n_decode_)  CUDA_CHECK(cudaMemcpy(d_decode_rids_,  host_decode_rids_.data(),  n_decode_  * sizeof(int), cudaMemcpyHostToDevice));
+    if (n_prefill_) CUDA_CHECK(cudaMemcpy(d_prefill_rids_, host_prefill_rids_.data(), n_prefill_ * sizeof(int), cudaMemcpyHostToDevice));
+
+    run_layers(T, R, max_qlen);
+
+    if (S > 0) {
+        CUDA_CHECK(cudaMemcpy(d_lrows_, in.logits_rows.data(), S * sizeof(int), cudaMemcpyHostToDevice));
+        launch_gather_rows(x_, d_lrows_, xg_, S, H, stream_);
+        launch_rmsnorm(xg_, fnorm_, xb_, S, H, spec_.rms_eps, stream_);
+        gemm(xb_, lm_head_, logits_, S, H, V, CUDA_R_32F);   // BF16 in -> FP32 logits
+    }
 }
 
-void ModelRuntime::decode(const std::vector<int>& in_tokens, const std::vector<int>& past_len,
-                   const std::vector<std::vector<int>>& block_tables, std::vector<int>& out_tokens) {
-    int B = (int)in_tokens.size();
-    decode_forward(in_tokens, past_len, block_tables);
-    launch_argmax_batch(logits_, B, spec_.vocab_size, d_arg_, stream_);     // greedy, on the GPU
-    out_tokens.resize(B);
-    CUDA_CHECK(cudaMemcpyAsync(out_tokens.data(), d_arg_, B * sizeof(int),
-                               cudaMemcpyDeviceToHost, stream_));
+void ModelRuntime::forward(const ForwardInput& in, std::vector<int>& out_tokens) {
+    int S = (int)in.logits_rows.size();
+    forward_core(in);
+    out_tokens.resize(S);
+    if (S > 0) {
+        // Per-row sampling inputs: 1/temp (<=0 => greedy), nucleus cutoff, and a uniform draw.
+        std::uniform_real_distribution<float> dist(0.0f, 1.0f);
+        for (int i = 0; i < S; ++i) {
+            const SampleParams& sp = in.sample_params[i];
+            host_invT_[i] = sp.temp > 0.0f ? 1.0f / sp.temp : 0.0f;
+            host_topp_[i] = sp.top_p;
+            host_u_[i]    = dist(rng_);
+        }
+        CUDA_CHECK(cudaMemcpyAsync(d_invT_, host_invT_.data(), S * sizeof(float), cudaMemcpyHostToDevice, stream_));
+        CUDA_CHECK(cudaMemcpyAsync(d_topp_, host_topp_.data(), S * sizeof(float), cudaMemcpyHostToDevice, stream_));
+        CUDA_CHECK(cudaMemcpyAsync(d_u_,    host_u_.data(),    S * sizeof(float), cudaMemcpyHostToDevice, stream_));
+        launch_sample_batch(logits_, S, spec_.vocab_size, d_invT_, d_topp_, d_u_, d_arg_, stream_);
+        CUDA_CHECK(cudaMemcpyAsync(out_tokens.data(), d_arg_, S * sizeof(int),
+                                   cudaMemcpyDeviceToHost, stream_));
+    }
     CUDA_CHECK(cudaStreamSynchronize(stream_));
-}
-
-const float* ModelRuntime::decode_logits_host(const std::vector<int>& in_tokens,
-                                       const std::vector<int>& past_len,
-                                       const std::vector<std::vector<int>>& block_tables) {
-    int B = (int)in_tokens.size();
-    decode_forward(in_tokens, past_len, block_tables);
-    CUDA_CHECK(cudaMemcpyAsync(host_logits_.data(), logits_, (size_t)B * spec_.vocab_size * sizeof(float),
-                               cudaMemcpyDeviceToHost, stream_));
-    CUDA_CHECK(cudaStreamSynchronize(stream_));
-    return host_logits_.data();
-}
-
-int ModelRuntime::argmax_last() {
-    launch_argmax(logits_, spec_.vocab_size, d_arg_, stream_);
-    int id = 0;
-    CUDA_CHECK(cudaMemcpyAsync(&id, d_arg_, sizeof(int), cudaMemcpyDeviceToHost, stream_));
-    CUDA_CHECK(cudaStreamSynchronize(stream_));
-    return id;
-}
-
-const std::vector<float>& ModelRuntime::copy_logits() {
-    CUDA_CHECK(cudaMemcpy(host_logits_.data(), logits_, spec_.vocab_size * sizeof(float), cudaMemcpyDeviceToHost));
-    return host_logits_;
 }
 
 ModelRuntime::~ModelRuntime() {
     for (auto p : all_bufs_)  if (p) cudaFree(p);
     for (auto p : all_fbufs_) if (p) cudaFree(p);
-    for (auto p : all_i8_)    if (p) cudaFree(p);
-    cudaFree(x_); cudaFree(xb_); cudaFree(xb2_); cudaFree(q_); cudaFree(k_); cudaFree(v_);
-    cudaFree(attn_); cudaFree(gate_); cudaFree(up_); cudaFree(hmlp_); cudaFree(logits_);
-    cudaFree(xbf_); cudaFree(w_dq_); cudaFree(part_m_); cudaFree(part_l_); cudaFree(part_acc_);
-    cudaFree(d_ids_); cudaFree(d_pos_); cudaFree(d_arg_); cudaFree(d_past_);
-    cudaFree(d_bt_); cudaFree(d_iota_); cudaFree(d_zero_);
+    cudaFree(cos_tab_); cudaFree(sin_tab_);
+    cudaFree(x_); cudaFree(xb_); cudaFree(xb2_); cudaFree(qkv_);
+    cudaFree(attn_); cudaFree(gateup_); cudaFree(hmlp_); cudaFree(xg_); cudaFree(logits_);
+    cudaFree(d_ids_); cudaFree(d_pos_); cudaFree(d_req_);
+    cudaFree(d_qstart_); cudaFree(d_qlen_);
+    cudaFree(d_decode_rids_); cudaFree(d_prefill_rids_);
+    cudaFree(d_bt_); cudaFree(d_lrows_); cudaFree(d_arg_);
+    cudaFree(d_invT_); cudaFree(d_topp_); cudaFree(d_u_);
+    if (cublas_) cublasDestroy(cublas_);
     if (stream_) cudaStreamDestroy(stream_);
 }

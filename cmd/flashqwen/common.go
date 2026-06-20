@@ -9,17 +9,15 @@ import (
 	"flashqwen/internal/tokenizer"
 )
 
-// startupStallTimeout is how long WaitReady tolerates no load progress (process still alive) before
-// giving up. It is a watchdog against a stuck load, not a cap on total load time — a model that
-// keeps making progress, however slowly, is never killed.
-const startupStallTimeout = 120 * time.Second
+// startupTimeout caps how long we wait for the engine to load the model and start serving before
+// giving up. The engine loads before binding its port, so this is the whole load budget; generous so
+// a large model on a cold cache is never killed prematurely.
+const startupTimeout = 1800 * time.Second
 
 // session bundles the embedded engine plus its lifecycle. gen is the text tier (used by serve /
-// chat); tok is the same tokenizer, exposed so the benchmark can synthesise prompts of a target
-// length without loading it a second time.
+// chat); info carries the engine's reported model metadata; stop tears the engine down.
 type session struct {
 	gen  *engine.Generator
-	tok  *tokenizer.Tokenizer
 	info *engine.ModelInfo
 	stop func()
 }
@@ -27,14 +25,14 @@ type session struct {
 // open loads the tokenizer + chat template from the model directory, launches the embedded engine
 // against it, and waits for it to serve. The returned stop() tears both down. maxQueue caps the
 // engine's admission queue (<=0 => engine default of 4*slots).
-func open(modelDir string, slots, maxCtx, maxQueue int) (*session, error) {
+func open(modelDir string, slots, maxCtx, maxQueue, maxBatchTokens, maxPrefill int, gpuMemFraction float64) (*session, error) {
 	tok, err := tokenizer.Load(modelDir)
 	if err != nil {
 		return nil, err
 	}
 	cm := chatml.Load(modelDir, tok)
 
-	sup, err := supervisor.Start(modelDir, slots, maxCtx, maxQueue)
+	sup, err := supervisor.Start(modelDir, slots, maxCtx, maxQueue, maxBatchTokens, maxPrefill, gpuMemFraction)
 	if err != nil {
 		return nil, err
 	}
@@ -43,17 +41,15 @@ func open(modelDir string, slots, maxCtx, maxQueue int) (*session, error) {
 		sup.Stop()
 		return nil, err
 	}
-	// Block until the engine serves, showing a load progress bar. sup.Exited makes a dying engine
-	// surface its real cause immediately; WaitReady's stall watchdog tolerates a slow load of a large
-	// model (it only gives up if progress stops advancing for startupStallTimeout).
-	var bar startupBar
-	info, err := conn.WaitReady(startupStallTimeout, sup.Exited, bar.update)
-	bar.finish()
+	// Block until the engine has loaded the model and started serving (its load progress is logged to
+	// the terminal via the engine's stderr). sup.Exited makes a dying engine surface its real cause
+	// immediately instead of waiting out the timeout.
+	info, err := conn.WaitReady(startupTimeout, sup.Exited)
 	if err != nil {
 		conn.Close()
 		sup.Stop()
 		return nil, err
 	}
 	gen := engine.NewGenerator(conn, cm, tok, info.MaxCtx)
-	return &session{gen: gen, tok: tok, info: info, stop: func() { conn.Close(); sup.Stop() }}, nil
+	return &session{gen: gen, info: info, stop: func() { conn.Close(); sup.Stop() }}, nil
 }

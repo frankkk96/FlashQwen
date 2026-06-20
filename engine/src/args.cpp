@@ -21,6 +21,10 @@ int parse_args(int argc, char** argv, Args& out) {
     app.add_option("--max-queue", out.max_queue,
                    "admission cap on waiting requests; over it new requests are rejected as "
                    "over-capacity (<=0 => 4*slots)")->capture_default_str();
+    app.add_option("--max-batch-tokens", out.max_batch_tokens,
+                   "total tokens computed per scheduler step (max_num_batched_tokens)")->capture_default_str();
+    app.add_option("--max-prefill-tokens", out.max_prefill_tokens,
+                   "per-request prefill chunk cap per step (long_prefill_token_threshold)")->capture_default_str();
 
     try {
         app.parse(argc, argv);

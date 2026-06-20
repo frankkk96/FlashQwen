@@ -9,8 +9,10 @@ struct Args {
     float gpu_mem_fraction = 0.9f;                // VRAM cap; the KV pool gets whatever is left under it
     unsigned seed          = 1234;                // RNG seed for sampling
     std::string address    = "127.0.0.1:50051";   // gRPC listen address
-    int   slots            = 16;                   // max concurrent sequences
+    int   slots            = 16;                   // max concurrent sequences (max_num_seqs)
     int   max_queue        = 0;                    // admission cap on waiting requests (<=0 => 4*slots)
+    int   max_batch_tokens = 1024;                 // total tokens computed per step (max_num_batched_tokens)
+    int   max_prefill_tokens = 512;                // per-request prefill chunk cap (long_prefill_token_threshold)
 };
 
 // Parse argv into `out`. Returns <0 to continue running; returns >=0 when the program should exit

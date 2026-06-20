@@ -1,162 +1,136 @@
 #include "scheduler.hpp"
 #include <algorithm>
-#include <cstdio>
-#include <cstdlib>
+#include <numeric>
+#include <string>
 
-static const int PREFILL_CHUNK = 256;            // tokens prefilled per scheduler iteration
-
-Scheduler::Scheduler(ModelRuntime& model, const KVCache& kv, int n_slots, int max_queue, std::mt19937& rng)
-    : model_(model), kv_(kv), rng_(rng) {
-    n_slots_   = std::min(n_slots, model_.max_batch());
-    max_queue_ = max_queue;
-    max_ctx_ = model_.max_ctx();
-    V_       = model_.spec().vocab_size;
-    bsz_     = kv_.block_size();
-    free_blocks_.reserve(kv_.num_blocks());
-    for (int b = kv_.num_blocks() - 1; b >= 0; --b) free_blocks_.push_back(b);
-}
-
-void Scheduler::add(Request* r) { waiting_.push_back(r); }
-
-void Scheduler::remove(Request* r) {
-    for (auto it = waiting_.begin(); it != waiting_.end(); ++it)
-        if (*it == r) { waiting_.erase(it); return; }
-    if (pf_ == r) { release(r); pf_ = nullptr; return; }
-    for (auto it = running_.begin(); it != running_.end(); ++it)
-        if (*it == r) { release(r); running_.erase(it); return; }
-}
-
-bool Scheduler::finished(const Request* r) const {
-    if ((int)r->output.size() >= r->max_new) return true;
-    if (!r->output.empty() &&
-        std::find(r->stop_ids.begin(), r->stop_ids.end(), r->cur) != r->stop_ids.end())
-        return true;                        // sampled a caller-provided stop token
-    if (r->past >= max_ctx_) return true;   // sequence full — no room for another token
-    return false;
-}
+Scheduler::Scheduler(ModelRuntime& model, KVCacheManager& kv, const SchedulerConfig& cfg)
+    : model_(model), kv_(kv), cfg_(cfg) {}
 
 void Scheduler::release(Request* r) {
-    for (int b : r->block_table) free_blocks_.push_back(b);
-    r->block_table.clear();
+    kv_.free(r->blocks());   // return blocks to the pool and clear the table
 }
 
-// Free the youngest running sequence other than running_[protect] (or any if protect<0): return
-// its blocks and requeue it so its KV is recomputed (from prompt+output) when later resumed.
-bool Scheduler::preempt_one(int protect) {
-    for (int k = (int)running_.size() - 1; k >= 0; --k) {
-        if (k == protect) continue;
-        release(running_[k]);
-        waiting_.push_front(running_[k]);
+// A request has left the engine for good (finished or failed): return its KV blocks to the pool and
+// drop it from the running set (destroying it).
+void Scheduler::retire(Request* r) {
+    release(r);
+    for (auto it = running_.begin(); it != running_.end(); ++it)
+        if (it->get() == r) { running_.erase(it); return; }   // unique_ptr destroyed -> Request freed
+}
+
+// How many tokens request r should advance this step: all its uncomputed tokens, capped by the
+// remaining budget and (for multi-token prefill chunks) by max_prefill. 0 when none are left.
+int Scheduler::chunk_size(const Request* r, int budget) const {
+    int remaining = r->remaining();
+    if (remaining <= 0) return 0;
+    int n = std::min(remaining, budget);
+    if (remaining > 1) n = std::min(n, cfg_.max_prefill);   // chunk long prefills
+    return n;
+}
+
+// Grow r's KV block table to cover `upto` tokens, preempting younger sequences when the pool is dry:
+// each preemption frees the youngest running sequence other than r — returns its blocks, resets its
+// cursor, and requeues it (front) so its KV is recomputed from prompt+output when later resumed.
+// Returns false if the pool can't fit r even after preempting everyone else: r is then failed (its
+// sink gets an OverCapacity error) and retired, and the caller must rebuild the batch.
+bool Scheduler::grow(Request* r, int upto) {
+    while (!kv_.grow(r->blocks(), upto)) {
+        // youngest running sequence other than r (scan from the end, skipping r itself)
+        int k = (int)running_.size() - 1;
+        while (k >= 0 && running_[k].get() == r) --k;
+        if (k < 0) {   // nobody else to preempt: r alone can't fit the pool -> fail it
+            if (r->sink()) r->sink()->error(EngineErrc::OverCapacity,
+                "out of KV cache: pool has " + std::to_string(kv_.num_blocks()) +
+                " blocks of " + std::to_string(kv_.block_size()) + " tokens, cannot grow a sequence to " +
+                std::to_string(upto) + " tokens");
+            retire(r);
+            return false;
+        }
+        release(running_[k].get());
+        running_[k]->reset_for_recompute();           // recompute from the start on resume
+        waiting_.push_front(std::move(running_[k]));   // requeue at the front
         running_.erase(running_.begin() + k);
-        return true;
     }
-    return false;
+    return true;
 }
 
-void Scheduler::step(const TokenFn& on_token, const FinishFn& on_finish, const ErrorFn& on_error) {
-    // (a) start prefilling the next waiting request if there is room for another sequence.
-    if (pf_ == nullptr && !waiting_.empty() && (int)running_.size() < n_slots_) {
-        pf_ = waiting_.front(); waiting_.pop_front();
-        pf_->block_table.clear();
-        pf_tokens_ = pf_->prompt;
-        if (!pf_->output.empty())                  // resume: re-cache everything but the last token
-            pf_tokens_.insert(pf_tokens_.end(), pf_->output.begin(), pf_->output.end() - 1);
-        if ((int)pf_tokens_.size() > max_ctx_) pf_tokens_.resize(max_ctx_);
-        pf_cursor_ = 0;
+// One scheduling iteration over a step-local batch: cancel, admit, pack, forward, apply, reclaim.
+void Scheduler::step() {
+    // 1. drop cancelled requests (client disconnected), freeing their KV — polled once per step
+    for (auto it = waiting_.begin(); it != waiting_.end(); ) {
+        if ((*it)->sink() && (*it)->sink()->cancelled()) { release(it->get()); it = waiting_.erase(it); }
+        else ++it;
     }
-    // (b) advance the in-progress prefill by one chunk.
-    if (pf_ != nullptr) {
-        Request* r = pf_;
-        int chunk = std::min(PREFILL_CHUNK, (int)pf_tokens_.size() - pf_cursor_);
-        int need = blocks_for(pf_cursor_ + chunk);
-        while ((int)r->block_table.size() < need) {
-            if (free_blocks_.empty() && !preempt_one(-1)) {
-                // The pool can't fit even this single prefill after preempting everyone. Fail just
-                // this request instead of taking down the whole engine (see issue #4).
-                std::string msg = "out of KV cache: pool has " + std::to_string(kv_.num_blocks()) +
-                    " blocks of " + std::to_string(bsz_) + " tokens (" +
-                    std::to_string(kv_.num_blocks() * bsz_) + " total), cannot reserve " +
-                    std::to_string(need) + " blocks for a " + std::to_string((int)pf_tokens_.size()) +
-                    "-token prefill";
-                release(r);
-                if (on_error) on_error(r, EngineErrc::OverCapacity, std::move(msg));
-                pf_ = nullptr;
-                return;   // abort this step; running sequences (if any) decode on the next one
-            }
-            if (free_blocks_.empty()) continue;
-            r->block_table.push_back(free_blocks_.back()); free_blocks_.pop_back();
-        }
-        std::vector<int> piece(pf_tokens_.begin() + pf_cursor_, pf_tokens_.begin() + pf_cursor_ + chunk);
-        model_.prefill(piece, r->block_table, pf_cursor_);
-        pf_cursor_ += chunk;
-        if (pf_cursor_ >= (int)pf_tokens_.size()) {        // prompt fully cached
-            if (r->output.empty()) {                       // fresh: take the first generated token
-                r->cur = (r->sp.temp <= 0.0f) ? model_.argmax_last()
-                                              : sample(model_.copy_logits(), r->sp, rng_);
-                r->output.push_back(r->cur);
-                if (on_token) on_token(r, r->cur);
-            } else {                                        // resume: continue from output.back()
-                r->cur = r->output.back();
-            }
-            r->past = (int)pf_tokens_.size();
-            if (finished(r)) { release(r); if (on_finish) on_finish(r); }
-            else running_.push_back(r);
-            pf_ = nullptr;
+    for (auto it = running_.begin(); it != running_.end(); ) {
+        if ((*it)->sink() && (*it)->sink()->cancelled()) { release(it->get()); it = running_.erase(it); }
+        else ++it;
+    }
+    // 2. admit waiters into the running set while slots are free
+    while ((int)running_.size() < cfg_.n_slots && !waiting_.empty()) {
+        running_.push_back(std::move(waiting_.front()));
+        waiting_.pop_front();
+    }
+    // 3. pack the running set under the token budget, scheduling by ascending remaining work — so
+    //    decodes (remaining==1) come first (low TPOT), then the shortest prefills. We sort an index
+    //    view, never running_ itself: its order is request age, which grow() uses to pick the youngest
+    //    to preempt. A preempt mutates running_, so rebuild from scratch when it happens.
+    CurrentBatch batch;
+    std::vector<int> order;
+    for (bool restart = true; restart; ) {
+        restart = false;
+        batch.clear();
+        order.resize(running_.size());
+        std::iota(order.begin(), order.end(), 0);
+        std::stable_sort(order.begin(), order.end(),
+            [&](int a, int b) { return running_[a]->remaining() < running_[b]->remaining(); });
+        int budget = cfg_.max_batch_tokens;
+        for (int idx : order) {
+            if (budget <= 0) break;
+            Request* r = running_[idx].get();
+            int n = chunk_size(r, budget);
+            if (n == 0) continue;
+            if (!grow(r, r->computed() + n)) { restart = true; break; }
+            batch.add_request(r, n);
+            budget -= n;
         }
     }
-    if (running_.empty()) return;
+    if (batch.empty()) return;
+    // 4. one merged forward (+ GPU sampling), then apply results + reclaim finished
+    model_.forward(batch.input, batch.sampled);
+    batch.apply();
+    for (Request* r : batch.finished) retire(r);
+}
 
-    // (c) grow each running sequence's block table for the token it is about to write, preempting
-    // a younger sequence (and rescanning) if the pool is exhausted.
-    for (bool rescan = true; rescan; ) {
-        rescan = false;
-        for (size_t k = 0; k < running_.size(); ++k) {
-            Request* r = running_[k];
-            int need = blocks_for(r->past + 1);
-            while ((int)r->block_table.size() < need) {
-                if (free_blocks_.empty()) {
-                    if (!preempt_one((int)k)) {
-                        // Only this sequence is running and the pool still can't grow it. Fail it
-                        // rather than crashing the engine (see issue #4).
-                        std::string msg = "out of KV cache during decode: pool has " +
-                            std::to_string(kv_.num_blocks()) + " blocks of " + std::to_string(bsz_) +
-                            " tokens, sequence at " + std::to_string(r->past) +
-                            " tokens cannot grow further";
-                        release(r);
-                        if (on_error) on_error(r, EngineErrc::OverCapacity, std::move(msg));
-                        running_.erase(running_.begin() + k);
-                        rescan = true; break;
-                    }
-                    rescan = true; break;
-                }
-                r->block_table.push_back(free_blocks_.back()); free_blocks_.pop_back();
-            }
-            if (rescan) break;
+void Scheduler::submit(std::unique_ptr<Request> r) {
+    { std::lock_guard<std::mutex> lk(inbound_mu_); inbound_.push_back(std::move(r)); }
+    inbound_cv_.notify_one();
+}
+
+// The engine thread: drain submitted requests (rejecting any that overflow the queue), then advance
+// one scheduling iteration. Blocks for the process lifetime.
+void Scheduler::run() {
+    std::deque<std::unique_ptr<Request>> incoming;
+    while (true) {
+        {
+            std::unique_lock<std::mutex> lk(inbound_mu_);
+            if (inbound_.empty() && !busy())
+                inbound_cv_.wait(lk, [&] { return !inbound_.empty(); });
+            incoming.swap(inbound_);
         }
+        while (!incoming.empty()) {
+            auto r = std::move(incoming.front()); incoming.pop_front();
+            // admission control: reject when the waiting queue is full -> over-capacity
+            if (cfg_.max_queue > 0 && (int)waiting_.size() >= cfg_.max_queue) {
+                if (r->sink()) r->sink()->error(EngineErrc::OverCapacity,
+                    "request queue full: " + std::to_string(waiting_.size()) +
+                    " requests already waiting (limit " + std::to_string(cfg_.max_queue) +
+                    "), engine running up to " + std::to_string(cfg_.n_slots) +
+                    " concurrent sequences; retry shortly");
+                // r is dropped here; the handler's sink ref still delivers the error event.
+            } else {
+                waiting_.push_back(std::move(r));   // admitted: into the scheduling queue
+            }
+        }
+        if (busy()) step();
     }
-
-    // decode the whole running set in one step.
-    in_tok_.clear(); past_.clear(); bts_.clear();
-    bool any_sampling = false;
-    for (Request* r : running_) { in_tok_.push_back(r->cur); past_.push_back(r->past);
-                                  bts_.push_back(r->block_table);
-                                  if (r->sp.temp > 0.0f) any_sampling = true; }
-    if (any_sampling) {
-        const float* L = model_.decode_logits_host(in_tok_, past_, bts_);
-        out_.resize(running_.size());
-        for (size_t k = 0; k < running_.size(); ++k)
-            out_[k] = sample(L + (size_t)k * V_, V_, running_[k]->sp, rng_);
-    } else {
-        model_.decode(in_tok_, past_, bts_, out_);   // all greedy: GPU argmax, no full-logits copy
-    }
-
-    std::vector<Request*> still;
-    for (size_t k = 0; k < running_.size(); ++k) {
-        Request* r = running_[k];
-        r->cur = out_[k]; r->past += 1; r->output.push_back(r->cur);
-        if (on_token) on_token(r, r->cur);
-        if (finished(r)) { release(r); if (on_finish) on_finish(r); }
-        else still.push_back(r);
-    }
-    running_.swap(still);
 }

@@ -1,47 +1,44 @@
-// Paged KV block pool — the storage layer for PagedAttention, kept separate from both the model
-// and the scheduler:
-//   * the MODEL only computes — its attention kernels read/write KV through k(l)/v(l);
-//   * the SCHEDULER only allocates — it hands out block ids from a free list (see scheduler.cpp);
-//   * this class only stores — a flat set of fixed-size blocks shared by all sequences, laid out
-//     per layer as [num_blocks, BLOCK, kv_dim] in BF16.
-// The three meet only through block tables (vectors of physical block ids) and the raw k/v base
-// pointers. Sizing is "whatever VRAM is left", so a KVCache must be constructed AFTER the model
-// has uploaded its weights + activation scratch (see main.cpp).
-//
-// Porting note: a different transformer that still uses a per-layer paged KV cache can reuse this
-// class unchanged — only the model's attention kernels that index k(l)/v(l) need rewriting.
+// KV cache manager — the request-level layer between the Scheduler and the BlockPool.
+//   * the SCHEDULER thinks in requests ("this sequence needs room for one more token");
+//   * the BLOCKPOOL thinks in physical block ids;
+//   * this manager translates between them — it grows a request's block table out of the pool and
+//     returns it on release, so the scheduler never touches the pool's free list directly.
+// It is also the seam where prefix caching will later live (get_computed_blocks / cache_blocks);
+// for now it is a thin, behavior-preserving wrapper around BlockPool.
 #pragma once
-#include "model_spec.hpp"
-#include "kernels.cuh"   // bf16
+#include "block_pool.hpp"
 #include <vector>
 
-class KVCache {
+class KVCacheManager {
 public:
-    static constexpr int BLOCK = 16;   // tokens per block (page)
+    explicit KVCacheManager(BlockPool& pool) : pool_(pool), bsz_(pool.block_size()) {}
 
-    // Carve the pool out of the VRAM left under gpu_mem_fraction. Needs room for at least one
-    // full-length (max_ctx) sequence; prints an error and exits the process if not.
-    KVCache(const ModelSpec& spec, int max_ctx, float gpu_mem_fraction);
-    ~KVCache();
-    KVCache(const KVCache&) = delete;
-    KVCache& operator=(const KVCache&) = delete;
+    // --- sizing / capacity (used by the scheduler for budgeting + error messages) ---
+    int block_size() const { return bsz_; }
+    int num_blocks() const { return pool_.num_blocks(); }
+    int num_free()   const { return pool_.num_free(); }
+    int blocks_for(int n_tok) const { return (n_tok + bsz_ - 1) / bsz_; }
 
-    bf16* k(int layer) const { return k_[layer]; }   // [num_blocks, BLOCK, kv_dim] for `layer`
-    bf16* v(int layer) const { return v_[layer]; }
+    // Grow `block_table` until it covers `num_tokens` logical tokens, pulling blocks from the pool.
+    // Returns true once covered; returns false the moment the pool runs dry (leaving the partial
+    // growth in place) so the caller can preempt a sequence and call again to continue.
+    bool grow(std::vector<int>& block_table, int num_tokens) {
+        int need = blocks_for(num_tokens);
+        while ((int)block_table.size() < need) {
+            int b;
+            if (!pool_.alloc_one(b)) return false;
+            block_table.push_back(b);
+        }
+        return true;
+    }
 
-    int block_size() const { return BLOCK; }
-    int num_blocks() const { return num_blocks_; }          // physical blocks in the pool
-    int max_blocks_per_seq() const { return max_blocks_; }  // ceil(max_ctx / BLOCK)
+    // Return a request's blocks to the pool and clear its table (finished / preempted / cancelled).
+    void free(std::vector<int>& block_table) {
+        pool_.free_many(block_table);
+        block_table.clear();
+    }
 
 private:
-    int num_blocks_ = 0;
-    int max_blocks_ = 0;
-    std::vector<bf16*> k_, v_;
+    BlockPool& pool_;
+    int bsz_;
 };
-
-// Write side of the pool: scatter M freshly-projected K (or V) rows into `cache` (one layer's
-// k(l)/v(l)). Token m goes to block-table row bt_row[m] of `bt` (row stride `max_blocks`), at
-// logical position pos[m]. Defined in kv_cache.cu; the read side is the attention kernels.
-void launch_store_kv_paged(const float* src, bf16* cache, const int* bt, int max_blocks,
-                           int block_size, int kv_dim, const int* bt_row, const int* pos,
-                           int M, cudaStream_t s);
