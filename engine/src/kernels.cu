@@ -217,12 +217,161 @@ __global__ void attn_decode_kernel(const bf16* __restrict__ q, int q_stride,
     }
 }
 
+// --- GQA-shared FlashDecoding (the conc>=8 fast path) ----------------------------------------
+// The per-(q-head) kernel above re-reads each kv-head's K/V once per query head in its GQA group
+// (4x for Qwen3's 4:1 ratio). Even though L2 absorbs most of the redundant HBM traffic, the redundant
+// L2 bandwidth + load instructions + score reductions cost ~2.3x. Here one block owns a (kv-head,
+// request) and computes ALL G = n_heads/n_kv query heads of the group, loading each K/V element ONCE
+// into registers and reusing it across the G heads. To keep the 4090 saturated despite n_kv being 4x
+// fewer blocks than n_heads, the KV range is split across grid.z (ksplit) FlashDecoding-style; a tiny
+// second kernel combines the per-split partials. (The S4 attempt grouped by kv-head but used only
+// n_kv blocks -> GPU starved; the KV split is what makes grouping a win.)
+//
+// Phase 1: each block (kv-head, request, split) -> NW warps stream their slice of the split's keys,
+// online-softmax per head, in-block combine across the NW warps, write G UNNORMALIZED partials
+// (m, l, acc[head_dim]) for this split into pm/pl/pa indexed [(di*n_heads + h)*ksplit + sp].
+template<int NW, int DPL, int G>
+__global__ void attn_decode_gqa_kernel(const bf16* __restrict__ q, int q_stride,
+                                       const bf16* __restrict__ cache_k, const bf16* __restrict__ cache_v,
+                                       float* __restrict__ pm, float* __restrict__ pl, float* __restrict__ pa,
+                                       int n_heads, int n_kv, int head_dim,
+                                       const int* __restrict__ pos, const int* __restrict__ qstart,
+                                       const int* __restrict__ decode_rids, const int* __restrict__ bt,
+                                       int max_blocks, int block_size, float scale, int ksplit) {
+    int kvh = blockIdx.x;              // kv head (owns this GQA group)
+    int di  = blockIdx.y;             // decode-request slot
+    int sp  = blockIdx.z;             // KV split
+    int w   = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    int r = decode_rids[di], flat = qstart[r], qpos = pos[flat];
+    int kv_dim = n_kv * head_dim;
+    const int* btr = bt + (size_t)r * max_blocks;
+
+    float qreg[G][DPL];               // the G query heads of this group, in registers
+    #pragma unroll
+    for (int g = 0; g < G; ++g) {
+        const bf16* qv = q + (size_t)flat * q_stride + (size_t)(kvh * G + g) * head_dim;
+        #pragma unroll
+        for (int i = 0; i < DPL; ++i) qreg[g][i] = __bfloat162float(qv[lane + (i << 5)]);
+    }
+    float m_run[G], l_run[G], acc[G][DPL];
+    #pragma unroll
+    for (int g = 0; g < G; ++g) { m_run[g] = -1e30f; l_run[g] = 0.f;
+        #pragma unroll
+        for (int i = 0; i < DPL; ++i) acc[g][i] = 0.f; }
+
+    // warp w of split sp streams keys sp*NW+w, +NW*ksplit, ... (every key hits exactly one (sp,w)).
+    for (int kpos = sp * NW + w; kpos <= qpos; kpos += NW * ksplit) {
+        size_t base = (size_t)btr[kpos / block_size] * block_size * kv_dim
+                    + (size_t)(kpos % block_size) * kv_dim + (size_t)kvh * head_dim;
+        const bf16* kc = cache_k + base; const bf16* vc = cache_v + base;
+        float kreg[DPL], vreg[DPL];   // K/V loaded ONCE, reused across the G heads
+        #pragma unroll
+        for (int i = 0; i < DPL; ++i) { kreg[i] = __bfloat162float(kc[lane + (i << 5)]);
+                                        vreg[i] = __bfloat162float(vc[lane + (i << 5)]); }
+        #pragma unroll
+        for (int g = 0; g < G; ++g) {
+            float partial = 0.f;
+            #pragma unroll
+            for (int i = 0; i < DPL; ++i) partial += qreg[g][i] * kreg[i];
+            #pragma unroll
+            for (int o = 16; o > 0; o >>= 1) partial += __shfl_xor_sync(0xffffffff, partial, o);
+            float score = partial * scale;
+            float m_new = fmaxf(m_run[g], score), corr = __expf(m_run[g] - m_new), p = __expf(score - m_new);
+            l_run[g] = l_run[g] * corr + p;
+            #pragma unroll
+            for (int i = 0; i < DPL; ++i) acc[g][i] = acc[g][i] * corr + p * vreg[i];
+            m_run[g] = m_new;
+        }
+    }
+
+    __shared__ float sm[G][NW], sl[G][NW], sa[G][NW][DPL * 32];
+    #pragma unroll
+    for (int g = 0; g < G; ++g) { sm[g][w] = m_run[g]; sl[g][w] = l_run[g];
+        #pragma unroll
+        for (int i = 0; i < DPL; ++i) sa[g][w][lane + (i << 5)] = acc[g][i]; }
+    __syncthreads();
+
+    if (w == 0) {   // merge the NW warps' partials, write one (m,l,acc) per head for this split
+        #pragma unroll
+        for (int g = 0; g < G; ++g) {
+            float gm = -1e30f;
+            #pragma unroll
+            for (int t = 0; t < NW; ++t) gm = fmaxf(gm, sm[g][t]);
+            float gl = 0.f, gacc[DPL];
+            #pragma unroll
+            for (int i = 0; i < DPL; ++i) gacc[i] = 0.f;
+            for (int t = 0; t < NW; ++t) { float c = __expf(sm[g][t] - gm); gl += sl[g][t] * c;
+                #pragma unroll
+                for (int i = 0; i < DPL; ++i) gacc[i] += sa[g][t][lane + (i << 5)] * c; }
+            int h = kvh * G + g;
+            size_t idx = ((size_t)di * n_heads + h) * ksplit + sp;
+            if (lane == 0) { pm[idx] = gm; pl[idx] = gl; }
+            #pragma unroll
+            for (int i = 0; i < DPL; ++i) pa[idx * head_dim + lane + (i << 5)] = gacc[i];
+        }
+    }
+}
+
+// Phase 2: combine the ksplit partials of each (head, request) -> the final normalized output row.
+// One block per (head, decode-request); head_dim threads, each owns one output element.
+__global__ void attn_decode_combine_kernel(const float* __restrict__ pm, const float* __restrict__ pl,
+                                           const float* __restrict__ pa, bf16* __restrict__ out,
+                                           int n_heads, int head_dim, const int* __restrict__ qstart,
+                                           const int* __restrict__ decode_rids, int ksplit) {
+    int h = blockIdx.x, di = blockIdx.y, d = threadIdx.x;
+    int r = decode_rids[di], flat = qstart[r];
+    size_t base = ((size_t)di * n_heads + h) * ksplit;
+    float gm = -1e30f;
+    for (int s = 0; s < ksplit; ++s) gm = fmaxf(gm, pm[base + s]);
+    float gl = 0.f, gacc = 0.f;
+    for (int s = 0; s < ksplit; ++s) {
+        float c = __expf(pm[base + s] - gm);
+        gl   += pl[base + s] * c;                     // ksplit is small; recomputing gl per thread is cheap
+        gacc += pa[(base + s) * head_dim + d] * c;
+    }
+    float inv = gl > 0.f ? 1.0f / gl : 0.f;
+    out[((size_t)flat * n_heads + h) * head_dim + d] = __float2bfloat16(gacc * inv);
+}
+
 void launch_attn_decode(const bf16* q, int q_stride, const bf16* cache_k, const bf16* cache_v,
                         bf16* out, int n_heads, int n_kv, int head_dim,
                         const int* pos, const int* qstart, const int* decode_rids, int n_decode,
                         const int* bt, int max_blocks, int block_size, float scale, cudaStream_t s) {
     if (n_decode <= 0) return;
-    constexpr int NW = 8;              // warps per block = KV splits
+    constexpr int NW = 8;              // warps per block
+    int G = n_heads / n_kv;            // GQA group size (4 for Qwen3-8B)
+
+    // GQA-shared fast path: head_dim==128 (DPL=4) and a supported group size. Split the KV range over
+    // grid.z so n_kv (< n_heads) blocks still saturate the GPU.
+    if (head_dim == 128 && (G == 1 || G == 2 || G == 4 || G == 8)) {
+        constexpr int MAX_KSPLIT = 16;
+        int ksplit = 128 / (n_decode > 0 ? n_decode : 1);   // ~enough blocks: n_kv*n_decode*ksplit
+        if (ksplit < 1) ksplit = 1; if (ksplit > MAX_KSPLIT) ksplit = MAX_KSPLIT;
+
+        // persistent FlashDecoding partials, reused across layers/steps (sized for the worst case).
+        static float *pm = nullptr, *pl = nullptr, *pa = nullptr;
+        if (!pm) {
+            size_t nent = (size_t)MAX_DECODE_B * 64 /*heads guard*/ * MAX_KSPLIT;
+            cudaMalloc(&pm, nent * sizeof(float));
+            cudaMalloc(&pl, nent * sizeof(float));
+            cudaMalloc(&pa, nent * 128 * sizeof(float));
+        }
+        dim3 g1(n_kv, n_decode, ksplit);
+        #define FQ_DEC_GQA(GG) attn_decode_gqa_kernel<NW, 4, GG><<<g1, NW * 32, 0, s>>>(            \
+            q, q_stride, cache_k, cache_v, pm, pl, pa, n_heads, n_kv, head_dim, pos, qstart,        \
+            decode_rids, bt, max_blocks, block_size, scale, ksplit)
+        if      (G == 4) FQ_DEC_GQA(4);
+        else if (G == 2) FQ_DEC_GQA(2);
+        else if (G == 8) FQ_DEC_GQA(8);
+        else             FQ_DEC_GQA(1);
+        #undef FQ_DEC_GQA
+        dim3 g2(n_heads, n_decode);
+        attn_decode_combine_kernel<<<g2, head_dim, 0, s>>>(pm, pl, pa, out, n_heads, head_dim,
+                                                           qstart, decode_rids, ksplit);
+        return;
+    }
+
+    // fallback: original one-block-per-(head,request) kernel (re-reads K/V per GQA group).
     dim3 grid(n_heads, n_decode);
     attn_decode_kernel<NW, 4><<<grid, NW * 32, 0, s>>>(
         q, q_stride, cache_k, cache_v, out, n_heads, n_kv, head_dim, pos, qstart, decode_rids, bt,

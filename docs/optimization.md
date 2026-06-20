@@ -52,6 +52,7 @@ FlashQwen's single-stream decode.)
 | S7 | WMMA tensor-core prefill attention | 44.9 | **493.4** | **70.7%** | 0dd4010 |
 | S8 | attn_prefill occupancy (shrink shared, drop PVt) | 45.2 | **528.5** | **75.7%** | 392cda5 |
 | S10 | scheduler: default max-batch-tokens 2048→1024 | ~45 | **589** | **84.4%** | 642cc28 |
+| S12 | GQA-shared FlashDecoding (read K/V once per group + KV-split) | **51.3** | **608.8** | **87.2%** | 7651b94 |
 
 ## Step entries
 
@@ -290,5 +291,28 @@ core utilization on the skinny M=32 decode shape) on top of fewer launches. Addi
 (C→S5) changes nothing (355.8→356.1). Kept all three anyway: correct, not negative, fewer launches for
 the eventual CUDA-graph capture — but the lesson is **GEMM-shape wins are the lever, elementwise/launch
 fusion is not** at this batch size.
+
+### S12 — GQA-shared FlashDecoding decode attention (2026-06-20)
+- **What**: the S6 decode kernel ran one block per (q-head, request); with Qwen3's 4:1 GQA each
+  kv-head's K/V was re-read once per query head in its group (4×). New two-phase kernel: phase 1 = one
+  block per (kv-head, request, **KV-split**) computes all G=4 q-heads of the group, loading each K/V
+  element into registers **once** and reusing it across the 4 heads; phase 2 combines the per-split
+  FlashDecoding partials. The `grid.z` KV-split (ksplit = clamp(128/n_decode, 1, 16)) keeps the 4090
+  saturated despite n_kv being 4× fewer blocks than n_heads (conc=32: 8·32·4 = 1024 blocks × 8 warps =
+  8192 warps = full). Old per-head kernel kept as fallback (head_dim≠128 or unsupported group).
+- **Why it works now (vs the spent S4 GQA attempt)**: S4 grouped by kv-head but used only n_kv blocks
+  → GPU starved → looked flat. The KV-split is what makes grouping a net win. L2 already absorbs most
+  of the redundant *HBM* traffic from the 4× re-read, but the redundant L2 bandwidth + load
+  instructions + score reductions still cost ~2.3× (microbench: 0.246→0.105 ms/layer).
+- **Result**: conc=32 **589 → 608.8 (+3.4%, 84.4%→87.2% of vLLM)**, TPOT 54→52.1 ms; conc=1
+  **45.7 → 51.3 (+12.2%)**, TPOT 22→19.6 ms. Greedy output verified bit-coherent (Rayleigh answer ok);
+  standalone numerical check vs the reference kernel: max|Δ| ≤ 1e-4 (bf16 noise) for KVLEN ∈ {1..2000}.
+- **Why conc=1 gains more than conc=32**: single-request KV (~4.7 MB/layer) fits in L2, so the 4×
+  re-read was pure wasted L2 bandwidth — cleanly removed. At conc=32 the KV (151 MB/layer) overflows
+  L2 (more HBM-bound) AND the 1024/128 workload is prefill-heavy (attn_decode is only ~13% of GPU
+  time), so the end-to-end share is smaller.
+- **Lesson**: a kernel-isolated speedup (2.3×) dilutes to +3.4% end-to-end because decode attention is
+  a minority of GPU time on a prefill-heavy workload. The remaining hand-rolled hot kernel is
+  **attn_prefill** (~11%), which still re-reads K/V 4× per GQA group — the next attention lever.
 
 <!-- Append one ### entry per landed step: What / Why / Change / Result (vs prev) / Lesson -->
