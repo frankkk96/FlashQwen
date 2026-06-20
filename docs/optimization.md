@@ -52,7 +52,7 @@ FlashQwen's single-stream decode.)
 | S7 | WMMA tensor-core prefill attention | 44.9 | **493.4** | **70.7%** | 0dd4010 |
 | S8 | attn_prefill occupancy (shrink shared, drop PVt) | 45.2 | **528.5** | **75.7%** | 392cda5 |
 | S10 | scheduler: default max-batch-tokens 2048→1024 | ~45 | **589** | **84.4%** | 642cc28 |
-| S12 | GQA-shared FlashDecoding (read K/V once per group + KV-split) | **51.3** | **608.8** | **87.2%** | 7651b94 |
+| S12 | GQA-shared FlashDecoding (read K/V once per group + KV-split) | **51.3** | **608.8** | **87.2%** | 240aaa1 |
 
 ## Step entries
 
