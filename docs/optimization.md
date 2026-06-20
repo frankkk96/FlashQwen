@@ -5,6 +5,36 @@ step: **what changed, the bottleneck it targeted, the measured effect, the lesso
 experiment notes (tuning sweeps, dead ends, profiler dumps) live under `docs/exps/` so this file
 stays readable.
 
+## Executive summary
+
+FlashQwen is a from-scratch Qwen3-8B inference engine (Go front-end + C++/CUDA backend over gRPC).
+This log tracks closing the serving-throughput gap to **vLLM** on a single RTX 4090, at **bf16
+parity (no quantization)**. Starting from `main` (INT8, a per-sequence scheduler) we rebuilt the
+scheduler, the GEMM path, and the attention kernels.
+
+**Final result** — fresh same-machine replay of every landed step, conc=32, output 128, vs a
+**feature-matched** vLLM (`--no-enable-prefix-caching`, bf16, 0.9 mem). Chart:
+`docs/exps/2026-06-20-journey.png`; data: `docs/exps/2026-06-20-journey.csv`.
+
+| input | FlashQwen (S14) | vLLM (no prefix cache) | **% of vLLM** |
+|---|---|---|---|
+| 128 (decode-heavy) | 1341 | 1376 | **97.5%** |
+| 512 | 908 | 944 | **96.2%** |
+| 1024 (prefill-heavy) | 605 | 652 | **92.8%** |
+
+conc=1 single-stream: 56.4 / 54.6 / 51.3 ≈ 92–97% of vLLM across the same inputs.
+
+**Headline takeaways**
+- **5.5×** over the `main` baseline at conc=32/1024 (107 → 605 tok/s).
+- The gap to vLLM **grows with input length** (97.5% → 92.8%): the residual is entirely **prefill-side
+  compute** (prefill GEMM at the cuBLAS/HBM limit + longer-context attention). Decode-heavy serving is
+  essentially at vLLM parity.
+- Decode, KV-cache capacity/eviction, and CPU/scheduling overhead were each measured and **ruled out**
+  as the conc=32 bottleneck (see Conclusions).
+- All comparisons here are against a **feature-matched** vLLM (no prefix caching). vLLM's default
+  (prefix-cache ON) was a non-equal earlier baseline and is retained only as a record:
+  `docs/exps/2026-06-20-vllm-baseline-prefix-cache-deprecated.md`.
+
 ## Goal & constraints
 
 - Close the serving-throughput gap to **vLLM** on **Qwen3-8B**, **bf16, no quantization** (fair, equal
@@ -22,39 +52,56 @@ stays readable.
   prefill, so prefill time lands in TPOT.)
 - Correctness gates each step: `bash /root/bench-compare/validate.sh` (numerical) + `gencheck.sh` (text).
 
-## Baselines (this exact standard: 1024/128, temp 0, ignore_eos)
+## Baselines & reference (canonical: the 2026-06-20 journey replay)
 
-Aligned `vllm bench serve --dataset-name random` — identical config on both servers, only the engine
-differs. (main has no `/v1/completions`+`ignore_eos`, so it was measured on a throwaway `main` worktree
-with that **Go-only** shim cherry-picked from `650fdaa` — no engine/compute change.)
+All numbers in this report are from the **single canonical dataset** — the same-machine journey replay
+(`docs/exps/2026-06-20-journey.csv`): every landed step rebuilt clean and benched at 128/512/1024
+input vs a **feature-matched vLLM** (`--no-enable-prefix-caching`, bf16, 0.9 mem). Aligned
+`vllm bench serve --dataset-name random`, output 128, temp 0.
 
-| | conc=1 | **conc=32** | % of vLLM (conc=32) |
-|---|---|---|---|
-| **main (B0)** | 56.7 (TPOT 11.5 ms) | **106.9** (TPOT 251 ms) | **15.3%** |
-| **vLLM (reference)** | 55.7 (TPOT 17.1 ms) | **698.2** (TPOT 37.2 ms) | 100% |
+vLLM reference (conc=32 output tok/s): **128 → 1376, 512 → 944, 1024 → 652**.
 
-main is at parity with vLLM **single-stream** (even ~2% ahead — INT8 weights are memory-lighter than
-vLLM's bf16, and decode is memory-bound), but **collapses under concurrency**: 15% at conc=32, where
-vLLM's batched GEMM dominates. The number to catch up = **conc=32**.
-(Precision caveat: FlashQwen is INT8 weight-quant vs vLLM bf16 — not equal precision yet; this flatters
-FlashQwen's single-stream decode.)
+Starting point — `main` (B0): per-sequence scheduler, INT8 weight-quant. Recorded at conc=32/1024 =
+**106.9** tok/s (15% of the no-cache vLLM 652). B0 is INT8 + a different branch, so it is cited from
+the original record, not re-run in the bf16 replay. INT8 makes its single-stream (conc=1) decode look
+good (lighter weight traffic) but it **collapses under concurrency** — that collapse is what the
+journey fixes.
+
+> Earlier revisions of this log compared against vLLM with **prefix caching ON** (its default → 698 /
+> 1031), which is not feature-matched (FlashQwen has no prefix sharing). That deprecated comparison is
+> kept only as a record: `docs/exps/2026-06-20-vllm-baseline-prefix-cache-deprecated.md`.
 
 ## Progress
 
+Canonical numbers from the 2026-06-20 journey replay, **standard test = 1024 input / 128 output**
+(`% vLLM` is vs the feature-matched no-cache vLLM, conc=32 = 652). Cross-input (128/512) results are
+in Final results below.
+
 | Step | change | conc=1 | conc=32 | % vLLM | commit |
 |---|---|---|---|---|---|
-| B0 | baseline = main (per-seq scheduler, old attn kernel) | 56.7 | 106.9 | 15.3% | 08392df |
-| R1 | unified token-budget scheduler + GPU sampling | 25.0 | 87.2 | 12.5% | 5065b2e |
-| R2 | scheduler/kernel refactor (perf-neutral, Δ0) | 24.9 | 87.4 | 12.5% | 291cb74 |
-| S3 | bf16 weights + cuBLAS GEMM + FlashAttention-2 | 38.2 | **350.0** | **50.1%** | 7650654 |
-| S5 | kernel fusion: fused QKV/gate-up GEMM, add+rmsnorm, RoPE table | 39.1 | 356.1 | 51.0% | c2f98a0 |
-| S6 | FlashDecoding decode-attention kernel (split by request type) | 44.7 | **455.2** | **65.2%** | f0b1499 |
-| S7 | WMMA tensor-core prefill attention | 44.9 | **493.4** | **70.7%** | 0dd4010 |
-| S8 | attn_prefill occupancy (shrink shared, drop PVt) | 45.2 | **528.5** | **75.7%** | 392cda5 |
-| S10 | scheduler: default max-batch-tokens 2048→1024 | ~45 | **589** | **84.4%** | 642cc28 |
-| S12 | GQA-shared FlashDecoding (read K/V once per group + KV-split) | **51.3** | **608.8** | **87.2%** | 240aaa1 |
+| B0 | baseline = main (per-seq scheduler, INT8, old attn kernel) | 56.7 | 106.9 | 16% | 08392df |
+| R1 | unified token-budget scheduler + GPU sampling (still INT8) | 24.2 | 85.9 | 13% | 5065b2e |
+| R2 | scheduler/kernel refactor (perf-neutral, Δ0) | 24.1 | 85.9 | 13% | 291cb74 |
+| S3 | bf16 weights + cuBLAS GEMM + FlashAttention-2 | 37.9 | **348** | **53%** | 7650654 |
+| S5 | kernel fusion: fused QKV/gate-up GEMM, add+rmsnorm, RoPE table | 38.8 | 356 | 55% | c2f98a0 |
+| S6 | FlashDecoding decode-attention kernel (split by request type) | 44.5 | **454** | **70%** | f0b1499 |
+| S7 | WMMA tensor-core prefill attention | 44.8 | **501** | **77%** | 0dd4010 |
+| S8 | attn_prefill occupancy (shrink shared, drop PVt) | 45.0 | **531** | **81%** | 392cda5 |
+| S10 | scheduler: default max-batch-tokens 2048→1024 | 45.0 | **581** | **89%** | 642cc28 |
+| S12 | GQA-shared FlashDecoding (read K/V once per group + KV-split) | **51.2** | **604** | **93%** | 240aaa1 |
+| S14 | activation scratch → per-step bound (pool↑, KV-cliff gone) + latent WMMA OOB fix | 51.3 | 605 | **93%** | e5a99c8 |
+| — | **vLLM (no prefix cache), reference** | 55.5 | **652** | 100% | — |
+
+B0 is the original INT8 record (different branch/precision); R1→S14 are the fresh bf16 replay. S14 is
+throughput-neutral on this metric (banks a memory/robustness/correctness fix). Reverted/not-landed
+attempts S4, S9, S11, S13 are documented in the step entries, not the table.
 
 ## Step entries
+
+> Note: absolute tok/s and "→ N" gap targets *inside* the entries below are **contemporaneous** — many
+> were measured with the older harness and targeted the then-current (prefix-cache) vLLM baseline. They
+> are the development narrative; the **canonical numbers are the Progress and Final-results tables**
+> (2026-06-20 replay, vs no-cache vLLM). Relative deltas and lessons still hold.
 
 ### B0 — baseline = main (08392df)
 - **State**: per-sequence scheduler (single prefill chunk), INT8 weight-quant matmul, the original
@@ -350,14 +397,64 @@ compute/occupancy-bound prefill path. Don't retry it on prefill on this architec
   fixes the latent OOB, reclaims 0.36 GB (pool now ≈ vLLM's 40,816), and removes the cliff for
   robustness at higher concurrency / longer context.
 
-#### Fair-baseline correction (2026-06-20)
-Same-machine A/B at equal features (vLLM `--no-enable-prefix-caching`, both bf16, 0.9 mem):
-| in | FlashQwen S12/S14 | vLLM (no prefix cache) | ratio |  | vLLM (default, prefix cache) |
-|---|---|---|---|---|---|
-| 512  | 915 | 946 | **96.7%** | | 1031 |
-| 1024 | 606 | 652 | **92.9%** | | 698 |
-The long-standing "84%/698" gap was measured against vLLM **with prefix caching ON** (its default),
-which caches the bench's shared chat-template prefix (~7% free on this workload — the FlashInfer
-cascade/shared-prefix feature we lack). Against a **feature-matched** vLLM we are at **92.9% (1024) /
-96.7% (512)**. vLLM KV pool = 40,816 tokens (we are now 39,040, near parity). The residual gap is
-compute (prefill GEMM at the cuBLAS limit + longer-context attention), and shrinks at shorter inputs.
+## Final results — journey replay across input lengths (2026-06-20)
+
+Every landed step `git checkout`'d, rebuilt clean, benched at 128/512/1024 input (output 128) on one
+machine/day, vs a feature-matched vLLM (`--no-enable-prefix-caching`). Plan + driver:
+`docs/exps/2026-06-20-journey-replay.md` / `/root/bench-compare/journey_replay.sh`. Chart:
+`docs/exps/2026-06-20-journey.png`. Full CSV: `docs/exps/2026-06-20-journey.csv`.
+
+**conc=32 output tok/s (and % of feature-matched vLLM):**
+
+| step | in=128 | in=512 | in=1024 | what this step bought |
+|---|---|---|---|---|
+| R1  | 248 (18.0%) | 139 (14.7%) | 86 (13.2%)  | INT8 unified scheduler — correct but kernel-bound |
+| R2  | 247 (18.0%) | 139 (14.8%) | 86 (13.2%)  | refactor, perf-neutral |
+| **S3**  | 1094 (79.5%) | 628 (66.5%) | 348 (53.4%) | **bf16 + cuBLAS + FA2 — the engine; ~4× everywhere** |
+| S5  | 1141 (82.9%) | 648 (68.6%) | 356 (54.6%) | fused QKV/gate-up GEMM (the only fusion that paid) |
+| **S6**  | 1317 (95.7%) | 824 (87.3%) | 454 (69.6%) | **FlashDecoding — biggest lift at short input (decode)** |
+| S7  | 1326 (96.4%) | 860 (91.1%) | 501 (76.8%) | WMMA prefill attn — lifts long input (+7pt @1024) |
+| S8  | 1328 (96.5%) | 878 (93.0%) | 531 (81.5%) | prefill occupancy — lifts long input (+4.7pt @1024) |
+| S10 | 1334 (97.0%) | 882 (93.4%) | 581 (89.1%) | max-batch-tokens=1024 — **only @1024** (+7.6pt, the cliff) |
+| S12 | 1338 (97.2%) | 906 (96.0%) | 604 (92.7%) | GQA-shared decode attn — mid/long input |
+| **S14** | **1341 (97.5%)** | **908 (96.2%)** | **605 (92.8%)** | pool fix (throughput-neutral) |
+| vLLM | 1376 (100%) | 944 (100%) | 652 (100%) | feature-matched reference |
+
+**Reading the chart.** Two clean facts: (1) every optimization acts on the regime it targets and they
+don't overlap — S6 (decode attn) lifts in=128 most; S7/S8 (prefill attn) lift in=1024 most; S10 (the
+KV-cliff scheduler fix) moves *only* in=1024. (2) The gap to vLLM is monotone in input length
+(97.5% → 96.2% → 92.8%): **decode-heavy serving is at vLLM parity; the whole residual is prefill-side
+compute.**
+
+## Conclusions — what's exhausted and where the last ~7% lives
+
+At bf16 parity on a 4090, the conc=32 bottleneck was chased to ground. Levers tried and **ruled out**
+(each with data, not reasoning):
+
+- **Decode GEMM** — at ~84% of HBM peak; both engines hit the same physical floor (only quantization
+  beats it, off-table). cuBLAS `cublasGemmEx(DEFAULT)` already picks the aspect-ratio-optimal kernel
+  per shape/M (split-K auto-tuned: large-K `down` always splits, large-N `gateup`/`lm_head` never;
+  cuBLASLt autotune ties it for M≥8, wins only at M=1/conc-1). GEMM is closed for conc=32.
+- **CPU/scheduling overlap (async scheduler)** — steady-state GPU is **98.7% busy**; the per-step host
+  bubble is ~0.2%. Our 50 ms GPU steps dwarf ~0.12 ms host prep, so vLLM/SGLang-style "run one step
+  ahead" buys ~nothing here.
+- **CUDA graphs** (S11) — net-negative (−12% @conc=32): not launch-bound.
+- **KV cache size / eviction** (S14) — growing the pool *past* peak demand (zero preemption possible)
+  moved throughput by **0**. Not the bottleneck; the marginal cliff is absorbed by completion staggering.
+- **prefill attention occupancy** (S8 banked it; S9 head-split flat; S13 GQA-shared prefill 0.73×
+  *slower* — compute/occupancy-bound, can't afford the 4× O accumulator). Tapped.
+- **prefill chunk size / gpu-mem-fraction** — flat / unfair. Done.
+
+**The residual gap (in=1024 ~7%) is prefill-side compute** — the prefill GEMM is large-M and
+compute-bound at the cuBLAS limit, and our hand-rolled WMMA prefill attention, while good, is a bit
+behind vLLM's FlashAttention there. It shrinks toward 0 as input shortens (decode dominates).
+
+**Only routes past it, both off the bf16-parity table:**
+1. **Prefix caching / cascade attention** (vLLM's default; the FlashInfer shared-prefix decomposition)
+   — caches the benchmark's shared chat-template prefix for the ~7% vLLM's default enjoys, and is a
+   large win for real serving (system prompts, RAG, multi-turn). Zero benefit on random-prefix inputs.
+2. **Quantization** (fp8/int weights or fp8 KV) — directly cuts the dominant weight-traffic / prefill-
+   GEMM cost, but breaks strict bf16 parity.
+
+Net: at equal precision + equal features, FlashQwen is **92.8–97.5% of vLLM** depending on input
+length, **5.5×** over where it started, with the remaining gap localized, measured, and explained.
