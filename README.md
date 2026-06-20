@@ -111,22 +111,42 @@ toolkit (12.x), Go 1.26+, gRPC/protobuf, **cuBLAS**, and an NVIDIA GPU with ≥2
 ### Stage 3 — optimization steps (branch `perf/serving-optimization`)
 
 The detailed report — what each step changed, the bottleneck it targeted, the measured effect, and
-the dead-ends — is in [`docs/optimization.md`](docs/optimization.md). Headline progression
-(conc=32, 1024-in/128-out, % of feature-matched vLLM):
+the dead-ends — is in [`docs/optimization.md`](docs/optimization.md). Every landed step was rebuilt
+clean and benched at **128 / 512 / 1024 input** (output 128) on one machine, vs a **feature-matched
+vLLM** (`--no-enable-prefix-caching`, bf16, 0.9 mem).
 
-| Step | change | commit | % vLLM |
+**Saturated throughput (concurrency 32) — output tok/s (% of vLLM):**
+
+| Step | change | commit | in=128 | in=512 | in=1024 |
+|---|---|---|---|---|---|
+| R1 | INT8 unified token-budget scheduler + GPU sampling | `5065b2e` | 248 (18.0%) | 139 (14.7%) | 86 (13.2%) |
+| R2 | scheduler/kernel refactor (perf-neutral) | `291cb74` | 247 (18.0%) | 139 (14.8%) | 86 (13.2%) |
+| S3 | bf16 weights + cuBLAS GEMM + FlashAttention-2 | `7650654` | 1094 (79.5%) | 628 (66.5%) | 348 (53.4%) |
+| S5 | fused QKV / gate-up GEMM | `c2f98a0` | 1141 (82.9%) | 648 (68.6%) | 356 (54.6%) |
+| S6 | FlashDecoding decode-attention (split by request type) | `f0b1499` | 1317 (95.7%) | 824 (87.3%) | 454 (69.6%) |
+| S7 | WMMA tensor-core prefill attention | `0dd4010` | 1326 (96.4%) | 860 (91.1%) | 501 (76.8%) |
+| S8 | prefill-attention occupancy | `392cda5` | 1328 (96.5%) | 878 (93.0%) | 531 (81.5%) |
+| S10 | scheduler: max-batch-tokens 2048→1024 | `642cc28` | 1334 (97.0%) | 882 (93.4%) | 581 (89.1%) |
+| S12 | GQA-shared FlashDecoding (read K/V once per group) | `240aaa1` | 1338 (97.2%) | 906 (96.0%) | 604 (92.7%) |
+| **S14** | activation right-sizing + KV-pool / OOB fix | `e5a99c8` | **1341 (97.5%)** | **908 (96.2%)** | **605 (92.8%)** |
+| **vLLM** (no prefix cache) | reference | — | **1376** | **944** | **652** |
+
+**Single-stream (concurrency 1) — output tok/s:**
+
+| Step | in=128 | in=512 | in=1024 |
 |---|---|---|---|
-| baseline | bf16 unified scheduler (INT8 main = the Stage-2 starting point) | `08392df` | 13% |
-| S3 | bf16 weights + cuBLAS GEMM + FlashAttention-2 | `7650654` | 53% |
-| S5 | fused QKV / gate-up GEMM | `c2f98a0` | 55% |
-| S6 | FlashDecoding decode-attention (split by request type) | `f0b1499` | 70% |
-| S7 | WMMA tensor-core prefill attention | `0dd4010` | 77% |
-| S8 | prefill-attention occupancy | `392cda5` | 81% |
-| S10 | scheduler: max-batch-tokens 2048→1024 | `642cc28` | 89% |
-| S12 | GQA-shared FlashDecoding (read K/V once per group) | `240aaa1` | 93% |
-| S14 | activation scratch right-sizing + KV-pool / OOB fix | `e5a99c8` | 93% |
+| R1 / R2 (INT8) | 67 | 38 | 24 |
+| S3 (bf16) | 52 | 45 | 38 |
+| S6 | 56 | 51 | 44 |
+| S8 | 56 | 51 | 45 |
+| S12 | 56 | 55 | 51 |
+| **S14** | **56** | **55** | **51** |
+| **vLLM** | **58** | **57** | **55** |
 
-The gap to vLLM **shrinks as input gets shorter** (decode-heavy): at 128-token input FlashQwen is
-**97.5%** of vLLM, at 512 **96.2%**, at 1024 **92.8%**. The remaining gap is prefill-side compute.
-See the report for the full cross-input data and the levers that were measured and ruled out
-(CUDA graphs, async scheduling, KV-cache sizing, GEMM autotuning).
+Reading the data: each optimization acts on the regime it targets (S6/decode-attn lifts in=128 most;
+S7/S8/prefill-attn lift in=1024 most; S10/the KV-cliff scheduler fix moves only in=1024). The gap to
+vLLM **shrinks as input gets shorter** (more decode-heavy): **97.5% at 128, 96.2% at 512, 92.8% at
+1024** — the residual is prefill-side compute. (Baseline B0 = `main` INT8, conc=32/1024 = 107 tok/s ≈
+16%; not re-run across inputs since it is a different precision/branch.) See the report for the
+per-step analysis and the levers measured and ruled out (CUDA graphs, async scheduling, KV-cache
+sizing, GEMM autotuning).
