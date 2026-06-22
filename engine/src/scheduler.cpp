@@ -42,7 +42,13 @@ void Scheduler::acquire_prefix(Request* r) {
         bt.push_back(b);
         parent = h;
     }
-    if (nb > 0) { r->adopt_prefix(nb, bsz, parent); stat_cache_hit_tok_ += nb * bsz; }
+    if (nb > 0) {
+        r->adopt_prefix(nb, bsz, parent);
+        stat_cache_hit_tok_ += nb * bsz;
+        if (stat_cache_hit_tok_ == (long)nb * bsz)   // first hit ever: positive proof in the log
+            LOG_INFO("[prefix] first cache hit: reused %d blocks (%d tokens) of a %d-token prompt",
+                     nb, nb * bsz, r->num_tokens());
+    }
 }
 
 // After a forward advances a request: register any blocks that are now full AND fully computed into the
