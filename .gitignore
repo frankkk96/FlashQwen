@@ -14,6 +14,7 @@ compile_commands.json
 
 # Go build artifacts
 /flashqwen
+/fqbench
 # Embedded engine binary (produced by `make`, copied here for //go:embed)
 internal/supervisor/bin/flashqwen-engine
 .dl/
