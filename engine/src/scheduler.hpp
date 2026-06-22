@@ -24,6 +24,7 @@
 #include <string>
 #include <algorithm>
 #include <utility>
+#include <cstdint>
 
 // A single generation request. Inputs are set once at construction and read-only thereafter; the
 // generation state (KV residency, computed cursor, output) is private and changes only through the
@@ -43,8 +44,23 @@ public:
     int               computed()  const { return computed_; }
     int               remaining() const { return num_tokens() - computed_; }   // uncomputed (uncached) tokens
 
+    // --- prefix caching: the scheduler hashes blocks of (prompt ++ output) and chains the hashes ---
+    int      num_tokens()  const { return (int)prompt_.size() + (int)output_.size(); }
+    int      token_at(int i) const {   // the i-th committed token of (prompt ++ output)
+        int P = (int)prompt_.size();
+        return i < P ? prompt_[i] : output_[i - P];
+    }
+    int      cached_blocks() const { return cached_blocks_; }       // leading blocks already in the cache
+    void     set_cached_blocks(int n) { cached_blocks_ = n; }
+    uint64_t last_hash()     const { return last_hash_; }           // content hash of block cached_blocks_-1
+    void     set_last_hash(uint64_t h) { last_hash_ = h; }
+
     // --- state transitions driven by the scheduler / batch ---
-    void reset_for_recompute() { computed_ = 0; }          // preempted: recompute KV on resume
+    // adopt a cache-reused prefix: `nb` leading blocks (already spliced into the block table) cover
+    // nb*bsz tokens whose KV is already resident, so skip recomputing them.
+    void adopt_prefix(int nb, int bsz, uint64_t last) { computed_ = nb * bsz; cached_blocks_ = nb; last_hash_ = last; }
+    // preempted: recompute KV on resume (block table already freed) -> also drops the prefix-cache cursor
+    void reset_for_recompute() { computed_ = 0; cached_blocks_ = 0; last_hash_ = 0; }
     void advance()             { computed_ += num_new_; }  // commit the chunk emitted this step
 
     // Write this request's next n-token chunk (positions computed..computed+n-1) into the forward
@@ -73,11 +89,6 @@ public:
     }
 
 private:
-    int num_tokens() const { return (int)prompt_.size() + (int)output_.size(); }
-    int token_at(int i) const {     // the i-th committed token of (prompt ++ output)
-        int P = (int)prompt_.size();
-        return i < P ? prompt_[i] : output_[i - P];
-    }
     int  generated()  const { return (int)output_.size(); }
     int  prompt_len() const { return (int)prompt_.size(); }
     bool hit_stop_token() const {   // the last sampled token is one of the caller's stop ids
@@ -100,6 +111,10 @@ private:
     std::vector<int> block_table_;  // physical KV block ids while resident (empty when not)
     int computed_ = 0;              // tokens whose KV is cached (vLLM num_computed_tokens)
     int num_new_  = 0;              // per-step scratch: tokens to advance this step
+    // prefix-cache cursor: leading block_table_ blocks whose content hash is registered, and the hash
+    // of the last such block (the parent for hashing the next block as it fills).
+    int      cached_blocks_ = 0;
+    uint64_t last_hash_     = 0;
 };
 
 // One scheduling step's batch: the merged forward input plus the requests it runs. The per-request
@@ -131,10 +146,11 @@ struct CurrentBatch {
 
 // Scheduler tuning knobs, resolved from CLI Args in run_engine (defaults already applied).
 struct SchedulerConfig {
-    int n_slots;          // max concurrent sequences (already clamped to model.max_batch())
-    int max_queue;        // admission cap on waiting requests before rejecting as over-capacity
-    int max_batch_tokens; // total query rows computed per step
-    int max_prefill;      // per-request prefill chunk cap
+    int  n_slots;          // max concurrent sequences (already clamped to model.max_batch())
+    int  max_queue;        // admission cap on waiting requests before rejecting as over-capacity
+    int  max_batch_tokens; // total query rows computed per step
+    int  max_prefill;      // per-request prefill chunk cap
+    bool prefix_cache;     // reuse cached KV blocks for shared prompt prefixes (vLLM automatic prefix caching)
 };
 
 class Scheduler {
@@ -155,8 +171,24 @@ private:
     int  chunk_size(const Request* r, int budget) const;   // tokens to advance this step (budget+max_prefill capped)
     bool grow(Request* r, int upto_tokens);  // grow r's KV (preempting younger seqs); false => r failed+retired
 
+    void acquire_prefix(Request* r);  // on admission: reuse cached prefix blocks, advancing computed_
+    void cache_filled(Request* r);    // after a forward: register newly-full blocks into the content cache
+
     void release(Request* r);               // return a request's KV blocks to the pool (it stays alive)
     void retire(Request* r);                // request leaves for good: free its KV + drop it from running
+
+    void log_kvstat();                      // periodic cumulative KV/preemption instrumentation line
+
+    // --- instrumentation (single-threaded engine thread; plain counters) ---
+    long stat_steps_       = 0;   // non-empty scheduler steps
+    long stat_fwd_rows_    = 0;   // total query rows forwarded (prefill chunks + decode steps)
+    long stat_prefill_rows_= 0;   // of those, rows that were prefill (chunk n>1)
+    long stat_decode_rows_ = 0;   // of those, rows that were decode (chunk n==1)
+    long stat_preempt_     = 0;   // preemption events (victims chosen)
+    long stat_recomp_tok_  = 0;   // KV tokens discarded by preemption (must be recomputed on resume)
+    long stat_cache_hit_tok_ = 0; // prompt tokens skipped via prefix-cache hits (KV reused, not recomputed)
+    long stat_prompt_tok_  = 0;   // total prompt tokens admitted (denominator for the cache hit rate)
+    int  stat_peak_used_   = 0;   // peak physical blocks in use across all steps
 
     ModelRuntime& model_;
     KVCacheManager& kv_;

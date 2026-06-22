@@ -38,6 +38,12 @@ public:
         block_table.clear();
     }
 
+    // --- prefix caching: the get_computed_blocks / cache_blocks seam (driven by the Scheduler, which
+    //     owns the token ids + block-hash chaining; this layer just forwards to the pool's registry) ---
+    int  cache_lookup(uint64_t hash)        { return pool_.cache_lookup(hash); }  // hit refs the block; -1 = miss
+    void cache_insert(int b, uint64_t hash) { pool_.cache_insert(b, hash); }      // register a full block's content
+    void incref(int b)                      { pool_.incref(b); }
+
 private:
     BlockPool& pool_;
     int bsz_;

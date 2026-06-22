@@ -12,6 +12,8 @@
 #include <memory>
 #include <thread>
 #include <exception>
+#include <cstdlib>
+#include <string>
 
 using flashqwen::Engine;
 using flashqwen::GenerateRequest;
@@ -92,11 +94,15 @@ int run_engine(const Args& a, const std::string& model_id) {
         KVCacheManager kv(pool);
 
         int n_slots = std::min(a.slots, model.max_batch());   // clamp to the runtime cap
+        // Automatic prefix caching is on by default; FQ_PREFIX_CACHE=0 (or =false) disables it (A/B).
+        const char* pc = std::getenv("FQ_PREFIX_CACHE");
+        bool prefix_cache = !(pc && (std::string(pc) == "0" || std::string(pc) == "false"));
         SchedulerConfig scfg{
             n_slots,
             a.max_queue <= 0 ? 4 * n_slots : a.max_queue,
             a.max_batch_tokens,
             a.max_prefill_tokens > 0 ? a.max_prefill_tokens : a.max_batch_tokens,
+            prefix_cache,
         };
         Scheduler sched(model, kv, scfg);
 
@@ -108,8 +114,8 @@ int run_engine(const Args& a, const std::string& model_id) {
         std::unique_ptr<grpc::Server> server(builder.BuildAndStart());
         if (!server) { LOG_ERROR("[engine] failed to bind %s", a.address.c_str()); return 1; }
         LOG_INFO("[engine] ready: %d slots, max_queue %d, max_batch_tokens %d, max_prefill %d, "
-                 "gRPC on %s", scfg.n_slots, scfg.max_queue, scfg.max_batch_tokens, scfg.max_prefill,
-                 a.address.c_str());
+                 "prefix_cache %s, gRPC on %s", scfg.n_slots, scfg.max_queue, scfg.max_batch_tokens,
+                 scfg.max_prefill, scfg.prefix_cache ? "on" : "off", a.address.c_str());
 
         std::thread engine([&] { sched.run(); });   // the engine thread; runs for the process lifetime
         engine.detach();

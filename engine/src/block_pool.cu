@@ -35,9 +35,12 @@ BlockPool::BlockPool(const ModelSpec& spec, int max_ctx, float gpu_mem_fraction)
         CUDA_CHECK(cudaMalloc(&v_[l], (size_t)num_blocks_ * BLOCK * kvd * sizeof(bf16)));
     }
 
-    // Seed the free list with every block id (back() = block 0, so ids are handed out 0,1,2,...).
-    free_blocks_.reserve(num_blocks_);
-    for (int b = num_blocks_ - 1; b >= 0; --b) free_blocks_.push_back(b);
+    // Per-block bookkeeping: all blocks start reclaimable (refcount 0, no cached content) and seed the
+    // LRU free queue in id order (front = block 0, handed out first).
+    ref_cnt_.assign(num_blocks_, 0);
+    blk_hash_.assign(num_blocks_, 0);
+    pos_.assign(num_blocks_, free_lru_.end());
+    for (int b = 0; b < num_blocks_; ++b) { free_lru_.push_back(b); pos_[b] = std::prev(free_lru_.end()); }
 
     CUDA_CHECK(cudaMemGetInfo(&freeb, &totalb));
     LOG_INFO("[kv] %d blocks x %d tok = %d-token pool (max_ctx=%d). GPU mem: %.1f GB used / %.1f GB total",
