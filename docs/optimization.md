@@ -496,6 +496,65 @@ tile (the S4 lesson) and FlashQwen's SIMT decode kernel has a GQA register-reuse
 specialized kernels (S6's split-by-request-type) beat one unified mma kernel here. Full FA-vs-FlashQwen
 comparison: [`attention-vs-flashattention.md`](attention-vs-flashattention.md).
 
+### S17 — comprehensive load/data comparison vs vLLM, + a prefix-cache correctness fix (2026-06-23)
+
+A wide head-to-head of the final engine vs vLLM under strict bf16 parity (same tokenizer, max-model-len
+4096, max-num-seqs 32, gpu-mem-util 0.9, seed 1234, temp 0, warmup discarded). FlashQwen's concurrency
+ceiling is **32** (`MAX_DECODE_B`, a compile-time decode-kernel constant), so the concurrency sweep tops
+out there. Any workload with large prefix-cache hits is run **cache-off on both** to stay apples-to-apples
+(see the fix below). All numbers are `vllm bench serve` Output token throughput (tok/s).
+
+**Throughput vs input length** (out=128, conc=32; in=2048 at conc=16 — 32×2176 tok would exceed the
+39k-token KV pool):
+
+| input | FlashQwen | vLLM | **% of vLLM** |
+|---|---|---|---|
+| 128  | 1345.7 | 1386.0 | **97.1%** |
+| 512  | 944.7  | 961.3  | **98.3%** |
+| 1024 | 638.3  | 652.6  | **97.8%** |
+| 2048 (c16) | 304.9 | 331.8 | **91.9%** ← weakest (long-context prefill) |
+
+**Concurrency sweep** (in=512, out=128) and **output length** (in=512, conc=32):
+
+| conc | FQ | vLLM | % |  | output | FQ | vLLM | % |
+|---|---|---|---|---|---|---|---|---|
+| 1  | 54.9  | 56.9  | 96.4% |  | 128  | 944.7  | 961.3  | 98.3% |
+| 8  | 358.9 | 377.8 | 95.0% |  | 512  | 1200.8 | 1250.0 | 96.1% |
+| 16 | 604.7 | 626.0 | 96.6% |  | 1024 | 1132.9 | 1055.0 | **107.4%** (FQ faster) |
+| 32 | 944.7 | 961.3 | 98.3% |  | | | | |
+
+**Real data — ShareGPT** (500 prompts, conc=32, cache-off both, fixed out=128):
+
+| | FlashQwen | vLLM | **% of vLLM** |
+|---|---|---|---|
+| Output tok/s | **1170.2** | 1159.1 | **100.9%** |
+| Mean TTFT | **5.4 ms** | 118.5 ms | FQ ~22× lower |
+| Mean TPOT | 27.4 ms | 23.9 ms | vLLM 13% lower |
+
+**Three observations.** (1) **TTFT vs TPOT are complementary:** at saturation FlashQwen's TTFT is tiny
+(3–22 ms) vs vLLM's 355–1166 ms (vLLM front-loads queued chunked-prefill), while vLLM's steady-state TPOT
+is slightly lower. (2) **Long output (out=1024) flips FQ ahead by 7%** — decode-heavy, and FQ's low TTFT
+compounds over the long generation, outweighing the small TPOT deficit. (3) **in=2048 is the weakest point
+(91.9%)** — long-context prefill is still FQ's relative soft spot even after the S16 mma rewrite.
+
+**Prefix-cache effectiveness.** On a forced-shared-prefix workload (1024 shared + 128 unique, conc=32)
+vLLM's cache lifts throughput **308 → 513 tok/s (+66%)** and makes the workload fit the KV pool. On
+ShareGPT (low cross-request overlap) caching is ~neutral on both engines (FQ 1168 cache-on ≈ 1170
+cache-off ≈ 100.9% of vLLM).
+
+**Bug found & fixed (commit `aaf4e0d`).** The matrix surfaced a correctness defect: with `FQ_PREFIX_CACHE=1`,
+requests with a *large* prefix-cache hit returned empty completions (or a 502). Root cause: the S16 prefill
+kernel's **cp.async double-buffered prefetch** had a timing hazard that only manifested in the engine's
+back-to-back multi-layer launch context and only on the cache-hit / chunked-tail shape (few query rows +
+many K/V tiles — a shape a fresh prefill never produces). Diagnosis: `FQ_PREFILL_V2=0` (WMMA) was clean, a
+stream sync between kernels was clean, and the isolated kernel under `compute-sanitizer --tool racecheck`
+was clean — i.e. an inter-kernel async hazard, not an intra-kernel race. Fix: **single-buffer synchronous
+cp.async staging** (kept register-O + mma.sync + block-shared K/V reuse; the overlap was worth only ~0.9%
+e2e, and 1024/conc32 cache-off perf is unchanged at 639). Post-fix, cache-on is correct and stable at
+conc=32 on real ShareGPT (500/500, 0 failures), and prefix hits up to ~88 blocks return correct output.
+(A separately-suspected "conc=32 cache-on hang" turned out to be a benchmark-harness artifact — rapid
+server restarts OOM'd the next engine at startup — not an engine bug.)
+
 ## Final results — journey replay across input lengths (2026-06-20)
 
 Every landed step `git checkout`'d, rebuilt clean, benched at 128/512/1024 input (output 128) on one

@@ -448,6 +448,59 @@ GPU → 减半 → ~5% 实现）；cp.async 只加了最后 ~0.9%（一旦头一
 专用 kernel（S6 的 split-by-request-type）在这里胜过一个统一 mma kernel。完整的 FA-vs-FlashQwen
 对比：[`attention-vs-flashattention.md`](attention-vs-flashattention.md)。
 
+### S17 — 与 vLLM 的全负载/全数据综合对比 + 一个 prefix-cache 正确性修复 (2026-06-23)
+
+在严格 bf16 parity 下(同 tokenizer、max-model-len 4096、max-num-seqs 32、gpu-mem-util 0.9、seed 1234、
+temp 0、warmup 丢弃)对最终引擎与 vLLM 做一次宽口径正面对比。FlashQwen 的并发上限是 **32**
+(`MAX_DECODE_B`,decode kernel 的编译期常量),所以并发扫描封顶在 32。任何会产生大 prefix-cache 命中的
+负载都在**两边都 cache-off** 下跑以保证公平(见下方修复说明)。所有数字均为 `vllm bench serve` 的
+Output token throughput (tok/s)。
+
+**吞吐 vs 输入长度**(out=128, conc=32;in=2048 用 conc=16——32×2176 token 会超出 39k 的 KV pool):
+
+| input | FlashQwen | vLLM | **% of vLLM** |
+|---|---|---|---|
+| 128  | 1345.7 | 1386.0 | **97.1%** |
+| 512  | 944.7  | 961.3  | **98.3%** |
+| 1024 | 638.3  | 652.6  | **97.8%** |
+| 2048 (c16) | 304.9 | 331.8 | **91.9%** ← 最弱(长上下文 prefill) |
+
+**并发扫描**(in=512, out=128)与**输出长度**(in=512, conc=32):
+
+| conc | FQ | vLLM | % |  | output | FQ | vLLM | % |
+|---|---|---|---|---|---|---|---|---|
+| 1  | 54.9  | 56.9  | 96.4% |  | 128  | 944.7  | 961.3  | 98.3% |
+| 8  | 358.9 | 377.8 | 95.0% |  | 512  | 1200.8 | 1250.0 | 96.1% |
+| 16 | 604.7 | 626.0 | 96.6% |  | 1024 | 1132.9 | 1055.0 | **107.4%**(FQ 更快) |
+| 32 | 944.7 | 961.3 | 98.3% |  | | | | |
+
+**真实数据 — ShareGPT**(500 prompts, conc=32, 两边 cache-off, 固定 out=128):
+
+| | FlashQwen | vLLM | **% of vLLM** |
+|---|---|---|---|
+| Output tok/s | **1170.2** | 1159.1 | **100.9%** |
+| Mean TTFT | **5.4 ms** | 118.5 ms | FQ 约低 22× |
+| Mean TPOT | 27.4 ms | 23.9 ms | vLLM 低 13% |
+
+**三点观察。**(1)**TTFT 与 TPOT 互补:** 饱和时 FlashQwen 的 TTFT 极低(3–22 ms),vLLM 为 355–1166 ms
+(vLLM 把排队的 chunked-prefill 前置),而 vLLM 的稳态 TPOT 略低。(2)**长输出(out=1024)FQ 反超 7%**——
+decode 密集,FQ 的低 TTFT 在长生成里累积,盖过了 TPOT 的小劣势。(3)**in=2048 是最弱点(91.9%)**——
+即便经过 S16 的 mma 重写,长上下文 prefill 仍是 FQ 的相对短板。
+
+**Prefix-cache 收益。** 在强制共享前缀的负载上(1024 共享 + 128 独有, conc=32),vLLM 的缓存把吞吐从
+**308 提升到 513 tok/s(+66%)**,并让该负载能放进 KV pool。在 ShareGPT(跨请求重叠很少)上,两边缓存
+基本中性(FQ cache-on 1168 ≈ cache-off 1170 ≈ vLLM 的 100.9%)。
+
+**发现并修复的 bug(commit `aaf4e0d`)。** 这次矩阵暴露了一个正确性缺陷:`FQ_PREFIX_CACHE=1` 时,带**大**
+prefix-cache 命中的请求返回空补全(或 502)。根因:S16 的 prefill kernel 里 **cp.async 双缓冲预取**有个时序
+hazard,只在引擎逐层背靠背启动的真实上下文里、且只在 cache-hit/chunked-tail 形状下(少 query 行 + 多 K/V
+tile——全新 prefill 永远不会产生这个形状)触发。诊断:`FQ_PREFILL_V2=0`(WMMA)正常、kernel 间插 stream
+sync 正常、隔离单 kernel 在 `compute-sanitizer --tool racecheck` 下干净——即**跨 kernel 异步 hazard**,不是
+kernel 内竞争。修复:**单缓冲同步 cp.async staging**(保留 register-O + mma.sync + block-shared K/V 复用;
+overlap 本来只值 ~0.9% e2e,且 1024/conc32 cache-off 吞吐不变,仍 639)。修复后,cache-on 在 conc=32 真实
+ShareGPT 上正确稳定(500/500,0 失败),命中到 ~88 block 的前缀也输出正确。(另外曾怀疑的"conc=32 cache-on
+挂起"经查是压测脚本的 harness 假象——频繁重启 server 导致下一个引擎在启动时 OOM——并非引擎 bug。)
+
 ## Final results — journey replay across input lengths (2026-06-20)
 
 每个落地步骤都 `git checkout`、干净重建、在 128/512/1024 input（output 128）下于同一
