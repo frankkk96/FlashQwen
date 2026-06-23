@@ -1,0 +1,44 @@
+# Pure Google C++ lint. Run over host translation units (.cpp + the .hpp they
+# pull in); .cu/.cuh device code is covered by clang-format only (clang-tidy
+# would need a clang CUDA toolchain to parse nvcc command lines — see scripts/lint.sh).
+Checks: >
+  bugprone-*,
+  performance-*,
+  clang-analyzer-*,
+  google-*,
+  modernize-use-override,
+  modernize-use-nullptr,
+  modernize-use-using,
+  readability-identifier-naming,
+  -bugprone-easily-swappable-parameters,
+  -google-runtime-references,
+  -google-readability-todo,
+  -clang-analyzer-security.insecureAPI.*
+
+WarningsAsErrors: ''
+HeaderFilterRegex: 'engine/src/.*\.(hpp|cuh)$'
+FormatStyle: file
+
+# Google identifier conventions. These flag (as warnings) the project's current
+# snake_case functions / SHOUTY constants so a follow-up rename can make the code
+# fully Google. Disable any single rule here if you decide to keep an idiom.
+CheckOptions:
+  - { key: readability-identifier-naming.NamespaceCase,          value: lower_case }
+  - { key: readability-identifier-naming.ClassCase,              value: CamelCase  }
+  - { key: readability-identifier-naming.StructCase,             value: CamelCase  }
+  - { key: readability-identifier-naming.TypeAliasCase,          value: CamelCase  }
+  - { key: readability-identifier-naming.TypedefCase,            value: CamelCase  }
+  - { key: readability-identifier-naming.EnumCase,               value: CamelCase  }
+  - { key: readability-identifier-naming.FunctionCase,           value: CamelCase  }
+  - { key: readability-identifier-naming.VariableCase,           value: lower_case }
+  - { key: readability-identifier-naming.ParameterCase,          value: lower_case }
+  - { key: readability-identifier-naming.MemberCase,             value: lower_case }
+  - { key: readability-identifier-naming.PrivateMemberSuffix,    value: _          }
+  - { key: readability-identifier-naming.ProtectedMemberSuffix,  value: _          }
+  - { key: readability-identifier-naming.EnumConstantCase,       value: CamelCase  }
+  - { key: readability-identifier-naming.EnumConstantPrefix,     value: k          }
+  - { key: readability-identifier-naming.ConstexprVariableCase,  value: CamelCase  }
+  - { key: readability-identifier-naming.ConstexprVariablePrefix, value: k         }
+  - { key: readability-identifier-naming.GlobalConstantCase,     value: CamelCase  }
+  - { key: readability-identifier-naming.GlobalConstantPrefix,   value: k          }
+  - { key: readability-identifier-naming.MacroDefinitionCase,    value: UPPER_CASE }

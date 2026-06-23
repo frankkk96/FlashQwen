@@ -1,0 +1,11 @@
+# Pre-commit hooks for the C++/CUDA engine. Install once with:
+#   pip install pre-commit && pre-commit install
+# clang-format runs on every commit (fast, deterministic, auto-fixes layout).
+# clang-tidy is intentionally NOT a commit hook — it needs build/compile_commands.json
+# and is slow; run it via `scripts/lint.sh tidy` or in CI instead.
+repos:
+  - repo: https://github.com/pre-commit/mirrors-clang-format
+    rev: v14.0.6
+    hooks:
+      - id: clang-format
+        files: ^engine/src/.*\.(cpp|hpp|cu|cuh)$

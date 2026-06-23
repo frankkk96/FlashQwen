@@ -1,0 +1,8 @@
+# Pure Google C++ style (80 columns). Applies to .cpp/.hpp and CUDA .cu/.cuh
+# (clang-format treats CUDA as C++ for layout — it does not parse device code).
+BasedOnStyle: Google
+Standard: c++17
+ColumnLimit: 80
+# Pin pointer alignment so it never depends on per-file heuristics: `bf16* x`.
+DerivePointerAlignment: false
+PointerAlignment: Left
