@@ -20,4 +20,4 @@ internal/supervisor/bin/flashqwen-engine
 .dl/
 
 # experiment notes / scratch docs (local only)
-/exps/
+exps/
