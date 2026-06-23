@@ -44,7 +44,6 @@ class KVCacheManager {
     return pool_.CacheLookup(hash);
   }  // hit refs the block; -1 = miss
   void CacheInsert(int b, uint64_t hash) { pool_.CacheInsert(b, hash); }
-  void Incref(int b) { pool_.Incref(b); }
 
  private:
   BlockPool& pool_;

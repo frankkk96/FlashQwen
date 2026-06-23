@@ -32,7 +32,6 @@ class BlockPool {
 
   int BlockSize() const { return BLOCK; }
   int NumBlocks() const { return num_blocks_; }
-  int MaxBlocksPerSeq() const { return max_blocks_; }  // ceil(max_ctx / BLOCK)
 
   // Block bookkeeping: refcounted + prefix-cache-aware (vLLM-style). Each block
   // has a refcount and optionally the content hash of the KV it holds. A
@@ -58,10 +57,6 @@ class BlockPool {
     out = b;
     return true;
   }
-  void Incref(int b) {
-    ++ref_cnt_[b];
-  }  // share a held block (e.g. reused prefix)
-
   void FreeOne(int b) {  // refcount-1; at 0 returns to LRU tail (mapping kept)
     if (--ref_cnt_[b] == 0) {
       free_lru_.push_back(b);

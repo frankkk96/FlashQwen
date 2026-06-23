@@ -35,7 +35,6 @@ struct ForwardInput {
     sample_params.clear();
   }
   int NumRows() const { return (int)tokens.size(); }
-  int NumRequests() const { return (int)block_tables.size(); }
 
   // Append primitives: callers build the batch through these, not the raw
   // vectors. Register a request's block table; returns its row index.
@@ -81,7 +80,6 @@ class ModelRuntime {
   // logits_rows.size().
   void Forward(const ForwardInput& in, std::vector<int>& out_tokens);
 
-  const ModelSpec& Spec() const { return spec_; }
   int MaxCtx() const { return max_ctx_; }
   int MaxBatch() const { return MAX_DECODE_B; }  // concurrent request cap
 
