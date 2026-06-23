@@ -13,25 +13,24 @@ Checks: >
   -bugprone-easily-swappable-parameters,
   -google-runtime-references,
   -google-readability-todo,
+  -google-readability-braces-around-statements,
   -clang-analyzer-security.insecureAPI.*
 
 WarningsAsErrors: ''
 HeaderFilterRegex: 'engine/src/.*\.(hpp|cuh)$'
 FormatStyle: file
 
-# Google identifier conventions. These flag (as warnings) the project's current
-# snake_case functions / SHOUTY constants so a follow-up rename can make the code
-# fully Google. Disable any single rule here if you decide to keep an idiom.
+# Google identifier conventions. Deliberate exemptions for this engine's idioms:
+#  - no Variable/Parameter case rule: keeps the BLAS-convention dimension names
+#    (M, N, K, H, IN, OUT, ...) used throughout the GEMM/kernel code.
+#  - no TypeAlias/Typedef case rule: keeps the primitive-like alias `bf16`.
+# Functions/types/members/constants are still enforced (PascalCase / kConstants).
 CheckOptions:
   - { key: readability-identifier-naming.NamespaceCase,          value: lower_case }
   - { key: readability-identifier-naming.ClassCase,              value: CamelCase  }
   - { key: readability-identifier-naming.StructCase,             value: CamelCase  }
-  - { key: readability-identifier-naming.TypeAliasCase,          value: CamelCase  }
-  - { key: readability-identifier-naming.TypedefCase,            value: CamelCase  }
   - { key: readability-identifier-naming.EnumCase,               value: CamelCase  }
   - { key: readability-identifier-naming.FunctionCase,           value: CamelCase  }
-  - { key: readability-identifier-naming.VariableCase,           value: lower_case }
-  - { key: readability-identifier-naming.ParameterCase,          value: lower_case }
   - { key: readability-identifier-naming.MemberCase,             value: lower_case }
   - { key: readability-identifier-naming.PrivateMemberSuffix,    value: _          }
   - { key: readability-identifier-naming.ProtectedMemberSuffix,  value: _          }

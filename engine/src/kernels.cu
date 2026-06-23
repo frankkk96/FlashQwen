@@ -5,7 +5,7 @@
 
 #include "kernels.cuh"
 #include "kv_cache.cuh"  // KvPhysRow: paged-KV addressing contract (shared with block_pool.cu)
-using namespace nvcuda;
+namespace wmma = nvcuda::wmma;
 
 // gemm: linear layers via cuBLAS (BF16 in / FP32 accumulate). Row-major <->
 // column-major derivation is in kernels.cuh.
@@ -153,9 +153,10 @@ void LaunchHeadNormRope(bf16* buf, const float* w, const float* cos_tab,
 // ==== Paged-KV attention ====
 // Split by request type (dispatched from RunLayers): prefill (q_len>1) ->
 // AttnPrefill (tensor cores), decode (q_len==1) -> AttnDecode (FlashDecoding).
-// Both read the paged KV pool [num_blocks, BLOCK, kv_dim] via per-request block
-// tables `bt` (stride max_blocks); q comes from the fused-QKV buffer at row
-// stride q_stride. `rids[grid_slot]` -> request id, so each runs on its subset.
+// Both read the paged KV pool [num_blocks, kBlock, kv_dim] via per-request
+// block tables `bt` (stride max_blocks); q comes from the fused-QKV buffer at
+// row stride q_stride. `rids[grid_slot]` -> request id, so each runs on its
+// subset.
 
 // decode: one block per (head, decode-request). NW warps split KV [0,qpos] into
 // strided slices (warp w takes positions w, w+NW, ...), each online-softmaxing
@@ -413,7 +414,7 @@ void LaunchAttnDecode(const bf16* q, int q_stride, const bf16* cache_k,
     // the worst case).
     static float *pm = nullptr, *pl = nullptr, *pa = nullptr;
     if (!pm) {
-      size_t nent = (size_t)MAX_DECODE_B * 64 /*heads guard*/ * MAX_KSPLIT;
+      size_t nent = (size_t)kMaxDecodeB * 64 /*heads guard*/ * MAX_KSPLIT;
       cudaMalloc(&pm, nent * sizeof(float));
       cudaMalloc(&pl, nent * sizeof(float));
       cudaMalloc(&pa, nent * 128 * sizeof(float));

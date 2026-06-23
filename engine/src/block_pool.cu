@@ -9,16 +9,16 @@ BlockPool::BlockPool(const ModelSpec& spec, int max_ctx,
                      float gpu_mem_fraction) {
   int kvd = spec.KvDim();
   max_blocks_ =
-      (max_ctx + BLOCK - 1) / BLOCK;  // block-table len for a full seq
+      (max_ctx + kBlock - 1) / kBlock;  // block-table len for a full seq
 
-  // Pool = VRAM left under the gpu_mem_fraction cap, carved into BLOCK-token
+  // Pool = VRAM left under the gpu_mem_fraction cap, carved into kBlock-token
   // blocks handed out on demand, so concurrency is decoupled from max_ctx.
   size_t freeb, totalb;
   CUDA_CHECK(cudaMemGetInfo(&freeb, &totalb));
   size_t used = totalb - freeb;
   size_t budget = (size_t)(totalb * gpu_mem_fraction);
   size_t kv_avail = budget > used ? budget - used : 0;
-  size_t per_block = (size_t)spec.num_layers * 2 * BLOCK * kvd * sizeof(bf16);
+  size_t per_block = (size_t)spec.num_layers * 2 * kBlock * kvd * sizeof(bf16);
   num_blocks_ = (int)(kv_avail / per_block);
   if (num_blocks_ < max_blocks_) {
     char msg[256];
@@ -36,9 +36,9 @@ BlockPool::BlockPool(const ModelSpec& spec, int max_ctx,
   v_.resize(spec.num_layers);
   for (int l = 0; l < spec.num_layers; ++l) {
     CUDA_CHECK(
-        cudaMalloc(&k_[l], (size_t)num_blocks_ * BLOCK * kvd * sizeof(bf16)));
+        cudaMalloc(&k_[l], (size_t)num_blocks_ * kBlock * kvd * sizeof(bf16)));
     CUDA_CHECK(
-        cudaMalloc(&v_[l], (size_t)num_blocks_ * BLOCK * kvd * sizeof(bf16)));
+        cudaMalloc(&v_[l], (size_t)num_blocks_ * kBlock * kvd * sizeof(bf16)));
   }
 
   // All blocks start reclaimable (refcount 0, uncached); seed the LRU queue in
@@ -55,8 +55,8 @@ BlockPool::BlockPool(const ModelSpec& spec, int max_ctx,
   LOG_INFO(
       "[kv] %d blocks x %d tok = %d-token pool (max_ctx=%d). GPU mem: %.1f GB "
       "used / %.1f GB total",
-      num_blocks_, BLOCK, num_blocks_ * BLOCK, max_ctx, (totalb - freeb) / 1e9,
-      totalb / 1e9);
+      num_blocks_, kBlock, num_blocks_ * kBlock, max_ctx,
+      (totalb - freeb) / 1e9, totalb / 1e9);
 }
 
 BlockPool::~BlockPool() {

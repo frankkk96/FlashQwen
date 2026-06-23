@@ -114,7 +114,7 @@ ModelRuntime::ModelRuntime(const ModelSpec& spec, const RuntimeConfig& cfg)
       LOG_INFO("[model] uploaded layer %d/%d", l + 1, spec_.num_layers);
   }
 
-  // Activation scratch is sized to max_rows_; sampling buffers to MAX_DECODE_B
+  // Activation scratch is sized to max_rows_; sampling buffers to kMaxDecodeB
   // (at most one logits row per request).
   int H = spec_.hidden_size, QD = spec_.QDim(), I = spec_.intermediate,
       V = spec_.vocab_size;
@@ -130,33 +130,33 @@ ModelRuntime::ModelRuntime(const ModelSpec& spec, const RuntimeConfig& cfg)
   bmalloc(&attn_, (size_t)max_rows_ * QD);
   bmalloc(&gateup_, (size_t)max_rows_ * 2 * I);
   bmalloc(&hmlp_, (size_t)max_rows_ * I);
-  bmalloc(&xg_, (size_t)MAX_DECODE_B * H);  // gathered sampling rows
+  bmalloc(&xg_, (size_t)kMaxDecodeB * H);  // gathered sampling rows
   CUDA_CHECK(cudaMalloc(
-      &logits_, (size_t)MAX_DECODE_B * V * sizeof(float)));  // [S, vocab] FP32
+      &logits_, (size_t)kMaxDecodeB * V * sizeof(float)));  // [S, vocab] FP32
   CUDA_CHECK(cudaMalloc(&d_ids_, max_rows_ * sizeof(int)));
   CUDA_CHECK(cudaMalloc(&d_pos_, max_rows_ * sizeof(int)));
   CUDA_CHECK(cudaMalloc(&d_req_, max_rows_ * sizeof(int)));
-  CUDA_CHECK(cudaMalloc(&d_qstart_, MAX_DECODE_B * sizeof(int)));
-  CUDA_CHECK(cudaMalloc(&d_qlen_, MAX_DECODE_B * sizeof(int)));
-  CUDA_CHECK(cudaMalloc(&d_decode_rids_, MAX_DECODE_B * sizeof(int)));
-  CUDA_CHECK(cudaMalloc(&d_prefill_rids_, MAX_DECODE_B * sizeof(int)));
-  // Paged-KV block tables: up to MAX_DECODE_B requests, padded to the longest.
-  max_blocks_ = (max_ctx_ + BlockPool::BLOCK - 1) / BlockPool::BLOCK;
+  CUDA_CHECK(cudaMalloc(&d_qstart_, kMaxDecodeB * sizeof(int)));
+  CUDA_CHECK(cudaMalloc(&d_qlen_, kMaxDecodeB * sizeof(int)));
+  CUDA_CHECK(cudaMalloc(&d_decode_rids_, kMaxDecodeB * sizeof(int)));
+  CUDA_CHECK(cudaMalloc(&d_prefill_rids_, kMaxDecodeB * sizeof(int)));
+  // Paged-KV block tables: up to kMaxDecodeB requests, padded to the longest.
+  max_blocks_ = (max_ctx_ + BlockPool::kBlock - 1) / BlockPool::kBlock;
   CUDA_CHECK(
-      cudaMalloc(&d_bt_, (size_t)MAX_DECODE_B * max_blocks_ * sizeof(int)));
-  CUDA_CHECK(cudaMalloc(&d_lrows_, MAX_DECODE_B * sizeof(int)));
-  CUDA_CHECK(cudaMalloc(&d_arg_, MAX_DECODE_B * sizeof(int)));
-  CUDA_CHECK(cudaMalloc(&d_invT_, MAX_DECODE_B * sizeof(float)));
-  CUDA_CHECK(cudaMalloc(&d_topp_, MAX_DECODE_B * sizeof(float)));
-  CUDA_CHECK(cudaMalloc(&d_u_, MAX_DECODE_B * sizeof(float)));
-  host_bt_.resize((size_t)MAX_DECODE_B * max_blocks_);
-  host_qstart_.resize(MAX_DECODE_B);
-  host_qlen_.resize(MAX_DECODE_B);
-  host_decode_rids_.resize(MAX_DECODE_B);
-  host_prefill_rids_.resize(MAX_DECODE_B);
-  host_invT_.resize(MAX_DECODE_B);
-  host_topp_.resize(MAX_DECODE_B);
-  host_u_.resize(MAX_DECODE_B);
+      cudaMalloc(&d_bt_, (size_t)kMaxDecodeB * max_blocks_ * sizeof(int)));
+  CUDA_CHECK(cudaMalloc(&d_lrows_, kMaxDecodeB * sizeof(int)));
+  CUDA_CHECK(cudaMalloc(&d_arg_, kMaxDecodeB * sizeof(int)));
+  CUDA_CHECK(cudaMalloc(&d_invT_, kMaxDecodeB * sizeof(float)));
+  CUDA_CHECK(cudaMalloc(&d_topp_, kMaxDecodeB * sizeof(float)));
+  CUDA_CHECK(cudaMalloc(&d_u_, kMaxDecodeB * sizeof(float)));
+  host_bt_.resize((size_t)kMaxDecodeB * max_blocks_);
+  host_qstart_.resize(kMaxDecodeB);
+  host_qlen_.resize(kMaxDecodeB);
+  host_decode_rids_.resize(kMaxDecodeB);
+  host_prefill_rids_.resize(kMaxDecodeB);
+  host_invT_.resize(kMaxDecodeB);
+  host_topp_.resize(kMaxDecodeB);
+  host_u_.resize(kMaxDecodeB);
   CUDA_CHECK(cudaStreamCreate(&stream_));
   CUBLAS_CHECK(cublasCreate(&cublas_));
   CUBLAS_CHECK(cublasSetStream(cublas_, stream_));

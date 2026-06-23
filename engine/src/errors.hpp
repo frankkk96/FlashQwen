@@ -4,6 +4,6 @@
 #pragma once
 
 enum class EngineErrc {
-  OverCapacity,  // KV pool exhausted or queue full; retryable (Go -> HTTP 503)
-  Internal,      // unexpected engine failure (Go -> HTTP 502)
+  kOverCapacity,  // KV pool exhausted or queue full; retryable (Go -> HTTP 503)
+  kInternal,      // unexpected engine failure (Go -> HTTP 502)
 };

@@ -37,7 +37,7 @@ using bf16 = __nv_bfloat16;
 
 // Max concurrent sequences (sizes sampling / block-table buffers). One logits
 // row per request.
-constexpr int MAX_DECODE_B = 32;
+constexpr int kMaxDecodeB = 32;
 
 // y[M,OUT] = x[M,IN] @ W[OUT,IN]^T via cuBLAS (BF16 in / FP32 accumulate).
 // cuBLAS is column-major, so row-major W/x map to column-major Wc[IN,OUT] /
@@ -72,7 +72,7 @@ void LaunchHeadNormRope(bf16* buf, const float* w, const float* cos_tab,
                         cudaStream_t s);
 
 // ---- Paged-KV attention ----
-// A layer's KV pool is [num_blocks, BLOCK, kv_dim] BF16; a sequence's KV is a
+// A layer's KV pool is [num_blocks, kBlock, kv_dim] BF16; a sequence's KV is a
 // list of physical block ids (its block table). Logical->physical addressing
 // lives in kv_cache.cuh (KvPhysRow), the write side in block_pool.*. `bt` holds
 // one block table per request (stride `max_blocks`).
@@ -84,7 +84,7 @@ void LaunchHeadNormRope(bf16* buf, const float* w, const float* cos_tab,
 // [0, pos] (causal); `rids[grid_slot]` -> request id (R / n_decode entries).
 
 // Prefill (q_len>1): tensor-core FlashAttention-2 (see kernels.cu). Requires
-// head_dim==128 and block_size==16 (Qwen3 + BlockPool::BLOCK). max_qlen sets
+// head_dim==128 and block_size==16 (Qwen3 + BlockPool::kBlock). max_qlen sets
 // the q-tile grid.
 void LaunchAttnPrefill(const bf16* q, int q_stride, const bf16* cache_k,
                        const bf16* cache_v, bf16* out, int n_heads, int n_kv,

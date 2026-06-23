@@ -34,13 +34,13 @@ struct ForwardInput {
     block_tables.clear();
     sample_params.clear();
   }
-  int NumRows() const { return (int)tokens.size(); }
+  int NumRows() const { return static_cast<int>(tokens.size()); }
 
   // Append primitives: callers build the batch through these, not the raw
   // vectors. Register a request's block table; returns its row index.
   int AddRequest(std::vector<int> block_table) {
     block_tables.push_back(std::move(block_table));
-    return (int)block_tables.size() - 1;
+    return static_cast<int>(block_tables.size()) - 1;
   }
   void AddRow(int token, int position,
               int req) {  // one query row of request `req`
@@ -50,7 +50,7 @@ struct ForwardInput {
   }
   // Flag the last appended row for sampling, with its sampling params.
   void SampleLastRow(SampleParams sp) {
-    logits_rows.push_back((int)tokens.size() - 1);
+    logits_rows.push_back(static_cast<int>(tokens.size()) - 1);
     sample_params.push_back(sp);
   }
 };
@@ -81,7 +81,7 @@ class ModelRuntime {
   void Forward(const ForwardInput& in, std::vector<int>& out_tokens);
 
   int MaxCtx() const { return max_ctx_; }
-  int MaxBatch() const { return MAX_DECODE_B; }  // concurrent request cap
+  int MaxBatch() const { return kMaxDecodeB; }  // concurrent request cap
 
  private:
   struct Layer {
@@ -107,7 +107,7 @@ class ModelRuntime {
   int max_ctx_ = 4096;
   int max_rows_ =
       4096;  // max query rows in one forward = max(max_ctx, max_batch_tokens)
-  int max_blocks_ = 0;  // ceil(max_ctx / BlockPool::BLOCK) = max block-table
+  int max_blocks_ = 0;  // ceil(max_ctx / BlockPool::kBlock) = max block-table
                         // length per request
   int bt_stride_ = 0;   // current block-table row stride uploaded to d_bt_
 
@@ -126,7 +126,7 @@ class ModelRuntime {
   // [max_rows, QDim+2*KvDim]; gateup_ = fused gate|up [max_rows,
   // 2*intermediate].
   bf16 *x_, *xb_, *xb2_, *qkv_, *attn_, *gateup_, *hmlp_;
-  bf16* xg_ = nullptr;  // gathered sampling rows [MAX_DECODE_B, H] before final
+  bf16* xg_ = nullptr;  // gathered sampling rows [kMaxDecodeB, H] before final
                         // norm + lm_head
   float* logits_ = nullptr;  // [S, vocab] FP32 (lm_head output -> sampling)
   int *d_ids_, *d_pos_,

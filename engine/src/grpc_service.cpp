@@ -55,7 +55,7 @@ class ServiceImpl final : public Engine::Service {
     std::vector<int> stop_ids(req->stop_token_ids().begin(),
                               req->stop_token_ids().end());
     int max_new = req->max_tokens() > 0 ? req->max_tokens() : kDefaultMaxTokens;
-    int room = max_ctx_ - (int)prompt.size();
+    int room = max_ctx_ - static_cast<int>(prompt.size());
     if (room < 1) room = 1;
     SampleParams sp{req->temperature(),
                     req->top_p() > 0.f ? req->top_p() : 1.0f};

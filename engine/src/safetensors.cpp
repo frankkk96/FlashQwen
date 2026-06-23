@@ -28,22 +28,22 @@ void SafeTensors::MapShard(const std::string& path) {
     close(fd);
     throw std::runtime_error("fstat failed: " + path);
   }
-  size_t fsize = (size_t)st.st_size;
+  size_t fsize = static_cast<size_t>(st.st_size);
 
   void* base = mmap(nullptr, fsize, PROT_READ, MAP_PRIVATE, fd, 0);
   close(fd);
   if (base == MAP_FAILED) throw std::runtime_error("mmap failed: " + path);
   mappings_.emplace_back(base, fsize);
 
-  const uint8_t* bytes = (const uint8_t*)base;
+  const uint8_t* bytes = static_cast<const uint8_t*>(base);
   uint64_t header_len;
   std::memcpy(&header_len, bytes,
               8);  // LE header length; assumes LE host (x86)
-  const char* json_begin = (const char*)(bytes + 8);
+  const char* json_begin = reinterpret_cast<const char*>(bytes + 8);
   const uint8_t* data_begin = bytes + 8 + header_len;
 
   rapidjson::Document root;
-  root.Parse(json_begin, (size_t)header_len);
+  root.Parse(json_begin, static_cast<size_t>(header_len));
   if (root.HasParseError() || !root.IsObject())
     throw std::runtime_error("invalid safetensors header: " + path);
   for (auto& kv : root.GetObject()) {
@@ -56,7 +56,7 @@ void SafeTensors::MapShard(const std::string& path) {
     int64_t begin = meta["data_offsets"][0].GetInt64();
     int64_t end = meta["data_offsets"][1].GetInt64();
     tv.data = data_begin + begin;
-    tv.nbytes = (size_t)(end - begin);
+    tv.nbytes = static_cast<size_t>(end - begin);
     tensors_[name] = tv;
   }
 }
@@ -78,5 +78,10 @@ void SafeTensors::LoadDir(const std::string& dir) {
   } else {
     shards.insert("model.safetensors");
   }
-  for (auto& shard : shards) MapShard(dir + "/" + shard);
+  for (auto& shard : shards) {
+    std::string path = dir;
+    path += '/';
+    path += shard;
+    MapShard(path);
+  }
 }

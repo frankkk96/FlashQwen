@@ -57,9 +57,11 @@ class Request {
 
   // --- prefix caching: scheduler hashes blocks of (prompt ++ output), chained
   // ---
-  int NumTokens() const { return (int)prompt_.size() + (int)output_.size(); }
+  int NumTokens() const {
+    return static_cast<int>(prompt_.size()) + static_cast<int>(output_.size());
+  }
   int TokenAt(int i) const {  // i-th committed token of (prompt ++ output)
-    int P = (int)prompt_.size();
+    int P = static_cast<int>(prompt_.size());
     return i < P ? prompt_[i] : output_[i - P];
   }
   int CachedBlocks() const {
@@ -118,8 +120,8 @@ class Request {
   }
 
  private:
-  int Generated() const { return (int)output_.size(); }
-  int PromptLen() const { return (int)prompt_.size(); }
+  int Generated() const { return static_cast<int>(output_.size()); }
+  int PromptLen() const { return static_cast<int>(prompt_.size()); }
   bool HitStopToken()
       const {  // last sampled token is one of the caller's stop ids
     return !output_.empty() && std::find(stop_ids_.begin(), stop_ids_.end(),
@@ -231,17 +233,19 @@ class Scheduler {
   void LogKvstat();  // periodic cumulative KV/preemption instrumentation line
 
   // --- instrumentation (single-threaded engine thread; plain counters) ---
-  long stat_steps_ = 0;  // non-empty scheduler steps
-  long stat_fwd_rows_ =
+  int64_t stat_steps_ = 0;  // non-empty scheduler steps
+  int64_t stat_fwd_rows_ =
       0;  // total query rows forwarded (prefill chunks + decode steps)
-  long stat_prefill_rows_ = 0;  // of those, rows that were prefill (chunk n>1)
-  long stat_decode_rows_ = 0;   // of those, rows that were decode (chunk n==1)
-  long stat_preempt_ = 0;       // preemption events (victims chosen)
-  long stat_recomp_tok_ =
+  int64_t stat_prefill_rows_ =
+      0;  // of those, rows that were prefill (chunk n>1)
+  int64_t stat_decode_rows_ =
+      0;                      // of those, rows that were decode (chunk n==1)
+  int64_t stat_preempt_ = 0;  // preemption events (victims chosen)
+  int64_t stat_recomp_tok_ =
       0;  // KV tokens discarded by preemption (must be recomputed on resume)
-  long stat_cache_hit_tok_ = 0;  // prompt tokens skipped via prefix-cache hits
-                                 // (KV reused, not recomputed)
-  long stat_prompt_tok_ =
+  int64_t stat_cache_hit_tok_ = 0;  // prompt tokens skipped via prefix-cache
+                                    // hits (KV reused, not recomputed)
+  int64_t stat_prompt_tok_ =
       0;  // total prompt tokens admitted (denominator for the cache hit rate)
   int stat_peak_used_ = 0;  // peak physical blocks in use across all steps
 

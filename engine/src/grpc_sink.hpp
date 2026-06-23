@@ -19,9 +19,9 @@
 // Engine domain error -> proto wire code (the single mapping spot).
 inline flashqwen::ErrorCode ToProto(EngineErrc e) {
   switch (e) {
-    case EngineErrc::OverCapacity:
+    case EngineErrc::kOverCapacity:
       return flashqwen::ERROR_CODE_OVER_CAPACITY;
-    case EngineErrc::Internal:
+    case EngineErrc::kInternal:
       return flashqwen::ERROR_CODE_INTERNAL;
   }
   return flashqwen::ERROR_CODE_UNSPECIFIED;

@@ -19,7 +19,7 @@ Scheduler::Scheduler(ModelRuntime& model, KVCacheManager& kv,
 static uint64_t HashBlock(uint64_t parent, const Request& r, int start, int n) {
   uint64_t h = parent ^ 0x9E3779B97F4A7C15ull;
   for (int i = 0; i < n; ++i) {
-    h ^= (uint64_t)(uint32_t)r.TokenAt(start + i);
+    h ^= static_cast<uint64_t>(static_cast<uint32_t>(r.TokenAt(start + i)));
     h *= 0x100000001B3ull;      // FNV-1a prime
     h = (h << 27) | (h >> 37);  // rotate for diffusion
   }
@@ -50,9 +50,10 @@ void Scheduler::AcquirePrefix(Request* r) {
   }
   if (nb > 0) {
     r->AdoptPrefix(nb, bsz, parent);
-    stat_cache_hit_tok_ += nb * bsz;
+    stat_cache_hit_tok_ += static_cast<int64_t>(nb) * bsz;
     if (stat_cache_hit_tok_ ==
-        (long)nb * bsz)  // first hit ever: positive proof in the log
+        static_cast<int64_t>(nb) *
+            bsz)  // first hit ever: positive proof in log
       LOG_INFO(
           "[prefix] first cache hit: reused %d blocks (%d tokens) of a "
           "%d-token prompt",
@@ -106,16 +107,16 @@ int Scheduler::ChunkSize(const Request* r, int budget) const {
 // pool is dry: each preemption frees the youngest running seq other than r
 // (returns its blocks, resets its cursor, requeues it at the front for
 // recompute on resume). Returns false if r can't fit even after preempting
-// everyone else: r is then failed (OverCapacity to its sink) and retired, and
+// everyone else: r is then failed (kOverCapacity to its sink) and retired, and
 // the caller must rebuild the batch.
 bool Scheduler::Grow(Request* r, int upto) {
   while (!kv_.Grow(r->Blocks(), upto)) {
     // youngest running seq other than r (scan from the end, skipping r)
-    int k = (int)running_.size() - 1;
+    int k = static_cast<int>(running_.size()) - 1;
     while (k >= 0 && running_[k].get() == r) --k;
     if (k < 0) {  // nobody else to preempt: r alone can't fit -> fail it
       if (r->Sink())
-        r->Sink()->Error(EngineErrc::OverCapacity,
+        r->Sink()->Error(EngineErrc::kOverCapacity,
                          "out of KV cache: pool has " +
                              std::to_string(kv_.NumBlocks()) + " blocks of " +
                              std::to_string(kv_.BlockSize()) +
@@ -157,7 +158,8 @@ void Scheduler::Step() {
   // 2. admit waiters while slots are free, splicing in any cached prefix first
   //    (empty block table marks a fresh or just-preempted request — both may
   //    reuse KV)
-  while ((int)running_.size() < cfg_.n_slots && !waiting_.empty()) {
+  while (static_cast<int>(running_.size()) < cfg_.n_slots &&
+         !waiting_.empty()) {
     if (waiting_.front()->Blocks().empty())
       AcquirePrefix(waiting_.front().get());
     running_.push_back(std::move(waiting_.front()));
@@ -221,10 +223,13 @@ void Scheduler::Step() {
 void Scheduler::LogKvstat() {
   int nb = kv_.NumBlocks();
   double peak_pct = nb > 0 ? 100.0 * stat_peak_used_ / nb : 0.0;
-  double recomp_pct =
-      stat_fwd_rows_ > 0 ? 100.0 * stat_recomp_tok_ / stat_fwd_rows_ : 0.0;
+  double recomp_pct = stat_fwd_rows_ > 0
+                          ? 100.0 * static_cast<double>(stat_recomp_tok_) /
+                                static_cast<double>(stat_fwd_rows_)
+                          : 0.0;
   double hit_pct = stat_prompt_tok_ > 0
-                       ? 100.0 * stat_cache_hit_tok_ / stat_prompt_tok_
+                       ? 100.0 * static_cast<double>(stat_cache_hit_tok_) /
+                             static_cast<double>(stat_prompt_tok_)
                        : 0.0;
   LOG_INFO(
       "[kvstat] steps=%ld peak_used=%d/%d (%.1f%%) | rows: prefill=%ld "
@@ -259,10 +264,11 @@ void Scheduler::Run() {
       auto r = std::move(incoming.front());
       incoming.pop_front();
       // admission control: reject when the waiting queue is full
-      if (cfg_.max_queue > 0 && (int)waiting_.size() >= cfg_.max_queue) {
+      if (cfg_.max_queue > 0 &&
+          static_cast<int>(waiting_.size()) >= cfg_.max_queue) {
         if (r->Sink())
           r->Sink()->Error(
-              EngineErrc::OverCapacity,
+              EngineErrc::kOverCapacity,
               "request queue full: " + std::to_string(waiting_.size()) +
                   " requests already waiting (limit " +
                   std::to_string(cfg_.max_queue) + "), engine running up to " +

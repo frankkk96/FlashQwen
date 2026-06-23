@@ -1,5 +1,6 @@
 // Paged KV block pool — lowest layer of the KV stack.
-//   STORAGE: flat per-layer pool [NumBlocks, BLOCK, kv_dim] BF16, shared by all
+//   STORAGE: flat per-layer pool [NumBlocks, kBlock, kv_dim] BF16, shared by
+//   all
 //            sequences; attention kernels read/write it directly via K(l)/V(l).
 //   BOOKKEEPING: free list of physical block ids handed out / returned on
 //   demand.
@@ -17,7 +18,7 @@
 
 class BlockPool {
  public:
-  static constexpr int BLOCK = 16;  // tokens per block (page)
+  static constexpr int kBlock = 16;  // tokens per block (page)
 
   // Carve the pool from VRAM left under gpu_mem_fraction; seed the free list
   // with every block id. Throws if there isn't room for one full max_ctx seq.
@@ -26,11 +27,11 @@ class BlockPool {
   BlockPool(const BlockPool&) = delete;
   BlockPool& operator=(const BlockPool&) = delete;
 
-  // Storage: per-layer base pointers, each [NumBlocks, BLOCK, kv_dim] BF16.
+  // Storage: per-layer base pointers, each [NumBlocks, kBlock, kv_dim] BF16.
   bf16* K(int layer) const { return k_[layer]; }
   bf16* V(int layer) const { return v_[layer]; }
 
-  int BlockSize() const { return BLOCK; }
+  int BlockSize() const { return kBlock; }
   int NumBlocks() const { return num_blocks_; }
 
   // Block bookkeeping: refcounted + prefix-cache-aware (vLLM-style). Each block
@@ -40,7 +41,7 @@ class BlockPool {
   // (cache hit). Allocation pops the LRU front, evicting that mapping if set.
 
   // Reclaimable (refcount-0) blocks; scheduler preempts only when this hits 0.
-  int NumFree() const { return (int)free_lru_.size(); }
+  int NumFree() const { return static_cast<int>(free_lru_.size()); }
 
   // Fresh block (refcount 1); false (out untouched) if none free.
   bool AllocOne(int& out) {

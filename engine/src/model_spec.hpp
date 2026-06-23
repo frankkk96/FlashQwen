@@ -55,8 +55,8 @@ struct ModelSpec {
                                          : c.hidden_size / c.num_heads;
     c.intermediate = o["intermediate_size"].GetInt();
     c.vocab_size = o["vocab_size"].GetInt();
-    c.rms_eps = (float)o["rms_norm_eps"].GetDouble();
-    c.rope_theta = (float)o["rope_theta"].GetDouble();
+    c.rms_eps = static_cast<float>(o["rms_norm_eps"].GetDouble());
+    c.rope_theta = static_cast<float>(o["rope_theta"].GetDouble());
     return c;
   }
 };

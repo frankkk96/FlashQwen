@@ -24,7 +24,7 @@ class KVCacheManager {
   // caller can preempt a sequence and retry.
   bool Grow(std::vector<int>& block_table, int num_tokens) {
     int need = BlocksFor(num_tokens);
-    while ((int)block_table.size() < need) {
+    while (static_cast<int>(block_table.size()) < need) {
       int b;
       if (!pool_.AllocOne(b)) return false;
       block_table.push_back(b);
