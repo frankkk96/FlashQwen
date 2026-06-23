@@ -527,8 +527,8 @@ __global__ void attn_prefill_mma_kernel(const bf16* __restrict__ q, int q_stride
     const int* btr=bt + (size_t)r*max_blocks;
     if(blockIdx.x*64>=ql) return;             // whole block past this request's rows
 
-    __shared__ bf16 Ksh[2][16*HDc];           // double-buffered (cp.async), natural
-    __shared__ bf16 Vsh[2][16*HDc];           // double-buffered (cp.async), natural
+    __shared__ bf16 Ksh[16*HDc];              // cp.async-staged K tile (natural layout)
+    __shared__ bf16 Vsh[16*HDc];              // cp.async-staged V tile (natural layout)
     __shared__ bf16 Psh[4][16*16];
     bf16* Ps=Psh[warp];
 
@@ -548,20 +548,23 @@ __global__ void attn_prefill_mma_kernel(const bf16* __restrict__ q, int q_stride
     int blast=min(blockIdx.x*64+63, ql-1);
     int ntiles=pos[qs+blast]/16 + 1;
 
-    auto stage=[&](int kt,int buf){     // async-copy tile kt's K&V (natural) into buffer buf
+    // cp.async-copy tile kt's K&V (natural layout) into shared. Single-buffered: a double-buffered
+    // prefetch was tried but had a correctness hazard in the engine's back-to-back multi-layer launch
+    // context (manifested only on cache-hit / chunked-tail prefills — few query rows + many K/V tiles);
+    // single-buffer staging keeps the register-O + mma + block-shared-K/V-reuse win (cp.async overlap
+    // was worth only ~0.9% e2e). See prefix-cache-large-hit-bug.
+    auto stage=[&](int kt){
         size_t kvbase=(size_t)btr[kt]*16*kv_dim + (size_t)kvh*HDc;
         for(int c=threadIdx.x; c<16*16; c+=128){ int key=c>>4, ck=c&15;   // 16B (8 bf16) chunks
-            __pipeline_memcpy_async(&Ksh[buf][key*HDc+ck*8], &cache_k[kvbase+(size_t)key*kv_dim+ck*8], 16);
-            __pipeline_memcpy_async(&Vsh[buf][key*HDc+ck*8], &cache_v[kvbase+(size_t)key*kv_dim+ck*8], 16); }
+            __pipeline_memcpy_async(&Ksh[key*HDc+ck*8], &cache_k[kvbase+(size_t)key*kv_dim+ck*8], 16);
+            __pipeline_memcpy_async(&Vsh[key*HDc+ck*8], &cache_v[kvbase+(size_t)key*kv_dim+ck*8], 16); }
         __pipeline_commit();
     };
-    stage(0,0);
     for(int kt=0; kt<ntiles; ++kt){
-        int cur=kt&1;
-        if(kt+1<ntiles) stage(kt+1,(kt+1)&1);          // prefetch next tile while we compute this one
-        __pipeline_wait_prior(kt+1<ntiles?1:0);
+        stage(kt);
+        __pipeline_wait_prior(0);
         __syncthreads();
-        bf16* Ks=Ksh[cur]; bf16* Vs=Vsh[cur];
+        bf16* Ks=Ksh; bf16* Vs=Vsh;
 
         float S[2][4];
         for(int nh=0; nh<2; ++nh){
