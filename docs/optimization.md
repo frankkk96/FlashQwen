@@ -1,19 +1,16 @@
-# FlashQwen optimization log — catching up to vLLM
+# FlashQwen 优化日志 — 追赶 vLLM
 
-The single, self-contained record of the throughput-optimization journey. One curated entry per
-landed step: **what changed, the bottleneck it targeted, the measured effect, the lesson.** All
-numbers and tables are inline; granular raw assets (per-run CSVs, profiler dumps, bench scripts) are
-intentionally kept out of the repo.
+这是吞吐优化全过程的唯一、自包含记录。每个落地步骤精选一条记录：**改了什么、针对的瓶颈、实测效果、得到的经验。** 所有
+数字和表格都内联呈现；细粒度的原始资产（每次运行的 CSV、profiler dump、bench 脚本）有意不纳入仓库。
 
 ## Executive summary
 
-FlashQwen is a from-scratch Qwen3-8B inference engine (Go front-end + C++/CUDA backend over gRPC).
-This log tracks closing the serving-throughput gap to **vLLM** on a single RTX 4090, at **bf16
-parity (no quantization)**. Starting from `main` (INT8, a per-sequence scheduler) we rebuilt the
-scheduler, the GEMM path, and the attention kernels.
+FlashQwen 是一个从零实现的 Qwen3-8B 推理引擎（Go 前端 + C++/CUDA 后端，经由 gRPC 通信）。
+本日志记录在单张 RTX 4090 上、以 **bf16 精度对齐（无量化）** 缩小与 **vLLM** 服务吞吐差距的过程。从 `main`（INT8、按序列调度器）出发，我们重写了
+调度器、GEMM 路径以及 attention kernel。
 
-**Final result** — fresh same-machine replay of every landed step, conc=32, output 128, vs a
-**feature-matched** vLLM (`--no-enable-prefix-caching`, bf16, 0.9 mem):
+**最终结果** — 在同一台机器上重新跑完每个落地步骤，conc=32，输出 128，对比一个
+**功能对齐** 的 vLLM（`--no-enable-prefix-caching`，bf16，0.9 mem）：
 
 | input | FlashQwen (S14) | vLLM (no prefix cache) | **% of vLLM** |
 |---|---|---|---|
@@ -21,60 +18,54 @@ scheduler, the GEMM path, and the attention kernels.
 | 512 | 908 | 944 | **96.2%** |
 | 1024 (prefill-heavy) | 605 | 652 | **92.8%** |
 
-conc=1 single-stream: 56.4 / 54.6 / 51.3 ≈ 92–97% of vLLM across the same inputs.
+conc=1 单流：56.4 / 54.6 / 51.3 ≈ 在相同输入下达到 vLLM 的 92–97%。
 
-**Headline takeaways**
-- **5.5×** over the `main` baseline at conc=32/1024 (107 → 605 tok/s).
-- The gap to vLLM **grows with input length** (97.5% → 92.8%): the residual is entirely **prefill-side
-  compute** (prefill GEMM at the cuBLAS/HBM limit + longer-context attention). Decode-heavy serving is
-  essentially at vLLM parity.
-- Decode, KV-cache capacity/eviction, and CPU/scheduling overhead were each measured and **ruled out**
-  as the conc=32 bottleneck (see Conclusions).
-- All comparisons here are against a **feature-matched** vLLM (no prefix caching). vLLM's default
-  (prefix-cache ON, ~698/1031) was a non-equal earlier baseline — it caches the bench's shared
-  chat-template prefix, which FlashQwen has no equivalent of — and is no longer used as the reference.
+**核心要点**
+- 在 conc=32/1024 下相比 `main` 基线达到 **5.5×**（107 → 605 tok/s）。
+- 与 vLLM 的差距 **随输入长度增大**（97.5% → 92.8%）：残余完全来自 **prefill 侧
+  计算**（prefill GEMM 已到 cuBLAS/HBM 极限 + 更长上下文的 attention）。decode-heavy 的服务
+  基本已与 vLLM 持平。
+- decode、KV-cache 容量/驱逐，以及 CPU/调度开销都各自被测量并 **排除** 在 conc=32 瓶颈之外（见 Conclusions）。
+- 这里的所有对比都是针对 **功能对齐** 的 vLLM（无前缀缓存）。vLLM 的默认配置
+  （前缀缓存开启，~698/1031）是一个早期不对等的基线——它缓存了 bench 共享的
+  chat-template 前缀，而 FlashQwen 当时没有对应能力——已不再用作参考。
 
 ## Goal & constraints
 
-- Close the serving-throughput gap to **vLLM** on **Qwen3-8B**, **bf16, no quantization** (fair, equal
-  precision). RTX 4090 (24 GB, sm_89, ~1 TB/s). 36 layers, hidden 4096, 32 q-head / 8 kv-head GQA,
-  head_dim 128, intermediate 12288, QK-RMSNorm, SwiGLU, no bias.
+- 在 **Qwen3-8B**、**bf16，无量化**（公平、等精度）的前提下，于 RTX 4090（24 GB，sm_89，~1 TB/s）上缩小与 **vLLM** 的服务吞吐差距。36 层，hidden 4096，32 q-head / 8 kv-head GQA，
+  head_dim 128，intermediate 12288，QK-RMSNorm，SwiGLU，无 bias。
 
 ## Standard test (the one number we track)
 
-- Workload: `vllm bench serve --dataset-name random`, **1024 input / 128 output**, greedy (temp 0),
-  thinking disabled. Concurrency **32** (matches vLLM's `--max-num-seqs 32`); conc=1 reported too for
-  the single-stream / per-step view.
-- Harness: `bash /root/bench-compare/std.sh <label>` → appends to `results/std.csv` (starts the server,
-  runs conc=1 and conc=32, prints output tok/s). Build first with `make`.
-- Honest metric: **output tok/s**. (TTFT is an artifact — FlashQwen emits the SSE role chunk before
-  prefill, so prefill time lands in TPOT.)
-- Correctness gates each step: `bash /root/bench-compare/validate.sh` (numerical) + `gencheck.sh` (text).
+- 负载：`vllm bench serve --dataset-name random`，**1024 input / 128 output**，greedy（temp 0），
+  关闭 thinking。并发 **32**（与 vLLM 的 `--max-num-seqs 32` 对齐）；也报告 conc=1 用于
+  单流 / 单步视角。
+- Harness：`bash /root/bench-compare/std.sh <label>` → 追加到 `results/std.csv`（启动 server，
+  跑 conc=1 与 conc=32，打印 output tok/s）。先用 `make` 构建。
+- 诚实指标：**output tok/s**。（TTFT 是个假象——FlashQwen 在 prefill 之前就发出 SSE role chunk，因此 prefill 时间被计入了 TPOT。）
+- 每一步的正确性门禁：`bash /root/bench-compare/validate.sh`（数值）+ `gencheck.sh`（文本）。
 
 ## Baselines & reference (canonical: the 2026-06-20 journey replay)
 
-All numbers in this report are from the **single canonical dataset** — the same-machine journey replay
-(2026-06-20): every landed step rebuilt clean and benched at 128/512/1024
-input vs a **feature-matched vLLM** (`--no-enable-prefix-caching`, bf16, 0.9 mem). Aligned
-`vllm bench serve --dataset-name random`, output 128, temp 0.
+本报告中的所有数字都来自 **唯一的权威数据集**——同机器上的全过程重放
+（2026-06-20）：每个落地步骤都干净重建并在 128/512/1024
+input 下对比一个 **功能对齐的 vLLM**（`--no-enable-prefix-caching`，bf16，0.9 mem）进行 bench。对齐的
+`vllm bench serve --dataset-name random`，output 128，temp 0。
 
-vLLM reference (conc=32 output tok/s): **128 → 1376, 512 → 944, 1024 → 652**.
+vLLM 参考（conc=32 output tok/s）：**128 → 1376, 512 → 944, 1024 → 652**。
 
-Starting point — `main` (B0): per-sequence scheduler, INT8 weight-quant. Recorded at conc=32/1024 =
-**106.9** tok/s (15% of the no-cache vLLM 652). B0 is INT8 + a different branch, so it is cited from
-the original record, not re-run in the bf16 replay. INT8 makes its single-stream (conc=1) decode look
-good (lighter weight traffic) but it **collapses under concurrency** — that collapse is what the
-journey fixes.
+起点 — `main`（B0）：按序列调度器，INT8 weight-quant。在 conc=32/1024 下记录为
+**106.9** tok/s（为无缓存 vLLM 652 的 15%）。B0 是 INT8 + 另一个分支，因此引自原始记录，而非在 bf16 重放中重新跑。INT8 让其单流（conc=1）decode 看起来
+不错（权重流量更轻），但它 **在并发下崩溃**——这次崩溃正是这趟历程要修的问题。
 
-> Earlier revisions of this log compared against vLLM with **prefix caching ON** (its default → ~698 /
-> 1031), which is not feature-matched (FlashQwen has no prefix sharing). That comparison is deprecated
-> and no longer used here.
+> 本日志的早期版本是对比 **前缀缓存开启** 的 vLLM（其默认 → ~698 /
+> 1031），这并不功能对齐（FlashQwen 没有前缀共享）。该对比已废弃，此处不再使用。
 
 ## Progress
 
-Canonical numbers from the 2026-06-20 journey replay, **standard test = 1024 input / 128 output**
-(`% vLLM` is vs the feature-matched no-cache vLLM, conc=32 = 652). Cross-input (128/512) results are
-in Final results below.
+来自 2026-06-20 全过程重放的权威数字，**standard test = 1024 input / 128 output**
+（`% vLLM` 是相对功能对齐的无缓存 vLLM，conc=32 = 652）。跨输入（128/512）结果见
+下文 Final results。
 
 | Step | change | conc=1 | conc=32 | % vLLM | commit |
 |---|---|---|---|---|---|
@@ -91,197 +82,174 @@ in Final results below.
 | S14 | activation scratch → per-step bound (pool↑, KV-cliff gone) + latent WMMA OOB fix | 51.3 | 605 | **93%** | e5a99c8 |
 | — | **vLLM (no prefix cache), reference** | 55.5 | **652** | 100% | — |
 
-B0 is the original INT8 record (different branch/precision); R1→S14 are the fresh bf16 replay. S14 is
-throughput-neutral on this metric (banks a memory/robustness/correctness fix). Reverted/not-landed
-attempts S4, S9, S11, S13 are documented in the step entries, not the table.
+B0 是原始 INT8 记录（不同分支/精度）；R1→S14 是全新的 bf16 重放。S14 在本指标上
+吞吐中性（攒下一个内存/鲁棒性/正确性修复）。被回退/未落地的尝试 S4、S9、S11、S13 记录在步骤条目中，不在表里。
 
 ## Step entries
 
-> Note: absolute tok/s and "→ N" gap targets *inside* the entries below are **contemporaneous** — many
-> were measured with the older harness and targeted the then-current (prefix-cache) vLLM baseline. They
-> are the development narrative; the **canonical numbers are the Progress and Final-results tables**
-> (2026-06-20 replay, vs no-cache vLLM). Relative deltas and lessons still hold.
+> 注：下文各条目 *内部* 的绝对 tok/s 与「→ N」差距目标都是 **当时同期** 的——许多
+> 是用旧 harness 测的、针对当时的（前缀缓存）vLLM 基线。它们是开发叙事；**权威数字是 Progress 和 Final-results 两张表**
+> （2026-06-20 重放，对比无缓存 vLLM）。相对增量和经验仍然成立。
 
 ### B0 — baseline = main (08392df)
-- **State**: per-sequence scheduler (single prefill chunk), INT8 weight-quant matmul, the original
-  paged-attention kernel. Measured on a `main` worktree with a Go-only `/v1/completions`+`ignore_eos`
-  shim cherry-picked (`650fdaa`) so the identical bench could run — no compute change.
-- **Aligned test**: conc=1 56.7 tok/s (TPOT 11.5 ms) = 102% of vLLM; conc=32 106.9 (TPOT 251 ms) = 15.3%.
-- **Read**: single-stream FlashQwen already beats vLLM (INT8 = less weight traffic, decode is
-  memory-bound). The whole gap is at concurrency — vLLM batches far better.
+- **State**：按序列调度器（单个 prefill chunk），INT8 weight-quant matmul，原始的
+  paged-attention kernel。在一个 `main` worktree 上测量，cherry-pick 了一个 Go-only 的 `/v1/completions`+`ignore_eos`
+  shim（`650fdaa`）以便跑相同的 bench——无计算改动。
+- **Aligned test**：conc=1 56.7 tok/s（TPOT 11.5 ms）= vLLM 的 102%；conc=32 106.9（TPOT 251 ms）= 15.3%。
+- **Read**：单流 FlashQwen 已经胜过 vLLM（INT8 = 更少权重流量，decode 是
+  memory-bound）。整个差距都在并发上——vLLM 的 batch 做得好得多。
 
 ### R1 — unified token-budget scheduler + GPU sampling (REGRESSION)
-- **Change**: rewrote scheduling to a vLLM-style unified token budget (chunked prefill + decode in one
-  merged forward), three-layer paged-KV stack, GPU sampling; replaced attention with a naive paged
-  varlen kernel (one warp per (head, query-row), online softmax, no split-K).
-- **Result vs B0**: **slower** — conc=1 56.7→25.0 (−56%, TPOT 11.5→33.2 ms), conc=32 106.9→87.2 (−18%).
-- **Lesson**: the rewrite bought correctness + robustness under concurrency + chunked prefill, but the
-  no-split-K varlen attention is far slower than the old kernel, so net throughput regressed. The
-  scheduler is fine; **the attention kernel is the debt.**
+- **Change**：把调度重写为 vLLM 风格的统一 token budget（chunked prefill + decode 合并到一次
+  forward），三层 paged-KV 栈，GPU sampling；用一个朴素的 paged varlen kernel 替换 attention（每个 (head, query-row) 一个 warp，online softmax，无 split-K）。
+- **Result vs B0**：**更慢**——conc=1 56.7→25.0（−56%，TPOT 11.5→33.2 ms），conc=32 106.9→87.2（−18%）。
+- **Lesson**：重写带来了正确性 + 并发下的鲁棒性 + chunked prefill，但
+  无 split-K 的 varlen attention 远慢于旧 kernel，所以净吞吐回退了。
+  调度器没问题；**attention kernel 才是欠的债。**
 
 ### R2 — scheduler/kernel refactor (perf-neutral)
-- **Change**: structural only — slimmed `step()`, merged `grow`/`retire`, pushed batch logic into
-  `Request`, bundled knobs into `SchedulerConfig`/`RuntimeConfig`, removed dead kernel code
-  (`gemv_kernel`; `launch_matmul`→`launch_matmul_prefill`). No hot-path or numerics change.
-- **Result vs R1**: unchanged — conc=1 24.9, conc=32 87.4 (Δ0; two independent measurements,
-  5065b2e ↔ HEAD).
-- **Lesson**: confirms the gap is the kernels, not scheduling/bookkeeping. Clears the deck for the
-  attention rewrite (split-K).
+- **Change**：纯结构性——精简 `step()`，合并 `grow`/`retire`，把 batch 逻辑下放进
+  `Request`，把各种旋钮归拢进 `SchedulerConfig`/`RuntimeConfig`，移除死掉的 kernel 代码
+  （`gemv_kernel`；`launch_matmul`→`launch_matmul_prefill`）。无热路径或数值改动。
+- **Result vs R1**：不变——conc=1 24.9，conc=32 87.4（Δ0；两次独立测量，
+  5065b2e ↔ HEAD）。
+- **Lesson**：确认差距在 kernel，而非调度/簿记。为 attention 重写（split-K）清场。
 
 ### S3 — bf16 + cuBLAS GEMM + FlashAttention-2 (7650654)
-- **Change**: three coordinated kernel rewrites, addressing the debt R1/R2 identified.
-  1. **Drop INT8 weight-quant → bf16 everywhere.** Weights load as bf16 (no dequant), and the whole
-     activation pipeline is bf16 (norm/rope/residual/silu accumulate in fp32 internally). This is now
-     **fair bf16-parity with vLLM** — the earlier precision caveat is gone.
-  2. **cuBLAS for all matmuls.** One `cublasGemmEx` path (bf16 in, fp32 accumulate, tensor cores)
-     replaces the hand-rolled WMMA prefill GEMM + per-call full-weight dequant + the batched INT8
-     decode GEMV. The decode/prefill matmul split is deleted — one path for the merged batch.
-  3. **FlashAttention-2 paged kernel.** Replaces the per-(head,row) varlen kernel that re-read all
-     K/V from global with zero reuse (O(T²)). New kernel: one block per (q-tile, head, request); BM=16
-     query rows (one warp each) share BLOCK-sized K/V tiles staged in shared memory (reuse factor BM),
-     online softmax with deferred normalization (divide by the running sum only at the end), causal
-     whole-tile skip. Host groups the batch by request (qstart/qlen) for the q-tile grid.
-- **Result vs R2**: conc=32 **87.4 → 350.0 tok/s (4.0×)** — **12.5% → 50.1% of vLLM**, and 3.3× the
-  `main` baseline (106.9). conc=1 24.9 → 38.2 (still below main's INT8 56.7: bf16 weights read 2× the
-  bytes of INT8, and single-stream decode is weight-bandwidth-bound — the expected de-quant cost; the
-  tracked metric is conc=32). Greedy generation verified coherent.
-- **Lesson**: R1/R2 were right — the gap was the kernels, not scheduling. The unified-scheduler
-  regression is not just recovered but blown past. The remaining ~2× to vLLM at conc=32 is NOT attention
-  (see S4 below) — it's the GEMMs (cuBLAS, near-optimal) + per-step launch/scheduling overhead (~720
-  kernel launches/step, no CUDA graphs, no persistent batch, no prefix caching). Single-stream (conc=1)
-  is a separate, bandwidth-bound concern (bf16 weight traffic) if we ever care about it.
+- **Change**：三处协同的 kernel 重写，解决 R1/R2 指出的债。
+  1. **去掉 INT8 weight-quant → 全面 bf16。** 权重以 bf16 加载（无 dequant），整个
+     激活流水线为 bf16（norm/rope/residual/silu 内部用 fp32 累加）。现在
+     已是 **与 vLLM 公平的 bf16 对齐**——早先的精度警告消失了。
+  2. **所有 matmul 用 cuBLAS。** 一条 `cublasGemmEx` 路径（bf16 输入，fp32 累加，tensor core）
+     替换手写的 WMMA prefill GEMM + 每次调用的全权重 dequant + batched INT8
+     decode GEMV。decode/prefill matmul 的分裂被删除——合并 batch 走一条路径。
+  3. **FlashAttention-2 paged kernel。** 替换那个每 (head,row) 的 varlen kernel——它把所有
+     K/V 从 global 重读且零复用（O(T²)）。新 kernel：每 (q-tile, head, request) 一个 block；BM=16
+     query 行（每行一个 warp）共享暂存在 shared memory 的 BLOCK 大小 K/V tile（复用系数 BM），
+     带延迟归一化的 online softmax（只在最后除以 running sum），causal 整 tile 跳过。Host 按 request（qstart/qlen）对 batch 分组以形成 q-tile grid。
+- **Result vs R2**：conc=32 **87.4 → 350.0 tok/s（4.0×）**——**12.5% → 50.1% of vLLM**，并且是
+  `main` 基线（106.9）的 3.3×。conc=1 24.9 → 38.2（仍低于 main 的 INT8 56.7：bf16 权重读取的字节数是 INT8 的 2×，
+  而单流 decode 是 weight-bandwidth-bound——这是预期中的去量化代价；追踪指标是 conc=32）。greedy 生成验证连贯。
+- **Lesson**：R1/R2 是对的——差距在 kernel，而非调度。统一调度器
+  的回退不仅被收复，还被远远甩开。conc=32 下与 vLLM 剩下的约 ~2× 不是 attention
+  （见下文 S4）——是 GEMM（cuBLAS，近最优）+ 每步 launch/调度开销（~720
+  kernel launch/step，无 CUDA graph、无 persistent batch、无前缀缓存）。单流（conc=1）
+  若我们日后在意，则是另一个独立的 bandwidth-bound 议题（bf16 权重流量）。
 
 ### S4 — tensor-core + GQA-grouped attention (TRIED, REVERTED)
-- **Change**: rewrote the attention kernel to use WMMA (16×16×16 tensor cores) for S=Q·Kᵀ and O=P·V,
-  and grouped one block per (q-tile, **KV head**, request) so all 4 q-heads of a GQA group reuse one
-  staged K/V tile (4× less K/V traffic). O accumulator kept in shared (fp32), rescaled by a thread
-  loop, P·V added via load/store_matrix_sync — no WMMA fragment-layout assumptions. Greedy output was
-  bit-identical to S3 (correct).
-- **Result vs S3**: conc=32 350.0 → 355.5 (flat, noise); conc=1 **38.2 → 25.1 (−34%)**. Net negative.
-- **Why it didn't pay off**: (1) after S3's BM=16 K/V tiling, **attention is no longer the conc=32
-  bottleneck** — the GEMMs/launch overhead dominate, so a 2–3× faster attention barely moves total
-  throughput. (2) At conc=1, decode rows have q_len=1 but WMMA forces a full 16-row tile (16× wasted
-  compute), and the per-KV-head grouping leaves only 8 grid blocks (vs 32) → the GPU is starved and
-  attention latency grows, dragging single-stream TPOT (26→40 ms).
-- **Decision**: reverted to S3 (commit 7650654). Kept here as the record that the attention lever is
-  spent — the next real levers are launch-overhead (CUDA graphs / kernel fusion) and the throughput
-  features vLLM has (persistent batch, prefix caching).
+- **Change**：把 attention kernel 重写为用 WMMA（16×16×16 tensor core）算 S=Q·Kᵀ 与 O=P·V，
+  并按 (q-tile, **KV head**, request) 每个一个 block，使一个 GQA 组的全部 4 个 q-head 复用一份
+  暂存的 K/V tile（K/V 流量减少 4×）。O 累加器保留在 shared（fp32），由 thread
+  循环 rescale，P·V 经 load/store_matrix_sync 累加——不依赖 WMMA fragment 布局假设。greedy 输出与 S3 逐位相同（正确）。
+- **Result vs S3**：conc=32 350.0 → 355.5（持平，噪声）；conc=1 **38.2 → 25.1（−34%）**。净负。
+- **Why it didn't pay off**：(1) 在 S3 的 BM=16 K/V tiling 之后，**attention 已不再是 conc=32
+  瓶颈**——GEMM/launch 开销主导，所以快 2–3× 的 attention 几乎不动总吞吐。(2) conc=1 时，decode 行
+  q_len=1 但 WMMA 强制一个完整 16 行 tile（浪费 16× 的计算），且 per-KV-head 分组只剩 8 个 grid block（vs 32）→ GPU 被饿着，
+  attention 延迟增长，拖累单流 TPOT（26→40 ms）。
+- **Decision**：回退到 S3（commit 7650654）。保留在此作为 attention 这根杠杆已耗尽的记录
+  ——下一根真正的杠杆是 launch 开销（CUDA graph / kernel fusion）和 vLLM 拥有的
+  吞吐特性（persistent batch、前缀缓存）。
 
 ### S5 — kernel fusion: fused QKV/gate-up GEMM, add+rmsnorm, RoPE table (landed)
-- **Target**: the per-step launch + redundant-traffic overhead S3 named as the remaining conc=32 lever
-  (~720 kernel launches/step). Three fusions, all bf16-identical math:
-  1. **Fused QKV and gate|up GEMMs.** q/k/v proj weights are concatenated on the OUT dim into one
-     `wqkv` ([q_dim+2·kv_dim, H]) at load, likewise gate+up into `wgateup` ([2·I, H]); one
-     `cublasGemmEx` each replaces 3 and 2. Downstream kernels read the interleaved fused buffers via
-     offset/stride: a new fused **per-head RMSNorm+RoPE** kernel normalizes+rotates the q and k slices
-     in place, `store_kv` reads k/v straight from the QKV buffer, attention takes a `q_stride`, and
-     `silu_mul` reads gate/up as the two halves of one row.
-  2. **Fused residual-add + RMSNorm.** `add_rmsnorm` does `x += residual` (written back, carrying the
-     residual forward) then `rmsnorm(x)` in one pass — replaces a separate `add` + `rmsnorm`, saving a
-     full H read/write of x and a launch per residual. run_layers restructured so every norm but the
-     first consumes the pending residual; one trailing `add` commits the last layer's MLP residual.
-  3. **Precomputed RoPE cos/sin table.** Angles depend only on (pos, i) and are identical across all
-     36 layers; the old kernel recomputed `powf/cosf/sinf` per element per layer (36× waste). Now a
-     `[max_ctx, head_dim/2]` table is built once at startup and looked up (folded into the fused
-     norm+rope kernel).
-  - Net: ~19 → 12 kernel launches per layer (~252 fewer/step, ~720 → ~470).
-- **Result vs S3**: conc=1 38.2 → **39.1 (+2.3%)**; conc=32 350.0 → **356.1 (+1.7%, within noise)**.
-  Greedy output verified coherent.
-- **Lesson**: removing ~250 launches/step + redundant elementwise traffic barely moved conc=32 — so at
-  conc=32 the launch/elementwise overhead is a **small fraction**; the skinny decode **GEMMs dominate**
-  (each step streams all 17 GB of bf16 weights from HBM). This recalibrates the roadmap: the
-  "~720 launches" figure overstated the lever. **CUDA graphs will help conc=1 (latency-bound) more than
-  conc=32**; closing the remaining 2× at conc=32 needs GEMM-side wins (cuBLASLt autotuning / better
-  decode-GEMM shapes) or the throughput features vLLM has (larger effective batch, prefix caching), not
-  just launch elision. The fusions are kept regardless — correct, cleaner, and they pre-stage the
-  persistent-buffer layout CUDA-graph capture will want.
+- **Target**：S3 点名的每步 launch + 冗余流量开销，作为剩余 conc=32 杠杆
+  （~720 kernel launch/step）。三处融合，全是 bf16 等价数学：
+  1. **融合 QKV 与 gate|up GEMM。** q/k/v proj 权重在加载时按 OUT 维拼成一个
+     `wqkv`（[q_dim+2·kv_dim, H]），同理 gate+up 拼成 `wgateup`（[2·I, H]）；各用一个
+     `cublasGemmEx` 替换 3 个和 2 个。下游 kernel 经 offset/stride 读取交错的融合缓冲：一个新的融合 **per-head RMSNorm+RoPE**
+     kernel 原位归一化+旋转 q 与 k 切片，`store_kv` 直接从 QKV 缓冲读 k/v，attention 接受一个 `q_stride`，
+     而 `silu_mul` 把 gate/up 当作一行的两半读取。
+  2. **融合 residual-add + RMSNorm。** `add_rmsnorm` 做 `x += residual`（写回，把
+     residual 向前携带），然后一次 pass 内做 `rmsnorm(x)`——替换单独的 `add` + `rmsnorm`，省下一次 x 的整 H 读写
+     和每个 residual 一次 launch。run_layers 被重构为除第一个外每个 norm 都消费待处理的 residual；一个尾随的 `add` 提交最后一层 MLP 的 residual。
+  3. **预计算 RoPE cos/sin 表。** 角度只依赖 (pos, i) 且在所有
+     36 层都相同；旧 kernel 每层每元素重算 `powf/cosf/sinf`（36× 浪费）。现在一个
+     `[max_ctx, head_dim/2]` 表在启动时构建一次并查表（折进融合的 norm+rope kernel）。
+  - 净效果：每层约 ~19 → 12 次 kernel launch（每步少约 ~252 次，~720 → ~470）。
+- **Result vs S3**：conc=1 38.2 → **39.1（+2.3%）**；conc=32 350.0 → **356.1（+1.7%，在噪声内）**。
+  greedy 输出验证连贯。
+- **Lesson**：移除每步 ~250 次 launch + 冗余 elementwise 流量几乎不动 conc=32——所以在
+  conc=32 下 launch/elementwise 开销只是 **很小一部分**；瘦长的 decode **GEMM 主导**（每步从 HBM 流式读取全部 17 GB 的 bf16 权重）。这重新校准了路线图：
+  「~720 次 launch」这个数字高估了杠杆。**CUDA graph 对 conc=1（latency-bound）的帮助大于
+  conc=32**；要闭合 conc=32 剩下的 2× 需要 GEMM 侧的胜利（cuBLASLt autotuning / 更好的
+  decode-GEMM 形状）或 vLLM 拥有的吞吐特性（更大有效 batch、前缀缓存），而不只是 launch 消除。无论如何这些融合都保留：正确、更干净，并预先铺好 CUDA-graph 捕获将需要的 persistent-buffer 布局。
 
 ### S6 — FlashDecoding decode-attention kernel (f0b1499)
-- **Target**: the conc=32 ceiling the S5 profiling left open. Profiles used SHORT context; the tracked
-  metric is 1024-ctx, where decode attention reads a ~1152-tok KV every step. The unified attention
-  kernel handles q_len==1 (decode) terribly: only 1 of its 16 warps is active (~6% occupancy) and that
-  warp serially scans all ~72 KV tiles. GEMM was already at 84% HBM BW (S5 profile), so attention was
-  the remaining lever.
-- **Change**: split attention by request type *within* the unified batch — the GEMMs/norms stay merged
-  (attention is per-request anyway, so this is orthogonal to unified batching, NOT a return to
-  prefill/decode-split forwards). Decode rows (q_len==1) → new `decode_attn_kernel`; prefill rows
-  (q_len>1) → the existing tiled flash kernel. Both take a `rids[]` grid→request indirection so each
-  runs on its request subset, writing disjoint rows of `attn_`. In steady conc=32 most steps are pure
-  decode, so the decode kernel carries the common case.
-  - `decode_attn_kernel`: one block per (head, decode-request); NW=8 warps split that request's KV
-    [0,qpos] into strided slices; each warp online-softmaxes its slice in registers reading K/V
-    **straight from the paged cache** (one query row has no cross-row reuse → shared-memory staging is
-    pure overhead); then an in-block combine merges the NW partials (online-softmax). Full warp
-    occupancy + NW-way KV parallelism vs the old 1-warp serial scan.
-  - GQA K/V is still read per q-head (4× within a group), accepted: KV bytes are ~4% of GEMM and the
-    4 q-heads of a group hit the same cache lines (L2 absorbs most of it).
-- **Result vs S5**: conc=32 **357 → 455 tok/s (+27.5%, TPOT 84.9 → 65.3 ms)**; conc=1 39.1 → 44.7
-  (+14%, TPOT 25.8 → 22.5 ms). **51% → 65% of vLLM**, 4.26× the `main` baseline. Greedy output coherent.
-- **Lesson**: the S5 profiles (short context) under-counted attention; at the tracked 1024-ctx the
-  hand-rolled decode attention WAS the conc=32 bottleneck after all — and unlike the spent S4 WMMA
-  attempt (which fixed nothing real), FlashDecoding-style **KV-parallelism + occupancy** is the right
-  fix. Confirms the rule from the profiling sweep: GEMM/elementwise/scheduling were dead ends; the one
-  hand-rolled kernel with headroom delivered. Next gap to vLLM (455→698) is likely prefill-side
-  attention + the GQA 4× redundant KV read (a GQA-shared decode kernel) and CUDA graphs for conc=1.
+- **Target**：S5 profiling 留下的 conc=32 天花板。profile 用的是短上下文；追踪
+  指标是 1024-ctx，那里 decode attention 每步读取约 ~1152-tok 的 KV。统一 attention
+  kernel 处理 q_len==1（decode）很糟糕：16 个 warp 里只有 1 个活跃（~6% 占用率），而那个
+  warp 串行扫过全部 ~72 个 KV tile。GEMM 当时已到 84% HBM BW（S5 profile），所以 attention 是剩下的杠杆。
+- **Change**：在统一 batch *之内* 按 request 类型拆分 attention——GEMM/norm 仍合并
+  （attention 本就是 per-request，所以这与统一 batching 正交，**不是** 回到
+  prefill/decode-split forward）。decode 行（q_len==1）→ 新的 `decode_attn_kernel`；prefill 行
+  （q_len>1）→ 现有的 tiled flash kernel。两者都接受一个 `rids[]` grid→request 间接索引，使各自
+  在其 request 子集上运行，写入 `attn_` 的不相交行。在稳态 conc=32 下大多数步是纯
+  decode，所以 decode kernel 承载了常见情形。
+  - `decode_attn_kernel`：每 (head, decode-request) 一个 block；NW=8 个 warp 把该 request 的 KV
+    [0,qpos] 切成 strided 切片；每个 warp 在寄存器中对其切片做 online-softmax，直接从 paged cache
+    读取 K/V（一个 query 行没有跨行复用 → shared-memory 暂存纯属开销）；然后一次 in-block combine
+    合并 NW 个 partial（online-softmax）。相比旧的 1-warp 串行扫描，达成满 warp 占用率 + NW 路 KV 并行。
+  - GQA K/V 仍按 q-head 读取（一个组内 4×），接受：KV 字节约为 GEMM 的 ~4%，且一个组的
+    4 个 q-head 命中相同 cache line（L2 吸收大部分）。
+- **Result vs S5**：conc=32 **357 → 455 tok/s（+27.5%，TPOT 84.9 → 65.3 ms）**；conc=1 39.1 → 44.7
+  （+14%，TPOT 25.8 → 22.5 ms）。**51% → 65% of vLLM**，是 `main` 基线的 4.26×。greedy 输出连贯。
+- **Lesson**：S5 的 profile（短上下文）低估了 attention；在追踪的 1024-ctx 下手写的
+  decode attention 确实曾是 conc=32 瓶颈——并且不同于已耗尽的 S4 WMMA 尝试（没修任何实质问题），
+  FlashDecoding 风格的 **KV 并行 + 占用率** 才是正确的修法。这印证了 profiling sweep 得出的规则：GEMM/elementwise/调度都是死路；唯一一个还有余量的手写 kernel 交付了成果。下一段与 vLLM 的差距（455→698）很可能是 prefill 侧
+  attention + GQA 4× 冗余 KV 读取（一个 GQA-shared decode kernel）以及 conc=1 的 CUDA graph。
 
 ### S7 — WMMA tensor-core prefill attention (0dd4010)
-- **Target**: after S6 split decode off, the prefill-only attention kernel still used CUDA-core FMA dot
-  products (per-key warp-shuffle reductions) for what is a compute-bound 512×L×128 matmul — no tensor
-  cores. S4's WMMA attempt failed because it was applied to *decode* (q_len=1 wastes 15/16 of a 16-row
-  WMMA tile + per-kv-head grouping starved the grid); with decode now on its own kernel, WMMA on the
-  prefill path (q_len up to 512, full tiles) is the right application and S4's failure mode is gone.
-- **Change**: `attention_prefill_wmma_kernel` — FlashAttention-2 with WMMA 16×16×16 bf16 (fp32
-  accumulate), one warp per (16-query-tile, head, request). Q read straight from the fused-QKV buffer,
-  K/V straight from the paged cache (one 16-key tile == one page, since block_size==16), all as WMMA
-  loads — no S materialization. Online softmax + deferred normalization; O kept in shared fp32 and
-  rescaled per tile (portable — no WMMA fragment-layout assumptions). Dispatched via
-  `launch_attention_prefill` on the prefill subset; FMA fallback when block_size!=16 or head_dim!=128.
-- **Result vs S6**: conc=32 **455 → 493 tok/s (+8.5%, TPOT 65.3 → 59.8 ms)**; conc=1 flat (44.7 → 44.9
-  — single-stream is decode-bound, prefill is a one-time cost amortized over the 128 outputs). **65% →
-  71% of vLLM**, 4.6× the `main` baseline. Output verified coherent.
-- **Lesson**: prefill attention WAS a meaningful conc=32 slice (the +8.5% is the proof), and the S4
-  idea (tensor cores) was right all along — just mis-applied to decode. Splitting attention by request
-  type (S6) is what unlocked it: each regime now gets the kernel it wants (FlashDecoding for decode,
-  WMMA-FA for prefill). Remaining gap to vLLM (493→698): GQA-shared decode (4× redundant KV read —
-  judged marginal, KV is ~4% of bytes + L2-cached), CUDA graphs for conc=1, and the 1-warp/block
-  occupancy of this WMMA kernel (a bigger query tile / more warps per block could push it further).
+- **Target**：S6 把 decode 拆出去之后，仅 prefill 的 attention kernel 对于一个 compute-bound 的 512×L×128 matmul 仍在用 CUDA-core FMA 点积
+  （per-key warp-shuffle 归约）——没有 tensor core。S4 的 WMMA 尝试失败是因为它被用在 *decode*（q_len=1 浪费 16 行 WMMA tile 的 15/16 + per-kv-head 分组饿死 grid）；如今 decode 已有自己的 kernel，
+  把 WMMA 用在 prefill 路径（q_len 高达 512，满 tile）才是正确的应用，S4 的失效模式消失了。
+- **Change**：`attention_prefill_wmma_kernel`——带 WMMA 16×16×16 bf16（fp32
+  累加）的 FlashAttention-2，每 (16-query-tile, head, request) 一个 warp。Q 直接从融合 QKV 缓冲读，
+  K/V 直接从 paged cache 读（一个 16-key tile == 一个 page，因为 block_size==16），全部用 WMMA
+  load——不物化 S。online softmax + 延迟归一化；O 保留在 shared fp32 并
+  按 tile rescale（可移植——不依赖 WMMA fragment 布局假设）。在 prefill 子集上经
+  `launch_attention_prefill` 派发；当 block_size!=16 或 head_dim!=128 时回退到 FMA。
+- **Result vs S6**：conc=32 **455 → 493 tok/s（+8.5%，TPOT 65.3 → 59.8 ms）**；conc=1 持平（44.7 → 44.9
+  ——单流是 decode-bound，prefill 是一次性代价，摊到 128 个输出上）。**65% →
+  71% of vLLM**，是 `main` 基线的 4.6×。输出验证连贯。
+- **Lesson**：prefill attention 确曾是 conc=32 中有意义的一块（+8.5% 即证明），而 S4
+  的想法（tensor core）一直是对的——只是错用在了 decode 上。按 request 类型拆分 attention（S6）是解锁它的关键：每个 regime 现在都得到它想要的 kernel（decode 用 FlashDecoding，prefill 用
+  WMMA-FA）。与 vLLM 剩下的差距（493→698）：GQA-shared decode（4× 冗余 KV 读取——
+  判为边际收益，KV 约为字节的 ~4% 且被 L2 缓存）、conc=1 的 CUDA graph，以及这个 WMMA kernel 的 1-warp/block
+  占用率（更大的 query tile / 每 block 更多 warp 也许能再推一把）。
 
 ### S8 — attn_prefill occupancy: shrink shared memory (392cda5)
-- **Target**: the S7 WMMA prefill kernel was 1 warp/block with ~18 KB shared → only ~5 blocks/SM
-  resident (~8% warp occupancy). With so few warps, the tensor cores stall during the per-tile softmax
-  (CUDA-core work) — nothing else to overlap.
-- **Change**: drop the `[16,128]` `PVt` temp (8 KB). Instead of "rescale all of O, then add the full
-  P·V", fold both per 16×16 d-tile through a small `[16,16]` temp: `O[:,d] = O[:,d]*corr + (P·V)[:,d]`.
-  Each O element is still rescaled once and gets its P·V once — bit-identical math. Shared ~18 KB →
-  ~11 KB → ~9 blocks/SM (~2× resident warps).
-- **Result vs S7**: conc=32 **493 → 528 tok/s (+7.1%, TPOT 59.8 → 55.5 ms)**; conc=1 flat (44.9 → 45.2).
-  **71% → 76% of vLLM**, 4.94× the `main` baseline. Output coherent.
-- **Lesson**: a hand-rolled WMMA kernel at 1 warp/block is occupancy-starved even though tensor-core
-  throughput looks fine — freeing shared memory to double resident warps recovered 7%. More headroom
-  likely remains (a multi-warp block / KV-split would push occupancy further), but that's a bigger
-  rewrite with the usual WMMA-correctness risk; the cheap shared cut banked most of the easy gain.
+- **Target**：S7 的 WMMA prefill kernel 是 1 warp/block，约 ~18 KB shared → 每 SM 只有约 ~5 个 block
+  常驻（~8% warp 占用率）。warp 这么少，tensor core 在 per-tile softmax（CUDA-core 工作）期间会 stall——没有别的可以重叠。
+- **Change**：去掉 `[16,128]` 的 `PVt` 临时缓冲（8 KB）。不再「先 rescale 整个 O，再加完整
+  P·V」，而是经一个小的 `[16,16]` 临时缓冲按每个 16×16 d-tile 折叠两者：`O[:,d] = O[:,d]*corr + (P·V)[:,d]`。
+  每个 O 元素仍只 rescale 一次、只得到一次它的 P·V——逐位相同的数学。shared ~18 KB →
+  ~11 KB → 每 SM ~9 个 block（常驻 warp 约 2×）。
+- **Result vs S7**：conc=32 **493 → 528 tok/s（+7.1%，TPOT 59.8 → 55.5 ms）**；conc=1 持平（44.9 → 45.2）。
+  **71% → 76% of vLLM**，是 `main` 基线的 4.94×。输出连贯。
+- **Lesson**：一个 1 warp/block 的手写 WMMA kernel 即便 tensor-core 吞吐看起来没问题也是占用率被饿着的
+  ——释放 shared memory 让常驻 warp 翻倍，收回了 7%。很可能还有余量（multi-warp block / KV-split 会进一步推高占用率），但那是更大的重写、带着惯常的 WMMA 正确性
+  风险；廉价的 shared 削减已攒下大部分容易拿的收益。
 
 ### S10 — scheduler: default max-batch-tokens 2048 → 1024 (642cc28)
-- **Target**: sweeping the scheduler knobs (`sched_sweep.sh`) surfaced `max-batch-tokens`
-  (max_num_batched_tokens) as a big lever the earlier max-prefill-tokens sweep had missed.
-- **Root cause found**: at conc=32 / 1024-in, the KV pool (~36.7k tokens) sits right at demand
-  (32×1152 = 36864). The default mbt=2048 lets a step admit ~4 concurrent prefill chunks (4×512),
-  spiking peak KV demand past the pool → recompute-preemption thrash → 527 tok/s. mbt=1024 serializes
-  prefill enough to stay under the pool → 589 (+11%), with better TTFT/TPOT, at the **same 0.9 VRAM as
-  vLLM's default** (fair).
-- **Verified the mechanism** with a `--gpu-mem-fraction` sweep (plumbed through Go): enlarging the pool
-  to 43.5k tokens fixes mbt=2048 (527 → 588) but does **not** beat mbt=1024's 589. So ~588 is the
-  no-preemption ceiling — two paths (cap concurrency, or grow the pool) reach the same place, and the
-  remaining gap to vLLM (698) is **compute/framework, not KV/preemption**.
-- **Result vs S8**: conc=32 528 → **589 (+11%)**; conc=1 unchanged (~45, single-stream is
-  mbt-independent). **76% → 84% of vLLM**, 5.5× the `main` baseline. (gpu-mem-fraction default kept at
-  0.9; the flag is now exposed for users with other VRAM/models.)
-- **Lesson**: input-length-coupled (the user's call) — the mbt sweet spot exists because the std test
-  sits on the KV cliff; at 512-in (KV fits) mbt is irrelevant (~890 tok/s), at 2048-in (2× over) it
-  collapses. The fair, free win is capping admission via mbt; chasing past 588 means compute, not memory.
+- **Target**：扫描调度器旋钮（`sched_sweep.sh`）暴露了 `max-batch-tokens`
+  （max_num_batched_tokens）是一根大杠杆，之前的 max-prefill-tokens sweep 漏掉了。
+- **Root cause found**：在 conc=32 / 1024-in 下，KV 池（~36.7k tokens）正好坐在需求处
+  （32×1152 = 36864）。默认 mbt=2048 让一步能接纳约 ~4 个并发 prefill chunk（4×512），
+  把峰值 KV 需求顶过池子 → recompute-preemption 抖动 → 527 tok/s。mbt=1024 把
+  prefill 串行化到足以保持在池子之下 → 589（+11%），并有更好的 TTFT/TPOT，在 **与
+  vLLM 默认相同的 0.9 VRAM** 下（公平）。
+- **Verified the mechanism**：用一次 `--gpu-mem-fraction` sweep（穿透到 Go）：把池子
+  扩到 43.5k tokens 修复了 mbt=2048（527 → 588），但 **没有** 超过 mbt=1024 的 589。所以 ~588 是
+  no-preemption 天花板——两条路径（限并发，或扩池）到达同一处，
+  与 vLLM（698）剩下的差距是 **计算/框架，而非 KV/抢占**。
+- **Result vs S8**：conc=32 528 → **589（+11%）**；conc=1 不变（~45，单流与
+  mbt 无关）。**76% → 84% of vLLM**，是 `main` 基线的 5.5×。（gpu-mem-fraction 默认保持
+  0.9；该 flag 现在对用其他 VRAM/模型的用户开放。）
+- **Lesson**：与输入长度耦合（用户的判断）——mbt 甜点存在是因为 std test
+  坐在 KV cliff 上；在 512-in（KV 装得下）时 mbt 无关（~890 tok/s），在 2048-in（超 2×）时它
+  崩溃。公平、免费的胜利是经 mbt 限制接纳；追过 588 意味着计算，而非内存。
 
 #### inlen × mbt sweep — throughput is dominated by KV capacity vs demand (2026-06-20)
-`mbt_inlen.sh`, conc=32, otps by (input length, max-batch-tokens):
+`mbt_inlen.sh`，conc=32，按 (input length, max-batch-tokens) 的 otps：
 
 | inlen | KV needed (32×(in+128)) | best otps | mbt effect |
 |---|---|---|---|
@@ -289,37 +257,36 @@ attempts S4, S9, S11, S13 are documented in the step entries, not the table.
 | 1024 | 36864 (≈pool, the cliff) | ~589 | small mbt wins (eases preemption) |
 | 2048 | 69632 (190% of pool) | 78 → 7 | collapses; bigger mbt = worse (thrash) |
 
-The tracked 1024/128 metric sits exactly on the KV-capacity cliff — which is why everything here is so
-sensitive. Throughput is governed first by KV-pool capacity vs demand, then by kernels.
+被追踪的 1024/128 指标正好坐在 KV-capacity cliff 上——这就是为什么这里的一切都如此
+敏感。吞吐首先由 KV 池容量 vs 需求支配，其次才是 kernel。
 
 ### S11 attempt — CUDA graphs for pure-decode steps (TRIED, REVERTED, 2026-06-20)
-Captured the pure-decode forward (run_layers + lm_head + sample) into a CUDA graph per batch size B and
-replayed it (split forward into eager upload_inputs + captureable compute; pinned a cuBLAS workspace and
-fixed the block-table stride so launches stay valid; graceful fallback if capture fails). Capture
-**succeeded** and output stayed coherent — but it was **net negative**: conc=1 flat (45.2 → 45.7), conc=32
-**589 → 520 (−12%)**. Reverted.
-- **Why no conc=1 win**: conc=1 decode is **weight-bandwidth-bound**, not launch-bound — each token reads
-  all 17.3 GB of weights (~17.3 ms floor; our TPOT 22 ms ≈ 78% of HBM). The ~470 launches run async and
-  overlap that 17 ms of GPU work, so eliding them saves ~0 wall-clock. (vLLM's conc=1 17.9 ms ≈ the
-  17.3 ms floor; its edge is leaner *eager* per-step work — H2D + sync — which the graph doesn't cover.)
-- **Why conc=32 regressed**: GPU is already ~97% busy (no launch gaps to hide), and B drains 32→1 over
-  the run so each new batch size pays a one-time eager-warmup + graph-instantiate → net overhead.
-- **Takeaway**: FlashQwen is not launch-bound at any concurrency (saturated at 32, bandwidth-bound at 1),
-  so CUDA graphs — which only remove launch overhead — have nothing to recover here. This closes the
-  search: the remaining gap to vLLM (589→698) is HBM bandwidth + vLLM's leaner per-step eager path, not
-  a kernel/launch problem we can fix without quantization.
+把纯 decode forward（run_layers + lm_head + sample）按每个 batch size B 捕获进一个 CUDA graph 并
+回放（把 forward 拆成 eager upload_inputs + 可捕获的 compute；固定一块 cuBLAS workspace 并
+固定 block-table stride 以保证 launch 有效；捕获失败时优雅回退）。捕获
+**成功** 且输出保持连贯——但 **净负**：conc=1 持平（45.2 → 45.7），conc=32
+**589 → 520（−12%）**。已回退。
+- **Why no conc=1 win**：conc=1 decode 是 **weight-bandwidth-bound**，而非 launch-bound——每个 token 读取
+  全部 17.3 GB 权重（~17.3 ms 下限；我们的 TPOT 22 ms ≈ HBM 的 78%）。那 ~470 次 launch 异步运行并
+  与那 17 ms 的 GPU 工作重叠，所以消除它们几乎省不下 wall-clock。（vLLM 的 conc=1 17.9 ms ≈ 那个
+  17.3 ms 下限；它的优势在于更精简的 *eager* 每步工作——H2D + sync——这是 graph 覆盖不到的。）
+- **Why conc=32 regressed**：GPU 已经 ~97% 忙（没有 launch 间隙可藏），且 B 在一轮中从 32 漏到 1，所以每个新 batch size 都付一次性 eager-warmup + graph-instantiate → 净开销。
+- **Takeaway**：FlashQwen 在任何并发下都不是 launch-bound（32 时饱和，1 时 bandwidth-bound），
+  所以 CUDA graph——它只移除 launch 开销——在这里无可收复。这关闭了
+  搜索：与 vLLM 剩下的差距（589→698）是 HBM 带宽 + vLLM 更精简的每步 eager 路径，而非
+  一个我们能在不量化的情况下修的 kernel/launch 问题。
 
 #### S9 attempt — attn_prefill head-dim split (TRIED, REVERTED, 2026-06-20)
-After S8, tried 2 warps/block splitting the head dim (warp 0 dims [0,64), warp 1 [64,128); each
-contracts its half for a partial S, warp 0 sums + softmaxes, each does P·V for its output half). Os
-stays 8 KB (partitioned, not duplicated) so occupancy rose 9 → ~14 warps/SM. Output coherent, but
-conc=32 528 → 534 (**+1.1%, within noise**). The partial-S combine's extra `__syncthreads` (coupling
-the two warps) roughly cancels the occupancy gain — and S8 already banked the real occupancy win, so
-attn_prefill is no longer occupancy-bound. Reverted (kept the simpler 1-warp S8). Lesson: occupancy
-had one cheap win (S8's shared cut); past that, more warps don't pay here.
+S8 之后，尝试 2 warps/block 拆分 head 维（warp 0 处理 dims [0,64)，warp 1 处理 [64,128)；各
+为部分 S 收缩自己那半，warp 0 求和 + softmax，各自为自己的输出半做 P·V）。Os
+保持 8 KB（分区，不复制），所以占用率从 9 → ~14 warps/SM 上升。输出连贯，但
+conc=32 528 → 534（**+1.1%，在噪声内**）。部分-S 合并的额外 `__syncthreads`（耦合
+两个 warp）大致抵消了占用率收益——而且 S8 已攒下真正的占用率胜利，所以
+attn_prefill 已不再 occupancy-bound。已回退（保留更简单的 1-warp S8）。Lesson：占用率
+有一次廉价胜利（S8 的 shared 削减）；过此以后，更多 warp 在这里不划算。
 
 #### S5 ablation — which of the three fusions actually paid (2026-06-19)
-Each change isolated on the S3 base (1024/128, temp 0); only the engine differs.
+每项改动在 S3 base 上单独隔离（1024/128，temp 0）；只有引擎不同。
 
 | variant | conc=1 | conc=32 | vs S3 (conc=32) |
 |---|---|---|---|
@@ -329,92 +296,82 @@ Each change isolated on the S3 base (1024/128, temp 0); only the engine differs.
 | C: #6 fused QKV/gate-up GEMM only | 38.9 | 355.8 | **+1.7%** |
 | S5: all three | 39.1 | 356.1 | +1.7% |
 
-**Finding: none is a regression, but #5 and #7 are net-zero — the whole S5 gain is #6 (fused GEMMs).**
-Why #5/#7 are placebo here: RoPE and the add/rmsnorm elementwise kernels are tiny next to the GEMMs,
-and at conc=32 the step is GEMM/HBM-bound, so eliminating their launches + redundant traffic doesn't
-move the wall clock. #6 helps because folding 3→1 and 2→1 GEMMs gives cuBLAS a wider N (better tensor-
-core utilization on the skinny M=32 decode shape) on top of fewer launches. Adding #5+#7 on top of #6
-(C→S5) changes nothing (355.8→356.1). Kept all three anyway: correct, not negative, fewer launches for
-the eventual CUDA-graph capture — but the lesson is **GEMM-shape wins are the lever, elementwise/launch
-fusion is not** at this batch size.
+**Finding：没有一项是回退，但 #5 与 #7 是净零——整个 S5 收益来自 #6（融合 GEMM）。**
+为什么 #5/#7 在这里是安慰剂：RoPE 与 add/rmsnorm 这些 elementwise kernel 与 GEMM 相比微不足道，
+而在 conc=32 下这一步是 GEMM/HBM-bound，所以消除它们的 launch + 冗余流量并不动
+wall clock。#6 有帮助是因为把 3→1 和 2→1 个 GEMM 折叠给了 cuBLAS 更宽的 N（在瘦长的 M=32 decode 形状上更好的 tensor-core 利用率）外加更少 launch。在 #6 之上叠加 #5+#7
+（C→S5）什么都没变（355.8→356.1）。无论如何三项都保留：正确、不为负、为最终的 CUDA-graph
+捕获减少 launch——但经验是 **GEMM 形状的胜利才是杠杆，elementwise/launch
+融合不是**，在这个 batch size 下。
 
 ### S12 — GQA-shared FlashDecoding decode attention (2026-06-20)
-- **What**: the S6 decode kernel ran one block per (q-head, request); with Qwen3's 4:1 GQA each
-  kv-head's K/V was re-read once per query head in its group (4×). New two-phase kernel: phase 1 = one
-  block per (kv-head, request, **KV-split**) computes all G=4 q-heads of the group, loading each K/V
-  element into registers **once** and reusing it across the 4 heads; phase 2 combines the per-split
-  FlashDecoding partials. The `grid.z` KV-split (ksplit = clamp(128/n_decode, 1, 16)) keeps the 4090
-  saturated despite n_kv being 4× fewer blocks than n_heads (conc=32: 8·32·4 = 1024 blocks × 8 warps =
-  8192 warps = full). Old per-head kernel kept as fallback (head_dim≠128 or unsupported group).
-- **Why it works now (vs the spent S4 GQA attempt)**: S4 grouped by kv-head but used only n_kv blocks
-  → GPU starved → looked flat. The KV-split is what makes grouping a net win. L2 already absorbs most
-  of the redundant *HBM* traffic from the 4× re-read, but the redundant L2 bandwidth + load
-  instructions + score reductions still cost ~2.3× (microbench: 0.246→0.105 ms/layer).
-- **Result**: conc=32 **589 → 608.8 (+3.4%, 84.4%→87.2% of vLLM)**, TPOT 54→52.1 ms; conc=1
-  **45.7 → 51.3 (+12.2%)**, TPOT 22→19.6 ms. Greedy output verified bit-coherent (Rayleigh answer ok);
-  standalone numerical check vs the reference kernel: max|Δ| ≤ 1e-4 (bf16 noise) for KVLEN ∈ {1..2000}.
-- **Why conc=1 gains more than conc=32**: single-request KV (~4.7 MB/layer) fits in L2, so the 4×
-  re-read was pure wasted L2 bandwidth — cleanly removed. At conc=32 the KV (151 MB/layer) overflows
-  L2 (more HBM-bound) AND the 1024/128 workload is prefill-heavy (attn_decode is only ~13% of GPU
-  time), so the end-to-end share is smaller.
-- **Lesson**: a kernel-isolated speedup (2.3×) dilutes to +3.4% end-to-end because decode attention is
-  a minority of GPU time on a prefill-heavy workload. The remaining hand-rolled hot kernel is
-  **attn_prefill** (~11%), which still re-reads K/V 4× per GQA group — the next attention lever.
+- **What**：S6 的 decode kernel 每 (q-head, request) 跑一个 block；以 Qwen3 的 4:1 GQA，每个
+  kv-head 的 K/V 都被其组内每个 query head 重读一次（4×）。新的两阶段 kernel：phase 1 = 每
+  (kv-head, request, **KV-split**) 一个 block 计算该组全部 G=4 个 q-head，把每个 K/V
+  元素 **一次** 加载进寄存器并在 4 个 head 间复用；phase 2 合并 per-split 的
+  FlashDecoding partial。`grid.z` 的 KV-split（ksplit = clamp(128/n_decode, 1, 16)）即使在 n_kv 的 block 数比 n_heads 少 4× 时也让 4090 保持饱和（conc=32：8·32·4 = 1024 个 block × 8 warp =
+  8192 warp = 满）。旧的 per-head kernel 保留为回退（head_dim≠128 或不支持的 group）。
+- **Why it works now (vs the spent S4 GQA attempt)**：S4 按 kv-head 分组但只用了 n_kv 个 block
+  → GPU 饿着 → 看起来持平。KV-split 才是让分组成为净胜利的关键。L2 已吸收 4× 重读中大部分冗余的 *HBM* 流量，但冗余的 L2 带宽 + load
+  指令 + score 归约仍要花 ~2.3×（microbench：0.246→0.105 ms/layer）。
+- **Result**：conc=32 **589 → 608.8（+3.4%，84.4%→87.2% of vLLM）**，TPOT 54→52.1 ms；conc=1
+  **45.7 → 51.3（+12.2%）**，TPOT 22→19.6 ms。greedy 输出验证逐位连贯（Rayleigh 答案 ok）；
+  对比参考 kernel 的独立数值检查：对 KVLEN ∈ {1..2000}，max|Δ| ≤ 1e-4（bf16 噪声）。
+- **Why conc=1 gains more than conc=32**：单请求 KV（~4.7 MB/layer）装进 L2，所以 4×
+  重读纯属浪费的 L2 带宽——被干净移除。conc=32 时 KV（151 MB/layer）溢出
+  L2（更 HBM-bound），且 1024/128 负载是 prefill-heavy（attn_decode 仅占 GPU 时间的 ~13%），所以端到端的占比更小。
+- **Lesson**：一个 kernel 隔离的加速（2.3×）在端到端被稀释到 +3.4%，因为 decode attention 在 prefill-heavy 负载上只占 GPU 时间的少数。剩下的手写热 kernel 是
+  **attn_prefill**（~11%），它仍按 GQA 组重读 K/V 4×——下一根 attention 杠杆。
 
 #### S13 attempt — GQA-shared PREFILL attention (TRIED via microbench, REJECTED, not landed)
-After S12's decode win, tried the same GQA-sharing on `attn_prefill`: one block per (q-tile, kv-head,
-request) with G=4 warps (one per q-head of the group) sharing one K/V page staged in shared, so each
-K/V tile is read from global ONCE instead of 4× (once per q-head). Microbench (`prefill_probe.cu`,
-R=4 reqs × qlen 512) verdict: **0.73× — 37% SLOWER** (0.684 vs 0.499 ms/call), and that's the
-*favorable* build (Os shrunk to bf16; the natural fp32-Os version needs 51968 B shared > the 48 KB
-static cap and won't even compile). Why it loses, unlike decode:
-- **Prefill attention is compute(WMMA)/occupancy-bound, not K/V-load-bound.** Sharing the K/V *load*
-  saves the thing that wasn't the bottleneck, while the 4× persistent `Os[16,128]` accumulator + the
-  cross-warp `__syncthreads` barriers cost occupancy and stalls. (Decode has no big O accumulator —
-  just DPL=4 registers/head — and gains because it IS bandwidth/L2-bound.)
-- Consistent with S8 (prefill occupancy-bound; the win was *shrinking* shared) and S9 (more warps via
-  head-dim split → flat). Prefill attention's occupancy is tapped; GQA-sharing only adds shared.
-**Lesson: GQA K/V-sharing pays for the bandwidth-bound decode path (S12) but is net-negative for the
-compute/occupancy-bound prefill path. Don't retry it on prefill on this architecture.**
+S12 的 decode 胜利之后，在 `attn_prefill` 上尝试同样的 GQA-sharing：每 (q-tile, kv-head,
+request) 一个 block，G=4 个 warp（组内每个 q-head 一个）共享一份暂存在 shared 的 K/V page，使每个
+K/V tile 从 global 只读一次而非 4×（每个 q-head 一次）。Microbench（`prefill_probe.cu`，
+R=4 reqs × qlen 512）裁定：**0.73× — 慢 37%**（0.684 vs 0.499 ms/call），而且那还是
+*有利* 的构建（Os 缩到 bf16；自然的 fp32-Os 版本需要 51968 B shared > 48 KB
+静态上限，根本编不过）。为什么它输了，不像 decode：
+- **prefill attention 是 compute(WMMA)/occupancy-bound，而非 K/V-load-bound。** 共享 K/V 的 *load*
+  省的是本不构成瓶颈的东西，而 4× 的常驻 `Os[16,128]` 累加器 + 跨 warp 的
+  `__syncthreads` 屏障花掉了占用率与 stall。（decode 没有大 O 累加器——
+  只有 DPL=4 寄存器/head——并且有收益是因为它确实 bandwidth/L2-bound。）
+- 与 S8（prefill occupancy-bound；胜利在于 *缩小* shared）和 S9（经 head-dim
+  split 更多 warp → 持平）一致。prefill attention 的占用率已被榨干；GQA-sharing 只会增加 shared。
+**Lesson：GQA K/V-sharing 对 bandwidth-bound 的 decode 路径划算（S12），但对
+compute/occupancy-bound 的 prefill 路径净负。在此架构上不要在 prefill 上重试。**
 
 <!-- Append one ### entry per landed step: What / Why / Change / Result (vs prev) / Lesson -->
 
 ### S14 — activation scratch sized to the real per-step bound (2026-06-20)
-- **What**: `max_rows_` (the row count all activation buffers are sized to) was `max(max_ctx=4096,
-  max_batch_tokens=1024)` = 4096, but a forward never exceeds `max_batch_tokens` rows (the scheduler's
-  per-step budget caps T; prefills are chunked under it). Sized it to `max_batch_tokens + 16` instead.
-- **Why the +16**: surfaced a latent OOB — the WMMA prefill-attention `load_matrix_sync` reads a full
-  16-row Q tile, so a non-16-aligned last chunk over-reads up to 15 rows past T (harmless, masked by
-  `grow<ql`). The old 4096 sizing absorbed it; sizing to exactly 1024 made T=1024 over-read past the
-  buffer → illegal memory access (model_runtime.cu:272). +16 gives one Q-tile of headroom.
-- **Result**: weights+activations 17.3→17.0 GB; KV pool **36,656 → 39,040 tokens** (2291→2440 blocks),
-  now ABOVE the conc=32/1024 peak demand (36,864) → the KV-capacity cliff is eliminated. Throughput:
-  conc=32 512 912.8→915.0, 1024 605.6→606.0 — **unchanged (noise)**. Coherent.
-- **Lesson (settles the KV hypothesis)**: growing the pool past peak demand — guaranteeing zero
-  preemption — moves throughput by 0. **KV cache size / eviction is NOT the conc=32 bottleneck**
-  (re-confirms S10 post-S12, now with a fair memory fix rather than an unfair gpu-mem bump). Kept anyway:
-  fixes the latent OOB, reclaims 0.36 GB (pool now ≈ vLLM's 40,816), and removes the cliff for
-  robustness at higher concurrency / longer context.
+- **What**：`max_rows_`（所有激活缓冲都按其行数定大小）原为 `max(max_ctx=4096,
+  max_batch_tokens=1024)` = 4096，但一次 forward 永远不会超过 `max_batch_tokens` 行（调度器的
+  每步预算 cap 住 T；prefill 在其之下分块）。改为按 `max_batch_tokens + 16` 定大小。
+- **Why the +16**：暴露了一个潜在 OOB——WMMA prefill-attention 的 `load_matrix_sync` 读取一个完整
+  16 行 Q tile，所以一个非 16 对齐的末尾 chunk 会越界读取至多 15 行（无害，被
+  `grow<ql` 掩盖）。旧的 4096 定大小吸收了它；按正好 1024 定大小使 T=1024 越界读出
+  缓冲 → illegal memory access（model_runtime.cu:272）。+16 给出一个 Q-tile 的余量。
+- **Result**：weights+activations 17.3→17.0 GB；KV 池 **36,656 → 39,040 tokens**（2291→2440 blocks），
+  现在 **高于** conc=32/1024 的峰值需求（36,864）→ KV-capacity cliff 被消除。吞吐：
+  conc=32 512 912.8→915.0，1024 605.6→606.0 — **不变（噪声）**。连贯。
+- **Lesson（坐实 KV 假设）**：把池子扩过峰值需求——保证零
+  抢占——使吞吐变动为 0。**KV cache 大小 / 驱逐不是 conc=32 瓶颈**
+  （在 S12 之后重新确认 S10，现在是公平的内存修复而非不公平的 gpu-mem 抬升）。无论如何保留：
+  修了潜在 OOB，收回 0.36 GB（池子现在 ≈ vLLM 的 40,816），并为更高并发 / 更长上下文下的鲁棒性移除了 cliff。
 
 ### S15 — automatic prefix caching (branch `feat/prefix-caching`, fad12b7, 2026-06-22)
-- **What**: vLLM-style content-hashed KV reuse — identical prompt prefixes are prefilled once and the
-  cached KV blocks are spliced onto later requests. This lands the feature that the Conclusions had
-  parked as an "off-table route past the gap" (route #1), and turns the long-standing caveat
-  ("our headline gap was measured against a vLLM *with* prefix caching, which we lacked") into a
-  feature-matched, both-on comparison.
-- **Change**: three layers mirroring vLLM. **BlockPool** gains a per-block refcount + LRU free queue +
-  a content-hash→block registry; a refcount-0 block is reclaimable but kept (hash mapping retained) so
-  an identical prefix can resurrect it, and a fresh alloc pops the LRU front and evicts that block's
-  mapping. **Scheduler** chains 64-bit block hashes over (prompt ++ output); on admission
-  `acquire_prefix()` splices cached prefix blocks onto the block table and advances `computed_` past
-  them (always leaving ≥1 token), and after each forward `cache_filled()` registers newly-full blocks
-  (a finished request's blocks stay cached for the next identical prompt; a preempted request
-  re-acquires its own still-cached prefix on resume). Correctness rests on absolute-position KV
-  addressing + 16-aligned full-block reuse, so the chunked-prefill forward path is unchanged. On by
-  default; **`FQ_PREFIX_CACHE=0` disables it** for A/B, and `[kvstat]` now reports prefix hit rate.
-- **A/B (2026-06-22, same 口径 as the journey replay: `vllm bench serve --dataset-name random`,
-  out=128, temp 0, chat endpoint, enable_thinking=false; harness `/root/bench-compare/prefix_test.sh`).
-  conc=32 output tok/s, prefix cache OFF → ON for each engine:**
+- **What**：vLLM 风格的 content-hashed KV 复用——相同的 prompt 前缀只 prefill 一次，缓存的
+  KV block 被拼接到后续请求上。这落地了 Conclusions 中曾标记为「越过差距的 off-table 路线」（route #1）的特性，并把长期存在的警告
+  （「我们的头条差距是对比一个 *带* 前缀缓存的 vLLM，而我们当时没有」）变成了
+  功能对齐、双开的对比。
+- **Change**：三层结构镜像 vLLM。**BlockPool** 增加 per-block refcount + LRU free queue +
+  一个 content-hash→block 注册表；refcount-0 的 block 可回收但被保留（保留 hash 映射），以便
+  相同前缀能复活它，而一次新分配从 LRU 队首弹出并驱逐该 block 的映射。**Scheduler** 在 (prompt ++ output) 上串联 64-bit block hash；在接纳时
+  `acquire_prefix()` 把缓存的前缀 block 拼接到 block table 上并把 `computed_` 推过
+  它们（始终至少留 ≥1 token），而每次 forward 之后 `cache_filled()` 注册新填满的 block
+  （一个完成请求的 block 为下一个相同 prompt 保持缓存；一个被抢占的请求在恢复时
+  重新获取它自己仍被缓存的前缀）。正确性建立在绝对位置 KV 寻址 + 16 对齐的整 block 复用之上，所以 chunked-prefill 的 forward 路径不变。默认开启；**`FQ_PREFIX_CACHE=0` 关闭它** 用于 A/B，并且 `[kvstat]` 现在报告前缀命中率。
+- **A/B（2026-06-22，与全过程重放同口径：`vllm bench serve --dataset-name random`，
+  out=128，temp 0，chat endpoint，enable_thinking=false；harness `/root/bench-compare/prefix_test.sh`）。
+  conc=32 output tok/s，每个引擎前缀缓存 OFF → ON：**
 
   | workload (conc=32) | FQ off → on | ΔFQ | vLLM off → on | ΔvLLM | FQ-on / vLLM-on |
   |---|---|---|---|---|---|
@@ -423,49 +380,47 @@ compute/occupancy-bound prefill path. Don't retry it on prefill on this architec
   | 1024 random | 615 → 630 | +2.4% | 668 → 681 | +1.9% | 92.4% |
   | **512 shared + 512 random** | **621 → 844** | **+35.9%** | **666 → 915** | **+37.4%** | **92.2%** |
 
-  conc=1 (single stream) is flat for both — only the template prefix is shared: FQ 56/55/51 ≈ 97/96/92%
-  of vLLM 58/57/56. (FQ-off prefix_hit confirmed 0%; FQ-on ~8% on pure-random, ramping to ~22% under
-  the shared-prefix probe — vLLM's reported hit rate tracks it: ~6% → ~19%.)
-- **Result / Lesson**: on *pure-random* prompts the gain is modest (+0.6–3.6%) because the only shared
-  prefix is the Qwen3 chat-template preamble (~8% of tokens) — and at conc=32 the bottleneck is
-  prefill/decode compute, not the small prefill saved. The feature's real value appears when prompts
-  **genuinely share a prefix** (system prompts, RAG context, few-shot, multi-turn): a 512-token shared
-  prefix yields **+35.9% (FQ) ≈ +37.4% (vLLM)** — FlashQwen's prefix caching is **as effective as
-  vLLM's**. Crucially, with both engines now feature-matched *including* prefix caching, FlashQwen holds
-  **92–97% of vLLM** across inputs — the **same parity band** as the no-cache journey replay below. This
-  closes the prefix-caching thread: the feature is no longer a missing capability, and the residual gap
-  is still the prefill-side compute identified in the Conclusions, not the absent feature.
+  conc=1（单流）两者都持平——只有 template 前缀是共享的：FQ 56/55/51 ≈ vLLM 58/57/56 的 97/96/92%。（FQ-off prefix_hit 确认为 0%；FQ-on 在纯随机上 ~8%，在共享前缀探测下
+  攀升到 ~22%——vLLM 报告的命中率与之吻合：~6% → ~19%。）
+- **Result / Lesson**：在 *纯随机* prompt 上收益不大（+0.6–3.6%），因为唯一共享的
+  前缀是 Qwen3 chat-template 前导（~8% 的 token）——而在 conc=32 下瓶颈是
+  prefill/decode 计算，而非省下的那点小 prefill。该特性的真正价值出现在 prompt
+  **真正共享前缀** 时（system prompt、RAG context、few-shot、多轮）：一个 512-token 共享
+  前缀带来 **+35.9%（FQ）≈ +37.4%（vLLM）**——FlashQwen 的前缀缓存 **与
+  vLLM 一样有效**。关键是，现在两个引擎都功能对齐 *包括* 前缀缓存，FlashQwen 在各输入下保持
+  **92–97% of vLLM**——与下文无缓存全过程重放 **相同的 parity band**。这
+  关闭了前缀缓存这条线：该特性不再是缺失的能力，残余差距仍是 Conclusions 中指出的 prefill 侧计算，而非缺失的特性。
 
 ### S16 — prefill attention rewrite: WMMA → mma.sync FlashAttention-style (branch `feat/prefix-caching`, 2026-06-23)
 
-**What.** An nsys re-profile of the tracked 1024/conc32 step (prefix-cache on) split GPU time into
-**GEMM ~72% / prefill-attn ~11% / decode-attn ~12% / elementwise ~5%** — GEMM is the *identical* cuBLAS
-path as vLLM (same `ampere_*_s1688gemm_*` kernels, same ~1.12 ms/call), so the only hand-rolled hot spot
-with headroom is attention. A direct vLLM trace showed it runs **one** fused `flash_fwd_splitkv`
-(FlashAttention) at ~10% vs FlashQwen's two hand-rolled kernels.
+**What.** 对被追踪的 1024/conc32 步（前缀缓存开启）做 nsys 重新 profile，把 GPU 时间拆成
+**GEMM ~72% / prefill-attn ~11% / decode-attn ~12% / elementwise ~5%**——GEMM 是与 vLLM *完全相同* 的 cuBLAS
+路径（相同的 `ampere_*_s1688gemm_*` kernel，相同的 ~1.12 ms/call），所以唯一还有余量的手写热点
+是 attention。对 vLLM 的直接 trace 显示它跑 **一个** 融合的 `flash_fwd_splitkv`
+（FlashAttention），约 10%，而 FlashQwen 是两个手写 kernel。
 
-**Tried and rejected first — prefill split-K** (`FQ_PREFILL_KSPLIT`): mirror decode's KV-split onto the
-WMMA prefill kernel. **0 e2e gain** — prefill already has thousands of independent blocks
-(qtiles×heads×reqs) even at conc=1, so it's never block-starved; the wall is *per-block occupancy*
-(the 8 KB shared O accumulator + 1 warp/block), which split-K doesn't change. Reverted.
+**先尝试并被否决——prefill split-K**（`FQ_PREFILL_KSPLIT`）：把 decode 的 KV-split 镜像到
+WMMA prefill kernel 上。**0 e2e 收益**——prefill 即便在 conc=1 下也已有数千个独立 block
+（qtiles×heads×reqs），所以从不会 block-starved；瓶颈是 *per-block 占用率*
+（8 KB shared O 累加器 + 1 warp/block），split-K 改变不了它。已回退。
 
-**Change (the real fix).** Rewrote `attn_prefill_kernel` (WMMA, 1 warp/block, O in shared) as
-`attn_prefill_mma_kernel`, porting FlashAttention's techniques for sm_89:
-1. **O accumulator in registers** via raw `mma.sync.m16n8k16.f32.bf16.bf16.f32` (not `nvcuda::wmma`) —
-   frees the 8 KB shared O that was the occupancy wall and keeps S in registers (no shared round-trip).
-2. **64-row M tile = 4 warps/block** (each warp 16 rows).
-3. **K/V staged to block-shared once per 16-key tile, reused by all 4 warps** (~4× less KV traffic — the
-   biggest single lever); P passed through a tiny shared buffer to skip the C→A fragment repack; online
-   softmax in registers via quad `__shfl_xor`.
-4. **cp.async double-buffer** of the K/V stream (prefetch tile n+1 while computing tile n).
-Validated against an fp32 reference in a standalone microbench (numerically identical to WMMA, max|Δ|~7e-4;
-**2.5× without cp.async, 2.8× with**). Toggle `FQ_PREFILL_V2` (default 1); falls back to WMMA otherwise.
+**Change（真正的修复）.** 把 `attn_prefill_kernel`（WMMA，1 warp/block，O 在 shared）重写为
+`attn_prefill_mma_kernel`，为 sm_89 移植 FlashAttention 的技术：
+1. **O 累加器放在寄存器** 经裸 `mma.sync.m16n8k16.f32.bf16.bf16.f32`（不是 `nvcuda::wmma`）——
+   释放那曾是占用率瓶颈的 8 KB shared O，并把 S 保留在寄存器（无 shared 往返）。
+2. **64 行 M tile = 4 warps/block**（每 warp 16 行）。
+3. **K/V 每 16-key tile 暂存到 block-shared 一次，被全部 4 个 warp 复用**（KV 流量减少 ~4×——
+   单根最大的杠杆）；P 经一个很小的 shared 缓冲传递以跳过 C→A fragment 重打包；online
+   softmax 在寄存器中经 quad `__shfl_xor` 完成。
+4. **cp.async double-buffer** K/V 流（在计算 tile n 时预取 tile n+1）。
+在独立 microbench 中对一个 fp32 参考验证（数值上与 WMMA 相同，max|Δ|~7e-4；
+**不带 cp.async 2.5×，带 cp.async 2.8×**）。开关 `FQ_PREFILL_V2`（默认 1）；否则回退到 WMMA。
 
-**Result — same-session A/B (`FQ_PREFILL_V2` 0=WMMA / 1=mma), conc=32 output tok/s, both cache states.**
-The no-cache S14/WMMA row reproduces the historical journey replay (606 vs 605 @1024; vLLM 652 identical),
-confirming the two are directly comparable.
+**Result — 同会话 A/B（`FQ_PREFILL_V2` 0=WMMA / 1=mma），conc=32 output tok/s，两种缓存状态。**
+无缓存的 S14/WMMA 行复现了历史全过程重放（606 vs 605 @1024；vLLM 652 相同），
+确认两者可直接对比。
 
-*No prefix cache (feature-matched, extends the journey-replay table):*
+*No prefix cache（功能对齐，扩展全过程重放表）：*
 
 | in | S14 (WMMA) | **S16 (mma)** | ΔFQ | vLLM | S16 % of vLLM |
 |---|---|---|---|---|---|
@@ -473,7 +428,7 @@ confirming the two are directly comparable.
 | 512  | 913  | 927  | +1.5% | 948  | 97.7% |
 | **1024** | **606** | **640** | **+5.6%** | **652** | **93.0% → 98.1%** |
 
-*Prefix cache ON (the branch default / deployed mode):*
+*Prefix cache ON（分支默认 / 部署模式）：*
 
 | in | S15 (WMMA+cache) | **S16 (mma+cache)** | ΔFQ | vLLM+cache | S16 % of vLLM |
 |---|---|---|---|---|---|
@@ -482,24 +437,21 @@ confirming the two are directly comparable.
 | **1024** | **621** | **655** | **+5.5%** | **681** | **92.4% → 96.2%** |
 | 512 shared + 512 random | 831 | 870 | +4.7% | — | — |
 
-in=128 and all conc=1 are flat (prefill-attn is a negligible slice there) — expected. The rewrite lifts
-exactly the long-context, prefill-heavy regime it targets: **at 1024/conc32 the gap to vLLM closes from
-~7% to ~2% (no-cache) / ~4% (cache-on)**, the smallest it has ever been at bf16 parity.
+in=128 和所有 conc=1 都持平（prefill-attn 在那里占比可忽略）——符合预期。该重写恰好抬升了它瞄准的长上下文、prefill-heavy 区间：**在 1024/conc32 下与 vLLM 的差距从
+~7% 收窄到 ~2%（无缓存）/ ~4%（缓存开启）**，这是 bf16 对齐下有史以来最小的。
 
-**Lesson.** The microbench 2.8× dilutes to +5.5% e2e exactly as the profile predicts (prefill-attn ~11% of
-GPU → halved → ~5% realized); cp.async added only the last ~0.9% (diminishing once the first 2.5× shrank
-attention's share). **Decode left unchanged and deliberately NOT unified into one mma kernel:** FA reuses
-its mainloop for decode (splitkv) for library maintainability, but on q_len=1 mma wastes 15/16 of the M
-tile (the S4 lesson) and FlashQwen's SIMT decode kernel has a GQA register-reuse advantage FA lacks — two
-specialized kernels (S6's split-by-request-type) beat one unified mma kernel here. Full FA-vs-FlashQwen
-comparison: [`attention-vs-flashattention.md`](attention-vs-flashattention.md).
+**Lesson.** microbench 的 2.8× 恰如 profile 预测的那样稀释为 +5.5% e2e（prefill-attn ~11% of
+GPU → 减半 → ~5% 实现）；cp.async 只加了最后 ~0.9%（一旦头一个 2.5× 缩小了 attention 占比后便递减）。**decode 保持不变，并刻意 NOT 统一进一个 mma kernel：** FA 为库的可维护性把它的 mainloop 复用于 decode（splitkv），但在 q_len=1 时 mma 浪费 M tile 的 15/16
+（S4 教训），而 FlashQwen 的 SIMT decode kernel 有一个 FA 缺乏的 GQA 寄存器复用优势——两个
+专用 kernel（S6 的 split-by-request-type）在这里胜过一个统一 mma kernel。完整的 FA-vs-FlashQwen
+对比：[`attention-vs-flashattention.md`](attention-vs-flashattention.md)。
 
 ## Final results — journey replay across input lengths (2026-06-20)
 
-Every landed step `git checkout`'d, rebuilt clean, benched at 128/512/1024 input (output 128) on one
-machine/day, vs a feature-matched vLLM (`--no-enable-prefix-caching`).
+每个落地步骤都 `git checkout`、干净重建、在 128/512/1024 input（output 128）下于同一
+机器/同一天 bench，对比一个功能对齐的 vLLM（`--no-enable-prefix-caching`）。
 
-**conc=32 output tok/s (and % of feature-matched vLLM):**
+**conc=32 output tok/s（及 % of feature-matched vLLM）：**
 
 | step | in=128 | in=512 | in=1024 | what this step bought |
 |---|---|---|---|---|
@@ -516,58 +468,50 @@ machine/day, vs a feature-matched vLLM (`--no-enable-prefix-caching`).
 | **S16** | **1318 (94.6%)** | **927 (97.7%)** | **640 (98.1%)** | **prefill attn WMMA→mma.sync — lifts long input most (+5.6pt→98% @1024)** |
 | vLLM | 1376/1393 (100%) | 944/948 (100%) | 652 (100%) | feature-matched reference |
 
-(S16 row + its vLLM `%` are a same-session A/B re-measured 2026-06-23 — the S16-off/WMMA control reproduced
-the historical S14 row: 606 vs 605 @1024, vLLM 652 identical — so the row is directly comparable. S15
-(prefix caching) is omitted here because with prefix cache OFF it is identical to S14; its effect is shown
-in the S15 entry's cache-on A/B above. vLLM 128/512 cells: historical / S16-session.)
+（S16 行 + 其 vLLM `%` 是 2026-06-23 重测的同会话 A/B——S16-off/WMMA 对照复现了
+历史 S14 行：606 vs 605 @1024，vLLM 652 相同——所以该行可直接对比。S15
+（前缀缓存）在此省略，因为前缀缓存 OFF 时它与 S14 相同；其效果见上文 S15 条目的缓存开启 A/B。vLLM 128/512 单元：历史 / S16 会话。）
 
-**Reading the chart.** Two clean facts: (1) every optimization acts on the regime it targets and they
-don't overlap — S6 (decode attn) lifts in=128 most; S7/S8 (prefill attn) lift in=1024 most; S10 (the
-KV-cliff scheduler fix) moves *only* in=1024. (2) Through S14 the gap to vLLM was monotone in input length
-(97.5% → 96.2% → 92.8%) — the residual concentrated at long input, i.e. prefill-side compute. **S16's
-mma.sync prefill-attention rewrite then attacked exactly that long-input residual**, lifting 1024 from
-92.8% to **98.1%** of vLLM (and 512 to 97.7%) — so the curve is now nearly flat across input length and
-the long-context prefill gap, the last structural one, is largely closed at bf16 parity.
+**Reading the chart.** 两个干净的事实：(1) 每项优化作用于它瞄准的 regime 且彼此
+不重叠——S6（decode attn）抬升 in=128 最多；S7/S8（prefill attn）抬升 in=1024 最多；S10（KV-cliff 调度器修复）*只* 移动 in=1024。(2) 直到 S14，与 vLLM 的差距是输入长度的单调函数
+（97.5% → 96.2% → 92.8%）——残余集中在长输入，即 prefill 侧计算。**S16 的
+mma.sync prefill-attention 重写随即恰好攻击了那个长输入残余**，把 1024 从
+92.8% 抬到 vLLM 的 **98.1%**（512 抬到 97.7%）——所以曲线现在跨输入长度近乎平直，而
+长上下文 prefill 差距，这最后一个结构性差距，在 bf16 对齐下已基本闭合。
 
 ## Conclusions — what's exhausted and where the residual lives
 
-> **Update (S16, 2026-06-23):** the prefill-attention rewrite below closed most of the long-input gap
-> this section attributed to "prefill-side compute" — 1024/conc32 is now **98.1% of vLLM no-cache /
-> 96.2% cache-on** (was 92.8%). The analysis below still holds for *why* the gap existed and which levers
-> were dead; the one live attention lever it flagged has now been taken.
+> **Update (S16, 2026-06-23)：** 下文的 prefill-attention 重写闭合了本节归因为「prefill 侧计算」的
+> 大部分长输入差距——1024/conc32 现在是 **98.1% of vLLM no-cache /
+> 96.2% cache-on**（曾为 92.8%）。下文分析对 *为什么* 存在差距以及哪些杠杆
+> 是死路仍然成立；它标记的那一根活的 attention 杠杆现在已被拿下。
 
 
-At bf16 parity on a 4090, the conc=32 bottleneck was chased to ground. Levers tried and **ruled out**
-(each with data, not reasoning):
+在 4090 上的 bf16 对齐下，conc=32 瓶颈已被追到底。尝试过并 **排除** 的杠杆
+（每个都有数据，而非推理）：
 
-- **Decode GEMM** — at ~84% of HBM peak; both engines hit the same physical floor (only quantization
-  beats it, off-table). cuBLAS `cublasGemmEx(DEFAULT)` already picks the aspect-ratio-optimal kernel
-  per shape/M (split-K auto-tuned: large-K `down` always splits, large-N `gateup`/`lm_head` never;
-  cuBLASLt autotune ties it for M≥8, wins only at M=1/conc-1). GEMM is closed for conc=32.
-- **CPU/scheduling overlap (async scheduler)** — steady-state GPU is **98.7% busy**; the per-step host
-  bubble is ~0.2%. Our 50 ms GPU steps dwarf ~0.12 ms host prep, so vLLM/SGLang-style "run one step
-  ahead" buys ~nothing here.
-- **CUDA graphs** (S11) — net-negative (−12% @conc=32): not launch-bound.
-- **KV cache size / eviction** (S14) — growing the pool *past* peak demand (zero preemption possible)
-  moved throughput by **0**. Not the bottleneck; the marginal cliff is absorbed by completion staggering.
-- **prefill attention occupancy** (S8 banked it; S9 head-split flat; S13 GQA-shared prefill 0.73×
-  *slower* — compute/occupancy-bound, can't afford the 4× O accumulator). Tapped.
-- **prefill chunk size / gpu-mem-fraction** — flat / unfair. Done.
+- **Decode GEMM** — 已在 HBM peak 的 ~84%；两个引擎都撞到同一物理下限（只有量化
+  能打破它，off-table）。cuBLAS `cublasGemmEx(DEFAULT)` 已按每个 shape/M 选取 aspect-ratio 最优的 kernel
+  （split-K 自动调优：large-K 的 `down` 总是 split，large-N 的 `gateup`/`lm_head` 从不；
+  cuBLASLt autotune 在 M≥8 时打平，只在 M=1/conc-1 时胜出）。GEMM 对 conc=32 已关闭。
+- **CPU/调度重叠（async scheduler）** — 稳态 GPU **98.7% 忙**；每步 host
+  气泡约 ~0.2%。我们 50 ms 的 GPU 步远超 ~0.12 ms 的 host 准备，所以 vLLM/SGLang 风格的「提前跑一步」在这里几乎买不到什么。
+- **CUDA graphs**（S11）— 净负（−12% @conc=32）：不是 launch-bound。
+- **KV cache 大小 / 驱逐**（S14）— 把池子扩到 *超过* 峰值需求（零抢占可能）
+  使吞吐变动 **0**。不是瓶颈；边际 cliff 被完成错峰吸收。
+- **prefill attention 占用率**（S8 攒下；S9 head-split 持平；S13 GQA-shared prefill 0.73×
+  *更慢*——compute/occupancy-bound，付不起 4× O 累加器）。已榨干。
+- **prefill chunk 大小 / gpu-mem-fraction** — 持平 / 不公平。已了结。
 
-**The residual gap (in=1024 ~7%) is prefill-side compute** — the prefill GEMM is large-M and
-compute-bound at the cuBLAS limit, and our hand-rolled WMMA prefill attention, while good, is a bit
-behind vLLM's FlashAttention there. It shrinks toward 0 as input shortens (decode dominates).
+**残余差距（in=1024 ~7%）是 prefill 侧计算**——prefill GEMM 是 large-M 且在 cuBLAS 极限上 compute-bound，而我们手写的 WMMA prefill attention 虽好，但在那里略
+落后于 vLLM 的 FlashAttention。它随输入变短趋向 0（decode 主导）。
 
-**Only routes past it, both off the bf16-parity table:**
-1. **Prefix caching** — **LANDED (S15, `feat/prefix-caching`).** Automatic content-hashed KV reuse,
-   on by default. On pure-random inputs it recovers only the shared chat-template prefix (~2–4% at
-   conc=32, matching what vLLM's default gains); on workloads with a real shared prefix it is a large
-   win (**+36%** with a 512-token shared prefix, on par with vLLM's +37%). With both engines now
-   feature-matched including prefix caching, FlashQwen holds the same 92–97%-of-vLLM band. A further
-   step here would be cascade / shared-prefix attention (the FlashInfer decomposition) for the
-   *attention* over a shared prefix, not just KV reuse.
-2. **Quantization** (fp8/int weights or fp8 KV) — directly cuts the dominant weight-traffic / prefill-
-   GEMM cost, but breaks strict bf16 parity.
+**越过它的路线只有两条，都在 bf16 对齐表之外：**
+1. **前缀缓存** — **已落地（S15，`feat/prefix-caching`）。** 自动 content-hashed KV 复用，
+   默认开启。在纯随机输入上它只收回共享的 chat-template 前缀（conc=32 下 ~2–4%，与 vLLM 默认所得相当）；在有真实共享前缀的负载上它是一个大
+   胜利（512-token 共享前缀下 **+36%**，与 vLLM 的 +37% 持平）。现在两个引擎都
+   功能对齐包括前缀缓存，FlashQwen 保持同样的 92–97%-of-vLLM band。这里更进一步是为共享前缀上的 *attention* 做 cascade / shared-prefix attention（FlashInfer 分解），而不只是 KV 复用。
+2. **量化**（fp8/int 权重或 fp8 KV）— 直接削减主导的 weight-traffic / prefill-
+   GEMM 代价，但打破严格的 bf16 对齐。
 
-Net: at equal precision + equal features, FlashQwen is **92.8–97.5% of vLLM** depending on input
-length, **5.5×** over where it started, with the remaining gap localized, measured, and explained.
+净：在等精度 + 等特性下，FlashQwen 视输入长度是 **92.8–97.5% of vLLM**，相比起点 **5.5×**，剩余差距已定位、已测量、已解释。
