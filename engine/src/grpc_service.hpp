@@ -1,11 +1,11 @@
-// Token-level gRPC inference engine (the only mode). The Go app is the client: it sends prompt
-// token ids + sampling + stop ids, and the engine streams back sampled token ids. The engine has
-// no model-text knowledge — tokenisation, chat template, and tool-call detection all live in Go.
-//
-// The engine loads the model first and only then binds its gRPC port, so a successful GetModel
-// doubles as the readiness signal; load progress and failures are written to stderr.
+// Token-level gRPC inference engine. The client sends prompt token ids +
+// sampling + stop ids; the engine streams back sampled token ids. No model-text
+// knowledge here — tokenisation/chat template/tool-call detection live in Go.
+// The port binds only after the model loads, so a successful GetModel is the
+// readiness signal; load progress/failures go to stderr.
 #pragma once
-#include "args.hpp"
 #include <string>
 
-int run_engine(const Args& a, const std::string& model_id);
+#include "args.hpp"
+
+int RunEngine(const Args& a, const std::string& model_id);
