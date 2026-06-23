@@ -20,14 +20,16 @@ path, and the attention kernels.
 | 128 (decode-heavy) | 1318 | 1393 | **94.6%** |
 | 512 | 927 | 948 | **97.7%** |
 | 1024 (prefill-heavy) | 640 | 652 | **98.1%** |
-| ShareGPT (real data) | 1170 | 1159 | **100.9%** |
+| ShareGPT (1000, real data) | 1286 | 1328 | **96.8%** |
 
 - **~6×** over the `main` baseline at conc=32/1024 (107 → 640 tok/s).
 - Through S14 the gap **grew with input length** (residual = prefill-side compute). **S16** (the
   mma.sync prefill-attention rewrite) attacked exactly that, lifting 1024 from 92.8% → **98.1%** — the
   curve is now nearly flat and the last structural gap (long-context prefill) is largely closed.
-- On real conversational data (ShareGPT) FlashQwen is **at parity** (100.9%), with far lower TTFT
-  (3–22 ms vs vLLM's 355–1166 ms at saturation) and slightly higher steady-state TPOT.
+- On real conversational data (1000 ShareGPT conversations, equal output budget) FlashQwen is **96.8%**
+  of vLLM; with the TTFT-measurement fix (commit `32d05ea`) its TTFT is now honestly lower than vLLM's
+  (94.6 vs 138.8 ms mean at conc=32 — vLLM front-loads queued chunked-prefill) while its steady-state
+  TPOT is ~4% higher. Prefix caching is neutral on ShareGPT for both engines (cross-request overlap ≈ 0).
 - Decode GEMM, KV capacity/eviction, CUDA graphs, and CPU/scheduling overlap were each measured and
   **ruled out** as the conc=32 bottleneck (see Conclusions).
 
@@ -92,7 +94,9 @@ Wide head-to-head (FQ concurrency ceiling = 32, `MAX_DECODE_B`). Full tables + m
 - **Input length** (out=128, c=32; 2048@c16): 97.1% / 98.3% / 97.8% / 91.9% (128/512/1024/2048).
 - **Concurrency** (in=512): 96.4% / 95.0% / 96.6% / 98.3% (c=1/8/16/32).
 - **Output length** (in=512, c=32): out=128 98.3%, out=512 96.1%, **out=1024 107.4%** (FQ faster).
-- **ShareGPT real data** (c=32): **100.9%** (1170 vs 1159); FQ TTFT ~22× lower, vLLM TPOT 13% lower.
+- **ShareGPT real data** (1000 conversations, c=32, equal output budget): **96.8%** (1286 vs 1328);
+  honest TTFT (post `32d05ea`) FQ lower (94.6 vs 138.8 ms), TPOT vLLM ~4% lower; prefix cache neutral.
+  Full breakdown: [sharegpt-1000-comparison](exps/sharegpt-1000-comparison.md).
 
 S17 also found & fixed a prefix-cache correctness bug (the S16 cp.async double-buffer corrupted large
 prefix hits → empty output; fixed by single-buffer staging, commit `aaf4e0d`). A suspected high-concurrency
@@ -116,5 +120,5 @@ What remains is small and localized; the two routes past it are both **off the b
    but breaks strict bf16 parity.
 
 **Net:** at equal precision + equal features, FlashQwen is **~95–98% of vLLM** across input lengths and
-**at parity (~100%) on real conversational data**, **~6×** over where it started — with the remaining gap
-localized, measured, and explained.
+**~97% on real conversational data** (1000 ShareGPT, equal output budget), **~6×** over where it started —
+with the remaining gap localized, measured, and explained.
