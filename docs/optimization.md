@@ -396,6 +396,104 @@ compute/occupancy-bound prefill path. Don't retry it on prefill on this architec
   fixes the latent OOB, reclaims 0.36 GB (pool now ≈ vLLM's 40,816), and removes the cliff for
   robustness at higher concurrency / longer context.
 
+### S15 — automatic prefix caching (branch `feat/prefix-caching`, fad12b7, 2026-06-22)
+- **What**: vLLM-style content-hashed KV reuse — identical prompt prefixes are prefilled once and the
+  cached KV blocks are spliced onto later requests. This lands the feature that the Conclusions had
+  parked as an "off-table route past the gap" (route #1), and turns the long-standing caveat
+  ("our headline gap was measured against a vLLM *with* prefix caching, which we lacked") into a
+  feature-matched, both-on comparison.
+- **Change**: three layers mirroring vLLM. **BlockPool** gains a per-block refcount + LRU free queue +
+  a content-hash→block registry; a refcount-0 block is reclaimable but kept (hash mapping retained) so
+  an identical prefix can resurrect it, and a fresh alloc pops the LRU front and evicts that block's
+  mapping. **Scheduler** chains 64-bit block hashes over (prompt ++ output); on admission
+  `acquire_prefix()` splices cached prefix blocks onto the block table and advances `computed_` past
+  them (always leaving ≥1 token), and after each forward `cache_filled()` registers newly-full blocks
+  (a finished request's blocks stay cached for the next identical prompt; a preempted request
+  re-acquires its own still-cached prefix on resume). Correctness rests on absolute-position KV
+  addressing + 16-aligned full-block reuse, so the chunked-prefill forward path is unchanged. On by
+  default; **`FQ_PREFIX_CACHE=0` disables it** for A/B, and `[kvstat]` now reports prefix hit rate.
+- **A/B (2026-06-22, same 口径 as the journey replay: `vllm bench serve --dataset-name random`,
+  out=128, temp 0, chat endpoint, enable_thinking=false; harness `/root/bench-compare/prefix_test.sh`).
+  conc=32 output tok/s, prefix cache OFF → ON for each engine:**
+
+  | workload (conc=32) | FQ off → on | ΔFQ | vLLM off → on | ΔvLLM | FQ-on / vLLM-on |
+  |---|---|---|---|---|---|
+  | 128 random | 1350 → 1359 | +0.6% | 1406 → 1407 | ~0 | 96.6% |
+  | 512 random | 920 → 953 | +3.6% | 962 → 982 | +2.0% | 97.1% |
+  | 1024 random | 615 → 630 | +2.4% | 668 → 681 | +1.9% | 92.4% |
+  | **512 shared + 512 random** | **621 → 844** | **+35.9%** | **666 → 915** | **+37.4%** | **92.2%** |
+
+  conc=1 (single stream) is flat for both — only the template prefix is shared: FQ 56/55/51 ≈ 97/96/92%
+  of vLLM 58/57/56. (FQ-off prefix_hit confirmed 0%; FQ-on ~8% on pure-random, ramping to ~22% under
+  the shared-prefix probe — vLLM's reported hit rate tracks it: ~6% → ~19%.)
+- **Result / Lesson**: on *pure-random* prompts the gain is modest (+0.6–3.6%) because the only shared
+  prefix is the Qwen3 chat-template preamble (~8% of tokens) — and at conc=32 the bottleneck is
+  prefill/decode compute, not the small prefill saved. The feature's real value appears when prompts
+  **genuinely share a prefix** (system prompts, RAG context, few-shot, multi-turn): a 512-token shared
+  prefix yields **+35.9% (FQ) ≈ +37.4% (vLLM)** — FlashQwen's prefix caching is **as effective as
+  vLLM's**. Crucially, with both engines now feature-matched *including* prefix caching, FlashQwen holds
+  **92–97% of vLLM** across inputs — the **same parity band** as the no-cache journey replay below. This
+  closes the prefix-caching thread: the feature is no longer a missing capability, and the residual gap
+  is still the prefill-side compute identified in the Conclusions, not the absent feature.
+
+### S16 — prefill attention rewrite: WMMA → mma.sync FlashAttention-style (branch `feat/prefix-caching`, 2026-06-23)
+
+**What.** An nsys re-profile of the tracked 1024/conc32 step (prefix-cache on) split GPU time into
+**GEMM ~72% / prefill-attn ~11% / decode-attn ~12% / elementwise ~5%** — GEMM is the *identical* cuBLAS
+path as vLLM (same `ampere_*_s1688gemm_*` kernels, same ~1.12 ms/call), so the only hand-rolled hot spot
+with headroom is attention. A direct vLLM trace showed it runs **one** fused `flash_fwd_splitkv`
+(FlashAttention) at ~10% vs FlashQwen's two hand-rolled kernels.
+
+**Tried and rejected first — prefill split-K** (`FQ_PREFILL_KSPLIT`): mirror decode's KV-split onto the
+WMMA prefill kernel. **0 e2e gain** — prefill already has thousands of independent blocks
+(qtiles×heads×reqs) even at conc=1, so it's never block-starved; the wall is *per-block occupancy*
+(the 8 KB shared O accumulator + 1 warp/block), which split-K doesn't change. Reverted.
+
+**Change (the real fix).** Rewrote `attn_prefill_kernel` (WMMA, 1 warp/block, O in shared) as
+`attn_prefill_mma_kernel`, porting FlashAttention's techniques for sm_89:
+1. **O accumulator in registers** via raw `mma.sync.m16n8k16.f32.bf16.bf16.f32` (not `nvcuda::wmma`) —
+   frees the 8 KB shared O that was the occupancy wall and keeps S in registers (no shared round-trip).
+2. **64-row M tile = 4 warps/block** (each warp 16 rows).
+3. **K/V staged to block-shared once per 16-key tile, reused by all 4 warps** (~4× less KV traffic — the
+   biggest single lever); P passed through a tiny shared buffer to skip the C→A fragment repack; online
+   softmax in registers via quad `__shfl_xor`.
+4. **cp.async double-buffer** of the K/V stream (prefetch tile n+1 while computing tile n).
+Validated against an fp32 reference in a standalone microbench (numerically identical to WMMA, max|Δ|~7e-4;
+**2.5× without cp.async, 2.8× with**). Toggle `FQ_PREFILL_V2` (default 1); falls back to WMMA otherwise.
+
+**Result — same-session A/B (`FQ_PREFILL_V2` 0=WMMA / 1=mma), conc=32 output tok/s, both cache states.**
+The no-cache S14/WMMA row reproduces the historical journey replay (606 vs 605 @1024; vLLM 652 identical),
+confirming the two are directly comparable.
+
+*No prefix cache (feature-matched, extends the journey-replay table):*
+
+| in | S14 (WMMA) | **S16 (mma)** | ΔFQ | vLLM | S16 % of vLLM |
+|---|---|---|---|---|---|
+| 128  | 1315 | 1318 | +0.2% | 1393 | 94.6% |
+| 512  | 913  | 927  | +1.5% | 948  | 97.7% |
+| **1024** | **606** | **640** | **+5.6%** | **652** | **93.0% → 98.1%** |
+
+*Prefix cache ON (the branch default / deployed mode):*
+
+| in | S15 (WMMA+cache) | **S16 (mma+cache)** | ΔFQ | vLLM+cache | S16 % of vLLM |
+|---|---|---|---|---|---|
+| 128  | 1351 | 1352 | ~0    | 1407 | 96.1% |
+| 512  | 940  | 955  | +1.7% | 982  | 97.3% |
+| **1024** | **621** | **655** | **+5.5%** | **681** | **92.4% → 96.2%** |
+| 512 shared + 512 random | 831 | 870 | +4.7% | — | — |
+
+in=128 and all conc=1 are flat (prefill-attn is a negligible slice there) — expected. The rewrite lifts
+exactly the long-context, prefill-heavy regime it targets: **at 1024/conc32 the gap to vLLM closes from
+~7% to ~2% (no-cache) / ~4% (cache-on)**, the smallest it has ever been at bf16 parity.
+
+**Lesson.** The microbench 2.8× dilutes to +5.5% e2e exactly as the profile predicts (prefill-attn ~11% of
+GPU → halved → ~5% realized); cp.async added only the last ~0.9% (diminishing once the first 2.5× shrank
+attention's share). **Decode left unchanged and deliberately NOT unified into one mma kernel:** FA reuses
+its mainloop for decode (splitkv) for library maintainability, but on q_len=1 mma wastes 15/16 of the M
+tile (the S4 lesson) and FlashQwen's SIMT decode kernel has a GQA register-reuse advantage FA lacks — two
+specialized kernels (S6's split-by-request-type) beat one unified mma kernel here. Full FA-vs-FlashQwen
+comparison: [`attention-vs-flashattention.md`](attention-vs-flashattention.md).
+
 ## Final results — journey replay across input lengths (2026-06-20)
 
 Every landed step `git checkout`'d, rebuilt clean, benched at 128/512/1024 input (output 128) on one
@@ -415,15 +513,29 @@ machine/day, vs a feature-matched vLLM (`--no-enable-prefix-caching`).
 | S10 | 1334 (97.0%) | 882 (93.4%) | 581 (89.1%) | max-batch-tokens=1024 — **only @1024** (+7.6pt, the cliff) |
 | S12 | 1338 (97.2%) | 906 (96.0%) | 604 (92.7%) | GQA-shared decode attn — mid/long input |
 | **S14** | **1341 (97.5%)** | **908 (96.2%)** | **605 (92.8%)** | pool fix (throughput-neutral) |
-| vLLM | 1376 (100%) | 944 (100%) | 652 (100%) | feature-matched reference |
+| **S16** | **1318 (94.6%)** | **927 (97.7%)** | **640 (98.1%)** | **prefill attn WMMA→mma.sync — lifts long input most (+5.6pt→98% @1024)** |
+| vLLM | 1376/1393 (100%) | 944/948 (100%) | 652 (100%) | feature-matched reference |
+
+(S16 row + its vLLM `%` are a same-session A/B re-measured 2026-06-23 — the S16-off/WMMA control reproduced
+the historical S14 row: 606 vs 605 @1024, vLLM 652 identical — so the row is directly comparable. S15
+(prefix caching) is omitted here because with prefix cache OFF it is identical to S14; its effect is shown
+in the S15 entry's cache-on A/B above. vLLM 128/512 cells: historical / S16-session.)
 
 **Reading the chart.** Two clean facts: (1) every optimization acts on the regime it targets and they
 don't overlap — S6 (decode attn) lifts in=128 most; S7/S8 (prefill attn) lift in=1024 most; S10 (the
-KV-cliff scheduler fix) moves *only* in=1024. (2) The gap to vLLM is monotone in input length
-(97.5% → 96.2% → 92.8%): **decode-heavy serving is at vLLM parity; the whole residual is prefill-side
-compute.**
+KV-cliff scheduler fix) moves *only* in=1024. (2) Through S14 the gap to vLLM was monotone in input length
+(97.5% → 96.2% → 92.8%) — the residual concentrated at long input, i.e. prefill-side compute. **S16's
+mma.sync prefill-attention rewrite then attacked exactly that long-input residual**, lifting 1024 from
+92.8% to **98.1%** of vLLM (and 512 to 97.7%) — so the curve is now nearly flat across input length and
+the long-context prefill gap, the last structural one, is largely closed at bf16 parity.
 
-## Conclusions — what's exhausted and where the last ~7% lives
+## Conclusions — what's exhausted and where the residual lives
+
+> **Update (S16, 2026-06-23):** the prefill-attention rewrite below closed most of the long-input gap
+> this section attributed to "prefill-side compute" — 1024/conc32 is now **98.1% of vLLM no-cache /
+> 96.2% cache-on** (was 92.8%). The analysis below still holds for *why* the gap existed and which levers
+> were dead; the one live attention lever it flagged has now been taken.
+
 
 At bf16 parity on a 4090, the conc=32 bottleneck was chased to ground. Levers tried and **ruled out**
 (each with data, not reasoning):
@@ -447,9 +559,13 @@ compute-bound at the cuBLAS limit, and our hand-rolled WMMA prefill attention, w
 behind vLLM's FlashAttention there. It shrinks toward 0 as input shortens (decode dominates).
 
 **Only routes past it, both off the bf16-parity table:**
-1. **Prefix caching / cascade attention** (vLLM's default; the FlashInfer shared-prefix decomposition)
-   — caches the benchmark's shared chat-template prefix for the ~7% vLLM's default enjoys, and is a
-   large win for real serving (system prompts, RAG, multi-turn). Zero benefit on random-prefix inputs.
+1. **Prefix caching** — **LANDED (S15, `feat/prefix-caching`).** Automatic content-hashed KV reuse,
+   on by default. On pure-random inputs it recovers only the shared chat-template prefix (~2–4% at
+   conc=32, matching what vLLM's default gains); on workloads with a real shared prefix it is a large
+   win (**+36%** with a 512-token shared prefix, on par with vLLM's +37%). With both engines now
+   feature-matched including prefix caching, FlashQwen holds the same 92–97%-of-vLLM band. A further
+   step here would be cascade / shared-prefix attention (the FlashInfer decomposition) for the
+   *attention* over a shared prefix, not just KV reuse.
 2. **Quantization** (fp8/int weights or fp8 KV) — directly cuts the dominant weight-traffic / prefill-
    GEMM cost, but breaks strict bf16 parity.
 

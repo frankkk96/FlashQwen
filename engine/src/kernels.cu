@@ -1,6 +1,8 @@
 #include "kernels.cuh"
 #include "kv_cache.cuh"   // kv_phys_row: the paged-KV addressing contract (shared with block_pool.cu)
 #include <mma.h>
+#include <cuda_pipeline.h>   // cp.async (prefill K/V double-buffer)
+#include <cstdlib>           // getenv (FQ_PREFILL_V2)
 using namespace nvcuda;
 
 // ---------------------------------------------------------------------------------------
@@ -493,6 +495,144 @@ __global__ void attn_prefill_kernel(const bf16* __restrict__ q, int q_stride,
     }
 }
 
+// --- prefill v2: mma.sync (m16n8k16 bf16) FlashAttention-style. 4 warps / block, 64-query-row tile;
+// block-shared K/V staged ONCE per 16-key tile and reused by all 4 warps (~4x less KV traffic), O kept
+// in REGISTERS (mma C-fragment) and rescaled per online-softmax step (no shared O round-trip), online
+// softmax in registers via quad shuffles. V is staged transposed so the P@V B-operand is natural; P is
+// passed through a tiny shared buffer to skip the C->A fragment repack. ~2.5x the WMMA kernel
+// (microbench, hd=128). HD==128, block_size==16 only.
+static __device__ __forceinline__ unsigned fqa_pack(__nv_bfloat16 a, __nv_bfloat16 b){
+    __nv_bfloat162 t = __halves2bfloat162(a,b); unsigned x; memcpy(&x,&t,4); return x;
+}
+static __device__ __forceinline__ void fqa_mma(float d[4], const unsigned a[4], const unsigned b[2],
+                                               const float c[4]){
+    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+      "{%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%10,%11,%12,%13};\n"
+      :"=f"(d[0]),"=f"(d[1]),"=f"(d[2]),"=f"(d[3])
+      :"r"(a[0]),"r"(a[1]),"r"(a[2]),"r"(a[3]),"r"(b[0]),"r"(b[1]),
+       "f"(c[0]),"f"(c[1]),"f"(c[2]),"f"(c[3]));
+}
+__global__ void attn_prefill_mma_kernel(const bf16* __restrict__ q, int q_stride,
+                                        const bf16* __restrict__ cache_k, const bf16* __restrict__ cache_v,
+                                        bf16* __restrict__ out, int n_heads, int n_kv,
+                                        const int* __restrict__ pos, const int* __restrict__ qstart,
+                                        const int* __restrict__ qlen, const int* __restrict__ rids,
+                                        const int* __restrict__ bt, int max_blocks, float scale){
+    constexpr int HDc=128, NT=HDc/8;
+    int r=rids[blockIdx.z], h=blockIdx.y;
+    int warp=threadIdx.x>>5, lane=threadIdx.x&31, grp=lane>>2, tg=lane&3;
+    int ql=qlen[r], qs=qstart[r];
+    int qbase=blockIdx.x*64 + warp*16;
+    int kvh=h/(n_heads/n_kv), kv_dim=n_kv*HDc;
+    const int* btr=bt + (size_t)r*max_blocks;
+    if(blockIdx.x*64>=ql) return;             // whole block past this request's rows
+
+    __shared__ bf16 Ksh[2][16*HDc];           // double-buffered (cp.async), natural
+    __shared__ bf16 Vsh[2][16*HDc];           // double-buffered (cp.async), natural
+    __shared__ bf16 Psh[4][16*16];
+    bf16* Ps=Psh[warp];
+
+    unsigned qa[8][4];
+    for(int kk=0; kk<8; ++kk){
+        const bf16* qp=q + (size_t)(qs+qbase)*q_stride + (size_t)h*HDc + kk*16;
+        #define FQ_QG(row,col) ((qbase+(row))<ql ? qp[(size_t)(row)*q_stride+(col)] : __float2bfloat16(0.f))
+        qa[kk][0]=fqa_pack(FQ_QG(grp,tg*2),     FQ_QG(grp,tg*2+1));
+        qa[kk][1]=fqa_pack(FQ_QG(grp+8,tg*2),   FQ_QG(grp+8,tg*2+1));
+        qa[kk][2]=fqa_pack(FQ_QG(grp,tg*2+8),   FQ_QG(grp,tg*2+9));
+        qa[kk][3]=fqa_pack(FQ_QG(grp+8,tg*2+8), FQ_QG(grp+8,tg*2+9));
+        #undef FQ_QG
+    }
+    float O[NT][4]; for(int t=0;t<NT;t++){O[t][0]=O[t][1]=O[t][2]=O[t][3]=0.f;}
+    float m0=-1e30f,m1=-1e30f,l0=0.f,l1=0.f;
+
+    int blast=min(blockIdx.x*64+63, ql-1);
+    int ntiles=pos[qs+blast]/16 + 1;
+
+    auto stage=[&](int kt,int buf){     // async-copy tile kt's K&V (natural) into buffer buf
+        size_t kvbase=(size_t)btr[kt]*16*kv_dim + (size_t)kvh*HDc;
+        for(int c=threadIdx.x; c<16*16; c+=128){ int key=c>>4, ck=c&15;   // 16B (8 bf16) chunks
+            __pipeline_memcpy_async(&Ksh[buf][key*HDc+ck*8], &cache_k[kvbase+(size_t)key*kv_dim+ck*8], 16);
+            __pipeline_memcpy_async(&Vsh[buf][key*HDc+ck*8], &cache_v[kvbase+(size_t)key*kv_dim+ck*8], 16); }
+        __pipeline_commit();
+    };
+    stage(0,0);
+    for(int kt=0; kt<ntiles; ++kt){
+        int cur=kt&1;
+        if(kt+1<ntiles) stage(kt+1,(kt+1)&1);          // prefetch next tile while we compute this one
+        __pipeline_wait_prior(kt+1<ntiles?1:0);
+        __syncthreads();
+        bf16* Ks=Ksh[cur]; bf16* Vs=Vsh[cur];
+
+        float S[2][4];
+        for(int nh=0; nh<2; ++nh){
+            float acc[4]={0,0,0,0};
+            for(int kk=0; kk<8; ++kk){
+                unsigned b[2]; int kb=kk*16;
+                b[0]=fqa_pack(Ks[(nh*8+grp)*HDc+kb+tg*2],   Ks[(nh*8+grp)*HDc+kb+tg*2+1]);
+                b[1]=fqa_pack(Ks[(nh*8+grp)*HDc+kb+tg*2+8], Ks[(nh*8+grp)*HDc+kb+tg*2+9]);
+                float c[4]={acc[0],acc[1],acc[2],acc[3]};
+                fqa_mma(acc, qa[kk], b, c);
+            }
+            S[nh][0]=acc[0];S[nh][1]=acc[1];S[nh][2]=acc[2];S[nh][3]=acc[3];
+        }
+        float rmx0=-1e30f,rmx1=-1e30f;
+        for(int nh=0;nh<2;nh++){
+            int kpos0=kt*16+nh*8+tg*2, kpos1=kpos0+1;
+            int qp0=(qbase+grp  <ql)?pos[qs+qbase+grp  ]:-1;
+            int qp1=(qbase+grp+8<ql)?pos[qs+qbase+grp+8]:-1;
+            S[nh][0]=(kpos0<=qp0)?S[nh][0]*scale:-1e30f;
+            S[nh][1]=(kpos1<=qp0)?S[nh][1]*scale:-1e30f;
+            S[nh][2]=(kpos0<=qp1)?S[nh][2]*scale:-1e30f;
+            S[nh][3]=(kpos1<=qp1)?S[nh][3]*scale:-1e30f;
+            rmx0=fmaxf(rmx0,fmaxf(S[nh][0],S[nh][1])); rmx1=fmaxf(rmx1,fmaxf(S[nh][2],S[nh][3]));
+        }
+        rmx0=fmaxf(rmx0,__shfl_xor_sync(0xffffffff,rmx0,1)); rmx0=fmaxf(rmx0,__shfl_xor_sync(0xffffffff,rmx0,2));
+        rmx1=fmaxf(rmx1,__shfl_xor_sync(0xffffffff,rmx1,1)); rmx1=fmaxf(rmx1,__shfl_xor_sync(0xffffffff,rmx1,2));
+        float nm0=fmaxf(m0,rmx0), nm1=fmaxf(m1,rmx1);
+        float cc0=__expf(m0-nm0), cc1=__expf(m1-nm1);
+        float ps0=0,ps1=0;
+        for(int nh=0;nh<2;nh++){
+            float p0=__expf(S[nh][0]-nm0), p1=__expf(S[nh][1]-nm0);
+            float p2=__expf(S[nh][2]-nm1), p3=__expf(S[nh][3]-nm1);
+            ps0+=p0+p1; ps1+=p2+p3;
+            Ps[(grp  )*16+nh*8+tg*2  ]=__float2bfloat16(p0);
+            Ps[(grp  )*16+nh*8+tg*2+1]=__float2bfloat16(p1);
+            Ps[(grp+8)*16+nh*8+tg*2  ]=__float2bfloat16(p2);
+            Ps[(grp+8)*16+nh*8+tg*2+1]=__float2bfloat16(p3);
+        }
+        ps0+=__shfl_xor_sync(0xffffffff,ps0,1); ps0+=__shfl_xor_sync(0xffffffff,ps0,2);
+        ps1+=__shfl_xor_sync(0xffffffff,ps1,1); ps1+=__shfl_xor_sync(0xffffffff,ps1,2);
+        l0=l0*cc0+ps0; l1=l1*cc1+ps1; m0=nm0; m1=nm1;
+        for(int t=0;t<NT;t++){O[t][0]*=cc0;O[t][1]*=cc0;O[t][2]*=cc1;O[t][3]*=cc1;}
+        __syncwarp();
+        unsigned pa[4];
+        pa[0]=fqa_pack(Ps[grp*16+tg*2],      Ps[grp*16+tg*2+1]);
+        pa[1]=fqa_pack(Ps[(grp+8)*16+tg*2],  Ps[(grp+8)*16+tg*2+1]);
+        pa[2]=fqa_pack(Ps[grp*16+tg*2+8],    Ps[grp*16+tg*2+9]);
+        pa[3]=fqa_pack(Ps[(grp+8)*16+tg*2+8],Ps[(grp+8)*16+tg*2+9]);
+        for(int nt=0;nt<NT;nt++){
+            unsigned b[2]; int hd=nt*8+grp;     // V natural, transposed read: Vs[key*HD + hd]
+            b[0]=fqa_pack(Vs[(tg*2)*HDc+hd],   Vs[(tg*2+1)*HDc+hd]);
+            b[1]=fqa_pack(Vs[(tg*2+8)*HDc+hd], Vs[(tg*2+9)*HDc+hd]);
+            float c[4]={O[nt][0],O[nt][1],O[nt][2],O[nt][3]};
+            fqa_mma(O[nt], pa, b, c);
+        }
+        __syncthreads();
+    }
+    float inv0=l0>0?1.f/l0:0.f, inv1=l1>0?1.f/l1:0.f;
+    for(int nt=0;nt<NT;nt++){
+        int rr0=qbase+grp, rr1=qbase+grp+8, hd=nt*8+tg*2;
+        if(rr0<ql){
+            out[((size_t)(qs+rr0)*n_heads+h)*HDc+hd  ]=__float2bfloat16(O[nt][0]*inv0);
+            out[((size_t)(qs+rr0)*n_heads+h)*HDc+hd+1]=__float2bfloat16(O[nt][1]*inv0);
+        }
+        if(rr1<ql){
+            out[((size_t)(qs+rr1)*n_heads+h)*HDc+hd  ]=__float2bfloat16(O[nt][2]*inv1);
+            out[((size_t)(qs+rr1)*n_heads+h)*HDc+hd+1]=__float2bfloat16(O[nt][3]*inv1);
+        }
+    }
+}
+
 void launch_attn_prefill(const bf16* q, int q_stride, const bf16* cache_k, const bf16* cache_v,
                          bf16* out, int n_heads, int n_kv, int head_dim,
                          const int* pos, const int* qstart, const int* qlen,
@@ -500,8 +640,16 @@ void launch_attn_prefill(const bf16* q, int q_stride, const bf16* cache_k, const
                          const int* bt, int max_blocks, int block_size, float scale,
                          cudaStream_t s) {
     if (R <= 0) return;
-    // The WMMA kernel hardwires head_dim==128 (8 d-steps) and one 16-key tile per paged block
-    // (block_size==16) — the engine's only supported layout (Qwen3, BlockPool::BLOCK==16).
+    static int v2 = -1;
+    if (v2 < 0) { const char* e = std::getenv("FQ_PREFILL_V2"); v2 = (e && atoi(e) == 0) ? 0 : 1; }
+    // v2 mma.sync path: head_dim==128 (16 n8-tiles) + one 16-key tile per paged block (block_size==16).
+    if (v2 && head_dim == 128 && block_size == 16) {
+        dim3 grid((max_qlen + 63) / 64, n_heads, R);
+        attn_prefill_mma_kernel<<<grid, 128, 0, s>>>(
+            q, q_stride, cache_k, cache_v, out, n_heads, n_kv, pos, qstart, qlen, rids, bt, max_blocks, scale);
+        return;
+    }
+    // fallback: original WMMA kernel.
     int qtiles = (max_qlen + 15) / 16;
     dim3 grid(qtiles, n_heads, R);
     attn_prefill_kernel<<<grid, 32, 0, s>>>(
