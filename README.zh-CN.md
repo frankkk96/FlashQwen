@@ -28,9 +28,10 @@ split-K → INT8 权重量化)。
 
 ### 第三阶段 —— 服务性能优化(当前)
 当前重点:在 **bf16 对齐(不量化)** 的前提下,把服务吞吐追平 **vLLM**。通过一系列内核与调度重写(bf16 +
-cuBLAS GEMM、FlashAttention-2 prefill、GQA 共享的 FlashDecoding、统一 token 预算调度器等),FlashQwen
-目前在**关闭 prefix caching** 的情况下,在单张 RTX 4090 上达到 **vLLM 约 95% 的服务吞吐**,相比自身第一/
-二阶段基线约 **5.5×**。完整报告见 [`docs/optimization.md`](docs/optimization.md)。
+cuBLAS GEMM、FlashAttention-2 prefill、`mma.sync` FlashAttention 风格的 prefill-attention kernel、GQA
+共享的 FlashDecoding、统一 token 预算调度器、自动 prefix caching),FlashQwen 目前在**关闭 prefix caching**
+下、单张 RTX 4090 上达到 **vLLM 约 95–98% 的服务吞吐**,在**真实 ShareGPT 流量上约 97%**,相比自身第一/
+二阶段基线约 **6×**。完整报告见 [`docs/optimization.md`](docs/optimization.md)。
 
 ### 架构(第二阶段起)
 
@@ -92,9 +93,9 @@ make            # 编译 C++ 引擎 → 嵌入 Go → go build,产出 ./flashqwe
 |---|---|---|---|---|
 | **1** | 从零实现的终端引擎 | 单个 C++/CUDA 二进制,<2000 行,**零依赖**,终端运行。INT8 权重、CUDA-graph decode、flash-decoding split-K。单流研究。 | `main` | `7d6764c`(初始)→ `89318c5` |
 | **2** | 批处理 + OpenAI API 服务 | 连续批处理 + PagedAttention;Go/Gin **OpenAI 兼容 API**(gRPC)。启动为服务。 | `main` | `566fac6` → `08392df` |
-| **3** | 服务性能优化 | bf16 + cuBLAS GEMM、FlashAttention-2 prefill、GQA 共享 FlashDecoding、统一 token 预算调度。**vLLM 约 95%**(关 prefix cache),bf16 对齐。 | `perf/serving-optimization` | `08392df`(基线)→ `53ac297` |
+| **3** | 服务性能优化 | bf16 + cuBLAS GEMM、FlashAttention-2 / `mma.sync` prefill、GQA 共享 FlashDecoding、统一 token 预算调度、自动 prefix caching。**vLLM 约 95–98%**(关 prefix cache)、**真实 ShareGPT 约 97%**,bf16 对齐。 | `feat/prefix-caching` | `08392df`(基线)→ `HEAD` |
 
-### 第三阶段 —— 优化步骤(分支 `perf/serving-optimization`)
+### 第三阶段 —— 优化步骤(分支 `feat/prefix-caching`)
 
 每一步改了什么、针对哪个瓶颈、实测效果、以及试过的死路,详见
 [`docs/optimization.md`](docs/optimization.md)。每个落地步骤都干净重建,在同一台机器上分别测
@@ -105,7 +106,6 @@ make            # 编译 C++ 引擎 → 嵌入 Go → go build,产出 ./flashqwe
 | 步骤 | 改动 | 提交 | in=128 | in=512 | in=1024 |
 |---|---|---|---|---|---|
 | R1 | INT8 统一 token 预算调度 + GPU 采样 | `5065b2e` | 248 (18.0%) | 139 (14.7%) | 86 (13.2%) |
-| R2 | 调度/内核重构(性能持平) | `291cb74` | 247 (18.0%) | 139 (14.8%) | 86 (13.2%) |
 | S3 | bf16 权重 + cuBLAS GEMM + FlashAttention-2 | `7650654` | 1094 (79.5%) | 628 (66.5%) | 348 (53.4%) |
 | S5 | 融合 QKV / gate-up GEMM | `c2f98a0` | 1141 (82.9%) | 648 (68.6%) | 356 (54.6%) |
 | S6 | FlashDecoding decode 注意力(按请求类型拆分) | `f0b1499` | 1317 (95.7%) | 824 (87.3%) | 454 (69.6%) |
@@ -113,23 +113,33 @@ make            # 编译 C++ 引擎 → 嵌入 Go → go build,产出 ./flashqwe
 | S8 | prefill 注意力占用率 | `392cda5` | 1328 (96.5%) | 878 (93.0%) | 531 (81.5%) |
 | S10 | 调度器:max-batch-tokens 2048→1024 | `642cc28` | 1334 (97.0%) | 882 (93.4%) | 581 (89.1%) |
 | S12 | GQA 共享 FlashDecoding(每组 K/V 只读一次) | `240aaa1` | 1338 (97.2%) | 906 (96.0%) | 604 (92.7%) |
-| **S14** | activation 按需分配 + KV 池/越界修复 | `e5a99c8` | **1341 (97.5%)** | **908 (96.2%)** | **605 (92.8%)** |
-| **vLLM**(无 prefix cache) | 参照 | — | **1376** | **944** | **652** |
+| S14 | activation 按需分配 + KV 池/越界修复 | `e5a99c8` | 1341 (97.5%) | 908 (96.2%) | 605 (92.8%) |
+| S15 | 自动 prefix caching(内容哈希 KV 复用) | `fad12b7` | ≈S14* | ≈S14* | ≈S14* |
+| **S16** | **prefill 注意力重写:WMMA → `mma.sync`(FlashAttention 风格)** | `feat/prefix-caching` | **1318 (94.6%)** | **927 (97.7%)** | **640 (98.1%)** |
+| **vLLM**(无 prefix cache) | 参照 | — | **1376 / 1393** | **944 / 948** | **652** |
 
-**单流(并发 1)—— 输出 tok/s:**
+\* S15(prefix caching)在纯随机输入上中性(跨请求无公共前缀);只有在有共享前缀的负载上才有收益
+(**512-token 共享前缀 +36%**,与 vLLM 的 +37% 相当)。S16 行是同会话 A/B(其 WMMA 对照复现了 S14 行),
+第二个 vLLM 数字是该会话的参照。
 
-| 步骤 | in=128 | in=512 | in=1024 |
-|---|---|---|---|
-| R1 / R2(INT8) | 67 | 38 | 24 |
-| S3(bf16) | 52 | 45 | 38 |
-| S6 | 56 | 51 | 44 |
-| S8 | 56 | 51 | 45 |
-| S12 | 56 | 55 | 51 |
-| **S14** | **56** | **55** | **51** |
-| **vLLM** | **58** | **57** | **55** |
+**单流(并发 1):** 跨输入约为 vLLM 的 ~92–98%(`S14`/`S16`:56 / 55 / 51 vs vLLM 58 / 57 / 55 tok/s,
+对应 128 / 512 / 1024);prefill 重写在 conc=1 基本持平(此处 prefill-attn 占比极小)。
 
 怎么读这组数:每个优化都精确作用在它针对的 regime(S6/decode 注意力对 in=128 抬升最大;S7/S8/prefill 注意力
-对 in=1024 抬升最大;S10/KV 悬崖的调度修复只动 in=1024)。**差距随输入变短(decode 占比变大)而缩小:128 下
-97.5%、512 下 96.2%、1024 下 92.8%** —— 残余差距在 prefill 侧 compute。(基线 B0 = `main` INT8,conc=32/1024
-≈ 107 tok/s ≈ 16%;异精度/异分支,未跨输入重测。)报告里有逐步分析和被实测排除的各条杠杆(CUDA graph、
-异步调度、KV cache 容量、GEMM autotuning)。
+对 in=1024 抬升最大;S10/KV 悬崖的调度修复只动 in=1024)。到 S14 为止差距随输入长度单调(97.5% → 92.8%)——
+残余在 prefill 侧 compute;**S16 的 `mma.sync` prefill 重写正是攻这一点,把 1024 从 92.8% → 98.1%**,曲线现在
+几乎拉平。报告里有逐步分析和被实测排除的各条杠杆(CUDA graph、异步调度、KV cache 容量、GEMM autotuning)。
+
+### 超出历程之外 —— 综合对比与真实数据
+
+bf16 parity 下的宽口径对比(完整表见 [`docs/optimization.md`](docs/optimization.md)):
+
+- **输入长度**(out=128, conc=32;2048 用 conc=16):128 / 512 / 1024 / 2048 = **97.1% / 98.3% / 97.8% / 91.9%**
+  —— 长上下文 prefill(2048)是剩下的相对短板。
+- **输出长度**(in=512, conc=32):out=128 98.3%、out=512 96.1%、**out=1024 107%** —— 长输出、decode 密集时
+  FlashQwen 比 vLLM *更快*(其极低的 TTFT 在长生成里累积)。
+- **真实数据 —— 1000 条 ShareGPT 对话**(conc=32,等输出预算):**vLLM 的 96.8%**(1286 vs 1328 tok/s)。
+  **TTFT 更低**(94.6 vs 138.8 ms,vLLM 把排队的 chunked-prefill 前置),**TPOT 高约 4%**。Prefix caching 在
+  ShareGPT 上对两边**都中性**(跨请求重叠≈0)—— 只有负载有真实共享前缀(多轮、RAG、复用 system prompt)时才有收益。
+
+(基线 B0 = `main` INT8,conc=32/1024 ≈ 107 tok/s ≈ 16%;异精度/异分支,未跨输入重测。)
