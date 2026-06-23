@@ -150,8 +150,19 @@ func (s *Server) streamChat(c *gin.Context, req engine.Request, includeUsage boo
 		flusher.Flush()
 	}
 
-	chunk(&RespMessage{Role: "assistant"}, nil) // opening chunk carries the role
+	// The opening role chunk is emitted on the FIRST engine output (after prefill), not before
+	// generation starts — matching vLLM. Emitting it up front makes a streaming benchmark record TTFT
+	// against a pre-prefill placeholder (≈0 ms) and pushes the real prefill latency into TPOT/ITL, so
+	// TTFT wouldn't be comparable across engines.
+	roleSent := false
+	sendRole := func() {
+		if !roleSent {
+			chunk(&RespMessage{Role: "assistant"}, nil)
+			roleSent = true
+		}
+	}
 	res, err := s.gen.Generate(c.Request.Context(), req, func(text string, tc *chatml.ToolCall) {
+		sendRole() // first real token (post-prefill) -> this is the true time-to-first-token
 		if text != "" {
 			d := text
 			chunk(&RespMessage{Content: &d}, nil)
@@ -175,6 +186,7 @@ func (s *Server) streamChat(c *gin.Context, req engine.Request, includeUsage boo
 		return
 	}
 	reason := res.FinishReason
+	sendRole() // zero-token completion still needs a well-formed role chunk before finish
 	chunk(&RespMessage{}, &reason)
 	if includeUsage {
 		// Per the OpenAI stream_options contract: a final chunk with an empty choices array and the
