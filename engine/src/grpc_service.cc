@@ -1,22 +1,21 @@
-#include "grpc_service.hpp"
+#include "grpc_service.h"
 
 #include <grpcpp/grpcpp.h>
 
 #include <algorithm>
-#include <cstdlib>
 #include <exception>
 #include <memory>
 #include <string>
 #include <thread>
 
-#include "block_pool.hpp"
+#include "block_allocator.h"
 #include "engine.grpc.pb.h"
-#include "grpc_sink.hpp"
-#include "kv_cache.hpp"
-#include "log.hpp"
-#include "model_runtime.hpp"
-#include "model_spec.hpp"
-#include "scheduler.hpp"
+#include "grpc_sink.h"
+#include "kv_store.h"
+#include "log.h"
+#include "model_runtime.h"
+#include "model_spec.h"
+#include "scheduler.h"
 
 using flashqwen::Engine;
 using flashqwen::GenerateEvent;
@@ -24,14 +23,10 @@ using flashqwen::GenerateRequest;
 using flashqwen::ModelInfo;
 using flashqwen::ModelRequest;
 
-// Generate-stream tuning.
-constexpr int kDefaultMaxTokens = 512;  // used when a request omits max_tokens
+constexpr int kDefaultMaxTokens = 512;
 constexpr int kStreamPollMs =
-    100;  // how often the handler re-checks for client cancellation
+    100;
 
-// gRPC service. The model is loaded before this is constructed, so it is always
-// ready: GetModel answers immediately (the client's readiness probe) and
-// Generate submits straight to the scheduler.
 class ServiceImpl final : public Engine::Service {
  public:
   ServiceImpl(Scheduler& sched, std::string model_id, int max_ctx, int vocab)
@@ -62,25 +57,24 @@ class ServiceImpl final : public Engine::Service {
     auto r =
         std::make_unique<Request>(std::move(prompt), std::min(max_new, room),
                                   max_ctx_, sp, std::move(stop_ids), sink);
-    sched_.Submit(std::move(r));  // hand off; keep `sink` to drain the stream
+    sched_.Submit(std::move(r));
 
     while (true) {
       GenerateEvent ev;
       if (sink->queue.Pop(ev, kStreamPollMs)) {
-        if (!writer->Write(ev)) {  // client write failed
+        if (!writer->Write(ev)) {
           sink->cancel.store(true);
           break;
         }
-        // Done and Error are both terminal (client maps Error to a failure).
         if (ev.event_case() == GenerateEvent::kDone ||
             ev.event_case() == GenerateEvent::kError)
           break;
       } else {
-        if (ctx->IsCancelled()) {  // client went away
+        if (ctx->IsCancelled()) {
           sink->cancel.store(true);
           break;
         }
-        if (sink->queue.IsClosed()) break;  // engine closed the stream
+        if (sink->queue.IsClosed()) break;
       }
     }
     return grpc::Status::OK;
@@ -92,9 +86,6 @@ class ServiceImpl final : public Engine::Service {
   int max_ctx_, vocab_;
 };
 
-// Load the model, then bind + serve. Loading precedes the port opening, so the
-// client retries GetModel until it answers; a fatal load failure returns
-// non-zero so the supervisor sees the process die. Progress goes to stderr.
 int RunEngine(const Args& a, const std::string& model_id) {
   try {
     ModelSpec spec = ModelSpec::Load(a.model_dir);
@@ -102,36 +93,29 @@ int RunEngine(const Args& a, const std::string& model_id) {
       LOG_ERROR(
           "[engine] unsupported model at '%s': architecture '%s'. --model must "
           "point at a "
-          "dir with config.json + *.safetensors; the engine supports dense "
-          "Qwen3 "
+          "dir with config.json + *.safetensors; the engine supports "
+          "Qwen3-8B "
           "(Qwen3ForCausalLM).",
           a.model_dir.c_str(),
           spec.arch.empty() ? "unknown" : spec.arch.c_str());
       return 1;
     }
     LOG_INFO("[engine] loading model %s ...", model_id.c_str());
-    ModelRuntime model(spec,
-                       RuntimeConfig{a.max_ctx, a.max_batch_tokens, a.seed});
-    BlockPool pool(spec, a.max_ctx, a.gpu_mem_fraction);
-    model.AttachPool(pool);
-    KVCacheManager kv(pool);
+    KvStore store(spec, a.max_ctx, a.gpu_mem_fraction);
+    ModelRuntime model(spec, store, a.max_ctx, a.slots, a.token_budget, a.seed);
 
-    int n_slots =
-        std::min(a.slots, model.MaxBatch());  // clamp to the runtime cap
-    // Prefix caching on by default; FQ_PREFIX_CACHE=0/false disables it (A/B).
-    const char* pc = std::getenv("FQ_PREFIX_CACHE");
-    bool prefix_cache =
-        !(pc && (std::string(pc) == "0" || std::string(pc) == "false"));
     SchedulerConfig scfg{
-        n_slots,
-        a.max_queue <= 0 ? 4 * n_slots : a.max_queue,
-        a.max_batch_tokens,
-        a.max_prefill_tokens > 0 ? a.max_prefill_tokens : a.max_batch_tokens,
-        prefix_cache,
+        a.slots,
+        a.max_waiting > 0 ? a.max_waiting : 4 * a.slots,
+        a.token_budget,
+        a.prefill_chunk > 0 ? a.prefill_chunk : a.token_budget,
+        a.use_prefix_cache,
     };
-    Scheduler sched(model, kv, scfg);
 
-    ServiceImpl service(sched, model_id, model.MaxCtx(), spec.vocab_size);
+    BlockAllocator alloc(store.NumBlocks());
+    Scheduler sched(model, alloc, scfg);
+
+    ServiceImpl service(sched, model_id, a.max_ctx, spec.vocab_size);
     grpc::ServerBuilder builder;
     builder.AddListeningPort(a.address, grpc::InsecureServerCredentials());
     builder.RegisterService(&service);
@@ -142,14 +126,14 @@ int RunEngine(const Args& a, const std::string& model_id) {
       return 1;
     }
     LOG_INFO(
-        "[engine] ready: %d slots, max_queue %d, max_batch_tokens %d, "
-        "max_prefill %d, "
-        "prefix_cache %s, gRPC on %s",
-        scfg.n_slots, scfg.max_queue, scfg.max_batch_tokens, scfg.max_prefill,
-        scfg.prefix_cache ? "on" : "off", a.address.c_str());
+        "[engine] ready: %d slots, max_waiting %d, token_budget %d, "
+        "prefill_chunk %d, "
+        "use_prefix_cache %s, gRPC on %s",
+        scfg.n_slots, scfg.max_waiting, scfg.token_budget, scfg.prefill_chunk,
+        scfg.use_prefix_cache ? "on" : "off", a.address.c_str());
 
     std::thread engine(
-        [&] { sched.Run(); });  // engine thread; runs for the process lifetime
+        [&] { sched.Run(); });
     engine.detach();
     server->Wait();
     return 0;

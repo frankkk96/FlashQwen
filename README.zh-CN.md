@@ -80,10 +80,10 @@ make            # 编译 C++ 引擎 → 嵌入 Go → go build,产出 ./flashqwe
 ```
 
 - **OpenAI 接口:** `POST /v1/chat/completions`(流式/非流式/工具)、`GET /v1/models`、`GET /healthz`。
-- **常用参数:** `--max-ctx N`(KV/上下文长度)、`--slots N`(最大并发序列数)、`--max-batch-tokens N`
+- **常用参数:** `--max-ctx N`(KV/上下文长度)、`--slots N`(最大并发序列数)、`--token-budget N`
   (每步计算的 token 数)、`--addr`(监听地址)。采样参数(temperature、top_p)按请求传入。
 - **对话内命令:** `/exit` `/quit` 退出,`/reset` 清空上下文,`/think on|off` 切换思考模式。
-- **支持的模型:** dense Qwen3(`Qwen3ForCausalLM`)。MoE / 多模态 / 非 Qwen 架构不支持。
+- **支持的模型:** Qwen3-8B(`Qwen3ForCausalLM`)。其他 Qwen3 尺寸 / MoE / 多模态 / 非 Qwen 架构不支持。
 
 ---
 
@@ -111,7 +111,7 @@ make            # 编译 C++ 引擎 → 嵌入 Go → go build,产出 ./flashqwe
 | S6 | FlashDecoding decode 注意力(按请求类型拆分) | `f0b1499` | 1317 (95.7%) | 824 (87.3%) | 454 (69.6%) |
 | S7 | WMMA tensor-core prefill 注意力 | `0dd4010` | 1326 (96.4%) | 860 (91.1%) | 501 (76.8%) |
 | S8 | prefill 注意力占用率 | `392cda5` | 1328 (96.5%) | 878 (93.0%) | 531 (81.5%) |
-| S10 | 调度器:max-batch-tokens 2048→1024 | `642cc28` | 1334 (97.0%) | 882 (93.4%) | 581 (89.1%) |
+| S10 | 调度器:token-budget 2048→1024 | `642cc28` | 1334 (97.0%) | 882 (93.4%) | 581 (89.1%) |
 | S12 | GQA 共享 FlashDecoding(每组 K/V 只读一次) | `240aaa1` | 1338 (97.2%) | 906 (96.0%) | 604 (92.7%) |
 | S14 | activation 按需分配 + KV 池/越界修复 | `e5a99c8` | 1341 (97.5%) | 908 (96.2%) | 605 (92.8%) |
 | S15 | 自动 prefix caching(内容哈希 KV 复用) | `fad12b7` | ≈S14* | ≈S14* | ≈S14* |

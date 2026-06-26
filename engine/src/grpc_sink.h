@@ -1,9 +1,3 @@
-// Wire-format output for one Generate stream — the only place engine domain
-// types map onto the proto wire (ToProto), keeping proto headers out of the
-// engine loop and scheduler. GrpcSink is the OutputSink for one stream: the
-// scheduler pushes tokens / the terminal event into the EventQueue, the gRPC
-// handler thread drains it onto the wire. Both hold a shared_ptr; the handler
-// sets cancellation, the scheduler polls it.
 #pragma once
 #include <atomic>
 #include <chrono>
@@ -13,8 +7,8 @@
 #include <string>
 
 #include "engine.grpc.pb.h"
-#include "errors.hpp"
-#include "output_sink.hpp"
+#include "errors.h"
+#include "output_sink.h"
 
 // Engine domain error -> proto wire code (the single mapping spot).
 inline flashqwen::ErrorCode ToProto(EngineErrc e) {
@@ -27,7 +21,8 @@ inline flashqwen::ErrorCode ToProto(EngineErrc e) {
   return flashqwen::ERROR_CODE_UNSPECIFIED;
 }
 
-// Thread-safe handoff: scheduler thread pushes events, gRPC handler pops.
+// Thread-safe event handoff: the scheduler thread pushes, the gRPC handler
+// pops. Pop() waits up to timeout_ms and returns false on timeout or close.
 class EventQueue {
  public:
   void Push(flashqwen::GenerateEvent e) {
@@ -44,7 +39,6 @@ class EventQueue {
     }
     cv_.notify_all();
   }
-  // Wait up to timeout_ms; true with `out` set, or false on timeout/closed.
   bool Pop(flashqwen::GenerateEvent& out, int timeout_ms) {
     std::unique_lock<std::mutex> lk(m_);
     cv_.wait_for(lk, std::chrono::milliseconds(timeout_ms),
@@ -66,6 +60,9 @@ class EventQueue {
   bool closed_ = false;
 };
 
+// The OutputSink for one Generate stream: the scheduler pushes tokens / the
+// terminal event into `queue`, the gRPC handler drains it onto the wire and
+// sets `cancel` on client disconnect.
 struct GrpcSink : OutputSink {
   EventQueue queue;
   std::atomic<bool> cancel{false};

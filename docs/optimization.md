@@ -54,7 +54,7 @@ no-cache vLLM (conc=32 = 652). Reverted attempts (S4, S11) are kept as records �
 | S6 | FlashDecoding decode-attention kernel (split by request type) | **454** | 70% | [s06](exps/s06-flashdecoding.md) |
 | S7 | WMMA tensor-core prefill attention | **501** | 77% | [s07](exps/s07-wmma-prefill.md) |
 | S8 | prefill-attn occupancy (shrink shared memory) | **531** | 81% | [s08](exps/s08-prefill-occupancy.md) |
-| S10 | scheduler: default max-batch-tokens 2048 → 1024 (the KV cliff) | **581** | 89% | [s10](exps/s10-max-batch-tokens.md) |
+| S10 | scheduler: default token-budget 2048 → 1024 (the KV cliff) | **581** | 89% | [s10](exps/s10-max-batch-tokens.md) |
 | S11 | CUDA graphs for pure-decode steps — *tried, reverted (−12%)* | — | — | [s11](exps/s11-cuda-graphs-reverted.md) |
 | S12 | GQA-shared FlashDecoding (read K/V once per group + KV-split) | **604** | 93% | [s12](exps/s12-gqa-flashdecoding.md) |
 | S14 | activation scratch → real per-step bound (+ latent WMMA OOB fix) | 605 | 93% | [s14](exps/s14-activation-scratch.md) |

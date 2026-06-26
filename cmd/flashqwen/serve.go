@@ -16,16 +16,16 @@ func runServe(args []string) {
 	addr := fs.String("addr", ":8000", "HTTP listen address")
 	slots := fs.Int("slots", 16, "max concurrent sequences")
 	maxCtx := fs.Int("max-ctx", 4096, "KV / context length")
-	maxQueue := fs.Int("max-queue", 0, "max requests waiting for admission before new ones are rejected as over-capacity (0 => 4*slots)")
-	maxBatchTokens := fs.Int("max-batch-tokens", 1024, "total tokens computed per scheduler step (max_num_batched_tokens); smaller keeps decode steps from being dragged by big mixed prefill batches")
-	maxPrefill := fs.Int("max-prefill-tokens", 512, "per-request prefill chunk cap per step (long_prefill_token_threshold)")
+	maxWaiting := fs.Int("max-waiting", 0, "max requests waiting for admission before new ones are rejected as over-capacity (0 => 4*slots)")
+	tokenBudget := fs.Int("token-budget", 1024, "total tokens computed per scheduler step (max_num_batched_tokens); smaller keeps decode steps from being dragged by big mixed prefill batches")
+	prefillChunk := fs.Int("prefill-chunk", 512, "per-request prefill chunk cap per step (long_prefill_token_threshold)")
 	gpuMemFraction := fs.Float64("gpu-mem-fraction", 0.9, "fraction of total VRAM the engine may use; the KV cache pool gets whatever is left after weights+activations")
 	fs.Parse(args)
 	if *model == "" {
 		log.Fatal("serve: --model is required")
 	}
 
-	s, err := open(*model, *slots, *maxCtx, *maxQueue, *maxBatchTokens, *maxPrefill, *gpuMemFraction)
+	s, err := open(*model, *slots, *maxCtx, *maxWaiting, *tokenBudget, *prefillChunk, *gpuMemFraction)
 	if err != nil {
 		log.Fatalf("serve: %v", err)
 	}

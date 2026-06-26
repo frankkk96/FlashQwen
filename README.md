@@ -93,12 +93,12 @@ toolkit (12.x), Go 1.26+, gRPC/protobuf, **cuBLAS**, and an NVIDIA GPU with ≥2
 - **OpenAI endpoints:** `POST /v1/chat/completions` (streaming / non-streaming / tools),
   `GET /v1/models`, `GET /healthz`.
 - **Common flags:** `--max-ctx N` (KV/context length), `--slots N` (max concurrent sequences),
-  `--max-batch-tokens N` (tokens computed per scheduler step), `--addr` (listen address). Sampling
+  `--token-budget N` (tokens computed per scheduler step), `--addr` (listen address). Sampling
   params (temperature, top_p) are per-request via the API.
 - **In-chat commands:** `/exit` `/quit` leave, `/reset` clears context, `/think on|off` toggles
   thinking mode.
-- **Supported models:** dense Qwen3 (`Qwen3ForCausalLM`). MoE / multimodal / non-Qwen are not
-  supported.
+- **Supported models:** Qwen3-8B (`Qwen3ForCausalLM`). Other Qwen3 sizes / MoE / multimodal /
+  non-Qwen are not supported.
 
 ---
 
@@ -127,7 +127,7 @@ vLLM** (`--no-enable-prefix-caching`, bf16, 0.9 mem).
 | S6 | FlashDecoding decode-attention (split by request type) | `f0b1499` | 1317 (95.7%) | 824 (87.3%) | 454 (69.6%) |
 | S7 | WMMA tensor-core prefill attention | `0dd4010` | 1326 (96.4%) | 860 (91.1%) | 501 (76.8%) |
 | S8 | prefill-attention occupancy | `392cda5` | 1328 (96.5%) | 878 (93.0%) | 531 (81.5%) |
-| S10 | scheduler: max-batch-tokens 2048→1024 | `642cc28` | 1334 (97.0%) | 882 (93.4%) | 581 (89.1%) |
+| S10 | scheduler: token-budget 2048→1024 | `642cc28` | 1334 (97.0%) | 882 (93.4%) | 581 (89.1%) |
 | S12 | GQA-shared FlashDecoding (read K/V once per group) | `240aaa1` | 1338 (97.2%) | 906 (96.0%) | 604 (92.7%) |
 | S14 | activation right-sizing + KV-pool / OOB fix | `e5a99c8` | 1341 (97.5%) | 908 (96.2%) | 605 (92.8%) |
 | S15 | automatic prefix caching (content-hashed KV reuse) | `fad12b7` | ≈S14* | ≈S14* | ≈S14* |

@@ -57,9 +57,9 @@ func (t *tailBuffer) String() string {
 
 // Start extracts and launches the engine against modelDir, returning once the process has been
 // spawned (call WaitReady on a client to block until it serves). Engine stderr is forwarded.
-// maxQueue caps how many requests may wait for admission before the engine rejects new ones as
+// maxWaiting caps how many requests may wait for admission before the engine rejects new ones as
 // over-capacity; <=0 lets the engine pick its default (4*slots).
-func Start(modelDir string, slots, maxCtx, maxQueue, maxBatchTokens, maxPrefill int, gpuMemFraction float64) (*Engine, error) {
+func Start(modelDir string, slots, maxCtx, maxWaiting, tokenBudget, prefillChunk int, gpuMemFraction float64) (*Engine, error) {
 	f, err := os.CreateTemp("", "flashqwen-engine-*")
 	if err != nil {
 		return nil, err
@@ -84,9 +84,9 @@ func Start(modelDir string, slots, maxCtx, maxQueue, maxBatchTokens, maxPrefill 
 		"--address", addr,
 		"--slots", strconv.Itoa(slots),
 		"--max-ctx", strconv.Itoa(maxCtx),
-		"--max-queue", strconv.Itoa(maxQueue),
-		"--max-batch-tokens", strconv.Itoa(maxBatchTokens),
-		"--max-prefill-tokens", strconv.Itoa(maxPrefill),
+		"--max-waiting", strconv.Itoa(maxWaiting),
+		"--token-budget", strconv.Itoa(tokenBudget),
+		"--prefill-chunk", strconv.Itoa(prefillChunk),
 		"--gpu-mem-fraction", strconv.FormatFloat(gpuMemFraction, 'f', 4, 64))
 	// Forward engine stderr to the terminal so the user sees its load progress + logs, while also
 	// retaining the tail so a startup failure can be reported with the engine's actual cause.

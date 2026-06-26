@@ -2,7 +2,7 @@
 # Format + lint the C++/CUDA engine sources. Usage:
 #   scripts/lint.sh format    # rewrite files in place (clang-format)
 #   scripts/lint.sh check     # CI gate: fail if any file is mis-formatted
-#   scripts/lint.sh tidy      # clang-tidy over host .cpp (needs build/compile_commands.json)
+#   scripts/lint.sh tidy      # clang-tidy over host .cc (needs build/compile_commands.json)
 #   scripts/lint.sh           # = check + tidy
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -11,10 +11,10 @@ SRC_DIR=engine/src
 BUILD_DIR=engine/build
 # clang-format handles every source kind, including CUDA .cu/.cuh (layout only).
 ALL_SRC=$(find "$SRC_DIR" -maxdepth 1 -type f \
-  \( -name '*.cpp' -o -name '*.hpp' -o -name '*.cu' -o -name '*.cuh' \) | sort)
-# clang-tidy parses real translation units; restrict it to host .cpp (device .cu
+  \( -name '*.cc' -o -name '*.h' -o -name '*.cu' -o -name '*.cuh' \) | sort)
+# clang-tidy parses real translation units; restrict it to host .cc (device .cu
 # would need a clang CUDA toolchain to consume nvcc's compile_commands entries).
-HOST_TU=$(find "$SRC_DIR" -maxdepth 1 -type f -name '*.cpp' | sort)
+HOST_TU=$(find "$SRC_DIR" -maxdepth 1 -type f -name '*.cc' | sort)
 
 fmt()   { echo "$ALL_SRC" | xargs clang-format -i; echo "formatted $(echo "$ALL_SRC" | wc -l) files"; }
 check() { echo "$ALL_SRC" | xargs clang-format --dry-run --Werror && echo "format OK"; }

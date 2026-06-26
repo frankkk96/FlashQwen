@@ -1,4 +1,4 @@
-#include "safetensors.hpp"
+#include "safetensors.h"
 
 #include <fcntl.h>
 #include <sys/mman.h>
@@ -38,7 +38,7 @@ void SafeTensors::MapShard(const std::string& path) {
   const uint8_t* bytes = static_cast<const uint8_t*>(base);
   uint64_t header_len;
   std::memcpy(&header_len, bytes,
-              8);  // LE header length; assumes LE host (x86)
+              8);
   const char* json_begin = reinterpret_cast<const char*>(bytes + 8);
   const uint8_t* data_begin = bytes + 8 + header_len;
 

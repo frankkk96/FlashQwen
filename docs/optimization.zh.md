@@ -49,7 +49,7 @@ RTX 4090 上、以 **bf16 精度严格对齐(无量化)** 缩小与 **vLLM** 服
 | S6 | FlashDecoding decode-attention kernel(按请求类型拆分) | **454** | 70% | [s06](exps/s06-flashdecoding.md) |
 | S7 | WMMA tensor-core prefill attention | **501** | 77% | [s07](exps/s07-wmma-prefill.md) |
 | S8 | prefill-attn 占用率(压缩 shared memory) | **531** | 81% | [s08](exps/s08-prefill-occupancy.md) |
-| S10 | 调度器:默认 max-batch-tokens 2048 → 1024(KV cliff) | **581** | 89% | [s10](exps/s10-max-batch-tokens.md) |
+| S10 | 调度器:默认 token-budget 2048 → 1024(KV cliff) | **581** | 89% | [s10](exps/s10-max-batch-tokens.md) |
 | S11 | 纯 decode 步骤的 CUDA graphs — *尝试,已回退(−12%)* | — | — | [s11](exps/s11-cuda-graphs-reverted.md) |
 | S12 | GQA-shared FlashDecoding(每组只读一次 K/V + KV-split) | **604** | 93% | [s12](exps/s12-gqa-flashdecoding.md) |
 | S14 | activation scratch 按真实每步上界裁剪(+ 隐藏的 WMMA OOB 修复) | 605 | 93% | [s14](exps/s14-activation-scratch.md) |

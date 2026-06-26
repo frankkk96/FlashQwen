@@ -62,13 +62,13 @@ add_custom_command(
   COMMENT "protoc: engine.proto -> C++ stubs")
 
 add_executable(flashqwen-engine
-  src/main.cpp
-  src/args.cpp
-  src/scheduler.cpp
-  src/grpc_service.cpp
-  src/safetensors.cpp
+  src/main.cc
+  src/args.cc
+  src/scheduler.cc
+  src/grpc_service.cc
+  src/safetensors.cc
   src/kernels.cu
-  src/block_pool.cu
+  src/kv_store.cu
   src/model_runtime.cu
   ${PROTO_SRCS}
 )

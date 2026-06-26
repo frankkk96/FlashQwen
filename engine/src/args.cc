@@ -1,18 +1,16 @@
-#include "args.hpp"
+#include "args.h"
 
 #include "CLI11.hpp"
 
 int ParseArgs(int argc, char** argv, Args& out) {
   CLI::App app{
-      "flashqwen-engine — token-level C++/CUDA inference engine for Qwen3 "
-      "(dense). "
+      "flashqwen-engine — token-level C++/CUDA inference engine for Qwen3-8B. "
       "Driven over gRPC by the flashqwen Go app; not meant to be run "
       "directly."};
   app.footer(
       "SUPPORTED MODELS\n"
-      "  Any dense Qwen3 model (architecture Qwen3ForCausalLM): Qwen3-0.6B / "
-      "1.7B / 4B /\n"
-      "  8B / 14B / 32B. Dims are read from config.json. (Tested: Qwen3-8B.)");
+      "  Qwen3-8B only (architecture Qwen3ForCausalLM). Dims are read from "
+      "config.json.");
 
   app.add_option("--model", out.model_dir,
                  "model directory: config.json + *.safetensors")
@@ -31,24 +29,26 @@ int ParseArgs(int argc, char** argv, Args& out) {
       ->capture_default_str();
   app.add_option("--slots", out.slots, "max concurrent sequences")
       ->capture_default_str();
-  app.add_option("--max-queue", out.max_queue,
+  app.add_option("--max-waiting", out.max_waiting,
                  "admission cap on waiting requests; over it new requests are "
                  "rejected as "
                  "over-capacity (<=0 => 4*slots)")
       ->capture_default_str();
   app.add_option(
-         "--max-batch-tokens", out.max_batch_tokens,
+         "--token-budget", out.token_budget,
          "total tokens computed per scheduler step (max_num_batched_tokens)")
       ->capture_default_str();
-  app.add_option("--max-prefill-tokens", out.max_prefill_tokens,
+  app.add_option("--prefill-chunk", out.prefill_chunk,
                  "per-request prefill chunk cap per step "
                  "(long_prefill_token_threshold)")
       ->capture_default_str();
+  app.add_flag("--prefix-cache,!--no-prefix-cache", out.use_prefix_cache,
+               "reuse KV of shared prompt prefixes across requests");
 
   try {
     app.parse(argc, argv);
   } catch (const CLI::ParseError& e) {
-    return app.exit(e);  // exit 0 for --help, nonzero on error
+    return app.exit(e);
   }
-  return -1;  // OK; main continues (arch support checked via ModelSpec)
+  return -1;
 }

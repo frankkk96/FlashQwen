@@ -1,11 +1,8 @@
 #include <cuda_pipeline.h>  // cp.async (prefill K/V staging)
-#include <mma.h>
 
-#include <cstdlib>  // getenv (FQ_PREFILL_V2)
+#include <cassert>
 
 #include "kernels.cuh"
-#include "kv_cache.cuh"  // KvPhysRow: paged-KV addressing contract (shared with block_pool.cu)
-namespace wmma = nvcuda::wmma;
 
 // gemm: linear layers via cuBLAS (BF16 in / FP32 accumulate). Row-major <->
 // column-major derivation is in kernels.cuh.
@@ -23,8 +20,8 @@ __global__ void RmsnormKernel(const bf16* __restrict__ x,
                               const float* __restrict__ w,
                               bf16* __restrict__ out, int M, int H, float eps) {
   int m = blockIdx.x;
-  const bf16* xr = x + (size_t)m * H;
-  bf16* outr = out + (size_t)m * H;
+  const bf16* xr = x + static_cast<int64_t>(m) * H;
+  bf16* outr = out + static_cast<int64_t>(m) * H;
 
   extern __shared__ float red[];
   float local = 0.f;
@@ -57,9 +54,9 @@ __global__ void AddRmsnormKernel(bf16* __restrict__ x,
                                  bf16* __restrict__ out, int M, int H,
                                  float eps) {
   int m = blockIdx.x;
-  bf16* xr = x + (size_t)m * H;
-  const bf16* rr = res + (size_t)m * H;
-  bf16* outr = out + (size_t)m * H;
+  bf16* xr = x + static_cast<int64_t>(m) * H;
+  const bf16* rr = res + static_cast<int64_t>(m) * H;
+  bf16* outr = out + static_cast<int64_t>(m) * H;
 
   extern __shared__ float red[];
   float local = 0.f;
@@ -91,8 +88,8 @@ __global__ void EmbedKernel(const int* __restrict__ ids,
                             const bf16* __restrict__ embed,
                             bf16* __restrict__ out, int M, int H) {
   int m = blockIdx.x;
-  const bf16* src = embed + (size_t)ids[m] * H;
-  bf16* dst = out + (size_t)m * H;
+  const bf16* src = embed + static_cast<int64_t>(ids[m]) * H;
+  bf16* dst = out + static_cast<int64_t>(m) * H;
   for (int i = threadIdx.x; i < H; i += blockDim.x) dst[i] = src[i];
 }
 
@@ -101,23 +98,30 @@ void LaunchEmbed(const int* ids, const bf16* embed, bf16* out, int M, int H,
   EmbedKernel<<<M, 256, 0, s>>>(ids, embed, out, M, H);
 }
 
-// Fused per-head RMSNorm + RoPE (rotate-half, matching HF Qwen). In place on
-// the q (or k) slice of a fused QKV row of width `stride`: head (m,h) at
-// buf + m*stride + h*head_dim. Angles come from precomputed cos/sin tables
-// ([max_pos, head_dim/2]) indexed by pos[m] (no per-call transcendental; tables
-// are identical across all layers and built once). One block per (token, head);
-// blockDim == head_dim. FP32 math.
+// Fused per-head RMSNorm + RoPE (rotate-half, matching HF Qwen) over the q AND
+// k slices of a fused QKV row of width `stride` in one launch: the q heads
+// (weight wq) and k heads (weight wk) are contiguous, so head g of token m lives
+// at buf + m*stride + g*head_dim for g in [0, n_q+n_kv); g < n_q is a q head,
+// else a k head. v is left untouched. Angles come from precomputed cos/sin
+// tables ([max_pos, head_dim/2]) indexed by pos[m] (no per-call transcendental;
+// tables are identical across all layers and built once). One block per
+// (token, head); blockDim == head_dim. FP32 math.
 __global__ void HeadNormRopeKernel(bf16* __restrict__ buf,
-                                   const float* __restrict__ w,
+                                   const float* __restrict__ wq,
+                                   const float* __restrict__ wk,
                                    const float* __restrict__ cos_tab,
                                    const float* __restrict__ sin_tab,
-                                   const int* __restrict__ pos, int n_heads,
-                                   int head_dim, int stride, float eps) {
-  int row = blockIdx.x;  // over M * n_heads
-  int m = row / n_heads, h = row % n_heads;
+                                   const int* __restrict__ pos, int n_q,
+                                   int n_kv, int head_dim, int stride,
+                                   float eps) {
+  int hpr = n_q + n_kv;  // q + k heads per row
+  int row = blockIdx.x;  // over M * hpr
+  int m = row / hpr, g = row % hpr;
+  const float* w = g < n_q ? wq : wk;
   int t = threadIdx.x;  // 0..head_dim-1
   int half = head_dim >> 1;
-  bf16* v = buf + (size_t)m * stride + (size_t)h * head_dim;
+  bf16* v = buf + static_cast<int64_t>(m) * stride +
+            static_cast<int64_t>(g) * head_dim;
 
   extern __shared__ float sh[];  // [0,head_dim): reduction then normed values
   float x = __bfloat162float(v[t]);
@@ -133,8 +137,8 @@ __global__ void HeadNormRopeKernel(bf16* __restrict__ buf,
   __syncthreads();
 
   if (t < half) {
-    const float* cb = cos_tab + (size_t)pos[m] * half;
-    const float* sb = sin_tab + (size_t)pos[m] * half;
+    const float* cb = cos_tab + static_cast<int64_t>(pos[m]) * half;
+    const float* sb = sin_tab + static_cast<int64_t>(pos[m]) * half;
     float cs = cb[t], sn = sb[t];
     float x1 = sh[t], x2 = sh[t + half];
     v[t] = __float2bfloat16(x1 * cs - x2 * sn);
@@ -142,12 +146,13 @@ __global__ void HeadNormRopeKernel(bf16* __restrict__ buf,
   }
 }
 
-void LaunchHeadNormRope(bf16* buf, const float* w, const float* cos_tab,
-                        const float* sin_tab, const int* pos, int M,
-                        int n_heads, int head_dim, int stride, float eps,
-                        cudaStream_t s) {
-  HeadNormRopeKernel<<<M * n_heads, head_dim, head_dim * sizeof(float), s>>>(
-      buf, w, cos_tab, sin_tab, pos, n_heads, head_dim, stride, eps);
+void LaunchHeadNormRope(bf16* buf, const float* wq, const float* wk,
+                        const float* cos_tab, const float* sin_tab,
+                        const int* pos, int M, int n_q, int n_kv, int head_dim,
+                        int stride, float eps, cudaStream_t s) {
+  HeadNormRopeKernel<<<M * (n_q + n_kv), head_dim, head_dim * sizeof(float),
+                       s>>>(buf, wq, wk, cos_tab, sin_tab, pos, n_q, n_kv,
+                            head_dim, stride, eps);
 }
 
 // ==== Paged-KV attention ====
@@ -158,110 +163,22 @@ void LaunchHeadNormRope(bf16* buf, const float* w, const float* cos_tab,
 // row stride q_stride. `rids[grid_slot]` -> request id, so each runs on its
 // subset.
 
-// decode: one block per (head, decode-request). NW warps split KV [0,qpos] into
-// strided slices (warp w takes positions w, w+NW, ...), each online-softmaxing
-// its slice in registers, K/V read straight from the cache (a single query row
-// has no reuse, so shared staging would only add traffic + syncs); an in-block
-// combine then merges the NW partials.
-template <int NW, int DPL>
-__global__ void AttnDecodeKernel(
-    const bf16* __restrict__ q, int q_stride, const bf16* __restrict__ cache_k,
-    const bf16* __restrict__ cache_v, bf16* __restrict__ out, int n_heads,
-    int n_kv, int head_dim, const int* __restrict__ pos,
-    const int* __restrict__ qstart, const int* __restrict__ decode_rids,
-    const int* __restrict__ bt, int max_blocks, int block_size, float scale) {
-  int h = blockIdx.x;        // query head
-  int di = blockIdx.y;       // decode-request slot
-  int w = threadIdx.x >> 5;  // 0..NW-1: this warp's KV split
-  int lane = threadIdx.x & 31;
-
-  int r = decode_rids[di];
-  int flat = qstart[r];  // the single query row (q_len == 1)
-  int qpos = pos[flat];  // attends keys [0, qpos]
-  int kvh = h / (n_heads / n_kv);
-  int kv_dim = n_kv * head_dim;
-  const int* btr = bt + (size_t)r * max_blocks;
-
-  float qreg[DPL];
-  const bf16* qv = q + (size_t)flat * q_stride + (size_t)h * head_dim;
-#pragma unroll
-  for (int i = 0; i < DPL; ++i) qreg[i] = __bfloat162float(qv[lane + (i << 5)]);
-
-  float m_run = -1e30f, l_run = 0.f, acc[DPL];
-#pragma unroll
-  for (int i = 0; i < DPL; ++i) acc[i] = 0.f;
-
-  // warp w streams key positions w, w+NW, ... <= qpos, reading K/V from the
-  // pool
-  for (int kpos = w; kpos <= qpos; kpos += NW) {
-    size_t base = (size_t)btr[kpos / block_size] * block_size * kv_dim +
-                  (size_t)(kpos % block_size) * kv_dim + (size_t)kvh * head_dim;
-    const bf16* kc = cache_k + base;
-    float partial = 0.f;
-#pragma unroll
-    for (int i = 0; i < DPL; ++i)
-      partial += qreg[i] * __bfloat162float(kc[lane + (i << 5)]);
-#pragma unroll
-    for (int o = 16; o > 0; o >>= 1)
-      partial += __shfl_xor_sync(0xffffffff, partial, o);
-    float score = partial * scale;
-
-    float m_new = fmaxf(m_run, score);
-    float corr = __expf(m_run - m_new);
-    float p = __expf(score - m_new);
-    l_run = l_run * corr + p;
-    const bf16* vc = cache_v + base;
-#pragma unroll
-    for (int i = 0; i < DPL; ++i)
-      acc[i] = acc[i] * corr + p * __bfloat162float(vc[lane + (i << 5)]);
-    m_run = m_new;
-  }
-
-  // online-softmax merge of the NW partials, done by warp 0.
-  __shared__ float sm[NW], sl[NW], sacc[NW][DPL * 32];
-  sm[w] = m_run;
-  sl[w] = l_run;
-#pragma unroll
-  for (int i = 0; i < DPL; ++i) sacc[w][lane + (i << 5)] = acc[i];
-  __syncthreads();
-
-  if (w == 0) {
-    float gm = -1e30f;
-#pragma unroll
-    for (int s = 0; s < NW; ++s) gm = fmaxf(gm, sm[s]);
-    float gl = 0.f, gacc[DPL];
-#pragma unroll
-    for (int i = 0; i < DPL; ++i) gacc[i] = 0.f;
-    for (int s = 0; s < NW; ++s) {
-      float sc = __expf(sm[s] - gm);
-      gl += sl[s] * sc;
-#pragma unroll
-      for (int i = 0; i < DPL; ++i) gacc[i] += sacc[s][lane + (i << 5)] * sc;
-    }
-    float inv = gl > 0.f ? 1.0f / gl : 0.f;
-    bf16* o = out + ((size_t)flat * n_heads + h) * head_dim;
-#pragma unroll
-    for (int i = 0; i < DPL; ++i)
-      o[lane + (i << 5)] = __float2bfloat16(gacc[i] * inv);
-  }
-}
-
-// GQA-shared FlashDecoding (the conc>=8 fast path). The per-(q-head) kernel
-// above re-reads each kv-head's K/V once per query head in its GQA group (4x
-// for Qwen3); L2 absorbs most of the redundant HBM traffic, but the redundant
-// L2 bandwidth + load instructions + score reductions still cost ~2.3x. Here
-// one block owns a (kv-head, request) and computes all G = n_heads/n_kv query
-// heads, loading each K/V element ONCE into registers and reusing it across the
-// G heads. Since n_kv gives 4x fewer blocks than n_heads, the KV range is split
-// across grid.z (ksplit) FlashDecoding-style to keep the GPU saturated; a tiny
-// second kernel combines the per-split partials. (S4: grouping by kv-head with
-// only n_kv blocks starved the GPU; the KV split is what makes it a win.)
+// GQA-shared FlashDecoding (decode path). One block owns a (kv-head, request)
+// and computes all G = n_heads/n_kv query heads, loading each K/V element ONCE
+// into registers and reusing it across the G heads (vs. re-reading each
+// kv-head's K/V once per query head in the group, ~2.3x more work). Since n_kv
+// gives 4x fewer blocks than n_heads, the KV range is split across grid.z
+// (ksplit) FlashDecoding-style to keep the GPU saturated; a tiny second kernel
+// combines the per-split partials. (S4: grouping by kv-head with only n_kv
+// blocks starved the GPU; the KV split is what makes it a win.)
 //
 // Phase 1: each block (kv-head, request, split) -> NW warps stream their slice
 // of the split's keys, online-softmax per head, in-block combine across the NW
 // warps, write G UNNORMALIZED partials (m, l, acc[head_dim]) into pm/pl/pa
 // indexed [(di*n_heads + h)*ksplit + sp].
-template <int NW, int DPL, int G>
+// Single-config for qwen3-8B: head_dim=128 => DPL = head_dim/32 = 4;
+// n_heads/n_kv=4 => G = 4; NW = 8 warps/block. LaunchAttnDecode asserts these.
+constexpr int NW = 8, DPL = 4, G = 4;
 __global__ void AttnDecodeGqaKernel(
     const bf16* __restrict__ q, int q_stride, const bf16* __restrict__ cache_k,
     const bf16* __restrict__ cache_v, float* __restrict__ pm,
@@ -275,13 +192,13 @@ __global__ void AttnDecodeGqaKernel(
   int w = threadIdx.x >> 5, lane = threadIdx.x & 31;
   int r = decode_rids[di], flat = qstart[r], qpos = pos[flat];
   int kv_dim = n_kv * head_dim;
-  const int* btr = bt + (size_t)r * max_blocks;
+  const int* btr = bt + static_cast<int64_t>(r) * max_blocks;
 
   float qreg[G][DPL];  // the G query heads of this group, in registers
 #pragma unroll
   for (int g = 0; g < G; ++g) {
-    const bf16* qv =
-        q + (size_t)flat * q_stride + (size_t)(kvh * G + g) * head_dim;
+    const bf16* qv = q + static_cast<int64_t>(flat) * q_stride +
+                     static_cast<int64_t>(kvh * G + g) * head_dim;
 #pragma unroll
     for (int i = 0; i < DPL; ++i)
       qreg[g][i] = __bfloat162float(qv[lane + (i << 5)]);
@@ -298,8 +215,10 @@ __global__ void AttnDecodeGqaKernel(
   // warp w of split sp streams keys sp*NW+w, +NW*ksplit, ... (each key hits
   // exactly one (sp,w)).
   for (int kpos = sp * NW + w; kpos <= qpos; kpos += NW * ksplit) {
-    size_t base = (size_t)btr[kpos / block_size] * block_size * kv_dim +
-                  (size_t)(kpos % block_size) * kv_dim + (size_t)kvh * head_dim;
+    int64_t base =
+        static_cast<int64_t>(btr[kpos / block_size]) * block_size * kv_dim +
+        static_cast<int64_t>(kpos % block_size) * kv_dim +
+        static_cast<int64_t>(kvh) * head_dim;
     const bf16* kc = cache_k + base;
     const bf16* vc = cache_v + base;
     float kreg[DPL], vreg[DPL];  // K/V loaded ONCE, reused across the G heads
@@ -352,7 +271,7 @@ __global__ void AttnDecodeGqaKernel(
         for (int i = 0; i < DPL; ++i) gacc[i] += sa[g][t][lane + (i << 5)] * c;
       }
       int h = kvh * G + g;
-      size_t idx = ((size_t)di * n_heads + h) * ksplit + sp;
+      int64_t idx = (static_cast<int64_t>(di) * n_heads + h) * ksplit + sp;
       if (lane == 0) {
         pm[idx] = gm;
         pl[idx] = gl;
@@ -374,7 +293,7 @@ __global__ void AttnDecodeCombineKernel(
     const int* __restrict__ decode_rids, int ksplit) {
   int h = blockIdx.x, di = blockIdx.y, d = threadIdx.x;
   int r = decode_rids[di], flat = qstart[r];
-  size_t base = ((size_t)di * n_heads + h) * ksplit;
+  int64_t base = (static_cast<int64_t>(di) * n_heads + h) * ksplit;
   float gm = -1e30f;
   for (int s = 0; s < ksplit; ++s) gm = fmaxf(gm, pm[base + s]);
   float gl = 0.f, gacc = 0.f;
@@ -385,7 +304,7 @@ __global__ void AttnDecodeCombineKernel(
     gacc += pa[(base + s) * head_dim + d] * c;
   }
   float inv = gl > 0.f ? 1.0f / gl : 0.f;
-  out[((size_t)flat * n_heads + h) * head_dim + d] =
+  out[(static_cast<int64_t>(flat) * n_heads + h) * head_dim + d] =
       __float2bfloat16(gacc * inv);
 }
 
@@ -394,201 +313,44 @@ void LaunchAttnDecode(const bf16* q, int q_stride, const bf16* cache_k,
                       int head_dim, const int* pos, const int* qstart,
                       const int* decode_rids, int n_decode, const int* bt,
                       int max_blocks, int block_size, float scale,
-                      cudaStream_t s) {
+                      int max_decode, cudaStream_t s) {
   if (n_decode <= 0) return;
-  constexpr int NW = 8;    // warps per block
-  int G = n_heads / n_kv;  // GQA group size (4 for Qwen3-8B)
+  assert(head_dim == 128 && n_heads / n_kv == 4);  // Qwen3-8B: DPL=4, G=4
 
-  // GQA-shared fast path: head_dim==128 (DPL=4) and a supported group size.
   // Split the KV range over grid.z so n_kv (< n_heads) blocks still saturate
-  // the GPU.
-  if (head_dim == 128 && (G == 1 || G == 2 || G == 4 || G == 8)) {
-    constexpr int MAX_KSPLIT = 16;
-    int ksplit =
-        128 /
-        (n_decode > 0 ? n_decode : 1);  // ~enough blocks: n_kv*n_decode*ksplit
-    if (ksplit < 1) ksplit = 1;
-    if (ksplit > MAX_KSPLIT) ksplit = MAX_KSPLIT;
+  // the GPU; a second kernel combines the per-split partials.
+  constexpr int MAX_KSPLIT = 16;
+  int ksplit = 128 / (n_decode > 0 ? n_decode : 1);
+  if (ksplit < 1) ksplit = 1;
+  if (ksplit > MAX_KSPLIT) ksplit = MAX_KSPLIT;
 
-    // persistent FlashDecoding partials, reused across layers/steps (sized for
-    // the worst case).
-    static float *pm = nullptr, *pl = nullptr, *pa = nullptr;
-    if (!pm) {
-      size_t nent = (size_t)kMaxDecodeB * 64 /*heads guard*/ * MAX_KSPLIT;
-      cudaMalloc(&pm, nent * sizeof(float));
-      cudaMalloc(&pl, nent * sizeof(float));
-      cudaMalloc(&pa, nent * 128 * sizeof(float));
-    }
-    dim3 g1(n_kv, n_decode, ksplit);
-#define FQ_DEC_GQA(GG)                                                         \
-  AttnDecodeGqaKernel<NW, 4, GG><<<g1, NW * 32, 0, s>>>(                       \
-      q, q_stride, cache_k, cache_v, pm, pl, pa, n_heads, n_kv, head_dim, pos, \
-      qstart, decode_rids, bt, max_blocks, block_size, scale, ksplit)
-    if (G == 4)
-      FQ_DEC_GQA(4);
-    else if (G == 2)
-      FQ_DEC_GQA(2);
-    else if (G == 8)
-      FQ_DEC_GQA(8);
-    else
-      FQ_DEC_GQA(1);
-#undef FQ_DEC_GQA
-    dim3 g2(n_heads, n_decode);
-    AttnDecodeCombineKernel<<<g2, head_dim, 0, s>>>(
-        pm, pl, pa, out, n_heads, head_dim, qstart, decode_rids, ksplit);
-    return;
+  // Persistent partials, reused across layers/steps; sized on first call to the
+  // worst case (max_decode is fixed for the process, so this never re-grows).
+  static float *pm = nullptr, *pl = nullptr, *pa = nullptr;
+  if (!pm) {
+    size_t nent =
+        static_cast<size_t>(max_decode) * 64 /*heads guard*/ * MAX_KSPLIT;
+    cudaMalloc(&pm, nent * sizeof(float));
+    cudaMalloc(&pl, nent * sizeof(float));
+    cudaMalloc(&pa, nent * 128 * sizeof(float));
   }
-
-  // fallback: one-block-per-(head,request) kernel (re-reads K/V per GQA group).
-  dim3 grid(n_heads, n_decode);
-  AttnDecodeKernel<NW, 4><<<grid, NW * 32, 0, s>>>(
-      q, q_stride, cache_k, cache_v, out, n_heads, n_kv, head_dim, pos, qstart,
-      decode_rids, bt, max_blocks, block_size, scale);
+  dim3 g1(n_kv, n_decode, ksplit);
+  AttnDecodeGqaKernel<<<g1, NW * 32, 0, s>>>(
+      q, q_stride, cache_k, cache_v, pm, pl, pa, n_heads, n_kv, head_dim, pos,
+      qstart, decode_rids, bt, max_blocks, block_size, scale, ksplit);
+  dim3 g2(n_heads, n_decode);
+  AttnDecodeCombineKernel<<<g2, head_dim, 0, s>>>(
+      pm, pl, pa, out, n_heads, head_dim, qstart, decode_rids, ksplit);
 }
 
-// prefill: tensor-core FlashAttention-2 (WMMA 16x16x16, bf16 in / fp32 accum).
-// One warp per (16-query-tile, head, request); streams K/V in 16-key tiles
-// (one tile == one paged block, since block_size==16), no S materialization,
-// online softmax with deferred normalization, O kept in shared fp32 and
-// rescaled per tile (portable — no WMMA fragment-layout assumptions). HD==128
-// (8 d-steps).
-__global__ void AttnPrefillKernel(
-    const bf16* __restrict__ q, int q_stride, const bf16* __restrict__ cache_k,
-    const bf16* __restrict__ cache_v, bf16* __restrict__ out, int n_heads,
-    int n_kv, const int* __restrict__ pos, const int* __restrict__ qstart,
-    const int* __restrict__ qlen, const int* __restrict__ rids,
-    const int* __restrict__ bt, int max_blocks, float scale) {
-  constexpr int HD = 128, ND = HD / 16, TILE = 16;
-  int r = rids[blockIdx.z];
-  int h = blockIdx.y;
-  int qt = blockIdx.x;
-  int lane = threadIdx.x & 31;
-
-  int ql = qlen[r];
-  int q0 = qt * TILE;    // first query row (within request) of this tile
-  if (q0 >= ql) return;  // tile entirely past the request's rows
-  int qs = qstart[r];
-  int kvh = h / (n_heads / n_kv);
-  int kv_dim = n_kv * HD;
-  const int* btr = bt + (size_t)r * max_blocks;
-
-  // last active row's position bounds the key range (positions increase within
-  // a request).
-  int last = min(q0 + TILE - 1, ql - 1);
-  int maxqpos = pos[qs + last];
-  int ntiles = maxqpos / TILE + 1;
-
-  __shared__ float Ss[TILE * TILE];          // S tile scratch (fp32)
-  __shared__ __nv_bfloat16 Ps[TILE * TILE];  // softmaxed P tile (bf16) for P*V
-  __shared__ float
-      Os[TILE * HD];  // O accumulator (fp32, persists across K tiles)
-  __shared__ float
-      Ot[TILE * TILE];  // one 16x16 P*V d-tile (folded into Os immediately)
-  __shared__ float m_[TILE], l_[TILE], corr_[TILE];
-
-  for (int e = lane; e < TILE * HD; e += 32) Os[e] = 0.f;
-  if (lane < TILE) {
-    m_[lane] = -1e30f;
-    l_[lane] = 0.f;
-  }
-  __syncthreads();
-
-  wmma::fragment<wmma::matrix_a, 16, 16, 16, __nv_bfloat16, wmma::row_major> qf;
-  wmma::fragment<wmma::matrix_b, 16, 16, 16, __nv_bfloat16, wmma::col_major> kf;
-  wmma::fragment<wmma::matrix_a, 16, 16, 16, __nv_bfloat16, wmma::row_major> pf;
-  wmma::fragment<wmma::matrix_b, 16, 16, 16, __nv_bfloat16, wmma::row_major> vf;
-
-  for (int kt = 0; kt < ntiles; ++kt) {
-    size_t kvbase = (size_t)btr[kt] * TILE * kv_dim +
-                    (size_t)kvh * HD;  // page kt, this kv-head
-
-    // S = Q * K^T  (accumulate over the 8 head-dim steps)
-    wmma::fragment<wmma::accumulator, 16, 16, 16, float> sacc;
-    wmma::fill_fragment(sacc, 0.f);
-#pragma unroll
-    for (int d = 0; d < ND; ++d) {
-      wmma::load_matrix_sync(
-          qf, q + (size_t)(qs + q0) * q_stride + (size_t)h * HD + d * 16,
-          q_stride);
-      wmma::load_matrix_sync(kf, cache_k + kvbase + d * 16, kv_dim);
-      wmma::mma_sync(sacc, qf, kf, sacc);
-    }
-    wmma::store_matrix_sync(Ss, sacc, TILE, wmma::mem_row_major);
-    __syncthreads();
-
-    // online softmax over this tile's 16 keys (one warp lane per query row)
-    if (lane < TILE) {
-      int grow = q0 + lane;
-      if (grow < ql) {
-        int qpos = pos[qs + grow];
-        float sc[TILE], rmax = -1e30f;
-#pragma unroll
-        for (int c = 0; c < TILE; ++c) {
-          int kpos = kt * TILE + c;
-          sc[c] = (kpos <= qpos) ? Ss[lane * TILE + c] * scale : -1e30f;
-          rmax = fmaxf(rmax, sc[c]);
-        }
-        float mold = m_[lane], mnew = fmaxf(mold, rmax),
-              corr = __expf(mold - mnew), rsum = 0.f;
-#pragma unroll
-        for (int c = 0; c < TILE; ++c) {
-          float p = __expf(sc[c] - mnew);
-          Ps[lane * TILE + c] = __float2bfloat16(p);
-          rsum += p;
-        }
-        l_[lane] = l_[lane] * corr + rsum;
-        m_[lane] = mnew;
-        corr_[lane] = corr;
-      } else {
-#pragma unroll
-        for (int c = 0; c < TILE; ++c)
-          Ps[lane * TILE + c] = __float2bfloat16(0.f);
-        corr_[lane] = 1.f;
-      }
-    }
-    __syncthreads();
-
-    // P*V folded with the running-O rescale, one 16x16 d-tile at a time (no
-    // full [16,128] temp): Os[:,d] = Os[:,d]*corr + (P*V)[:,d]. Each Os element
-    // is rescaled exactly once (when its d-tile is processed). Shrinks shared
-    // (~18KB -> ~11KB) so more blocks/warps stay resident.
-#pragma unroll
-    for (int d = 0; d < ND; ++d) {
-      wmma::fragment<wmma::accumulator, 16, 16, 16, float> pv;
-      wmma::fill_fragment(pv, 0.f);
-      wmma::load_matrix_sync(pf, Ps, TILE);
-      wmma::load_matrix_sync(vf, cache_v + kvbase + d * 16, kv_dim);
-      wmma::mma_sync(pv, pf, vf, pv);
-      wmma::store_matrix_sync(Ot, pv, TILE, wmma::mem_row_major);
-      __syncthreads();
-      for (int e = lane; e < TILE * TILE; e += 32) {
-        int row = e / TILE, col = e % TILE;
-        int oidx = row * HD + d * 16 + col;
-        Os[oidx] = Os[oidx] * corr_[row] + Ot[e];
-      }
-      __syncthreads();
-    }
-  }
-
-  // normalize and write out the active rows
-  for (int e = lane; e < TILE * HD; e += 32) {
-    int row = e / HD, d = e % HD, grow = q0 + row;
-    if (grow < ql) {
-      float inv = l_[row] > 0.f ? 1.0f / l_[row] : 0.f;
-      out[((size_t)(qs + grow) * n_heads + h) * HD + d] =
-          __float2bfloat16(Os[e] * inv);
-    }
-  }
-}
-
-// prefill v2: mma.sync (m16n8k16 bf16) FlashAttention-style, default ON. 4
+// prefill: mma.sync (m16n8k16 bf16) FlashAttention-style. 4
 // warps per block, 64-query-row tile; block-shared K/V staged ONCE per 16-key
 // tile and reused by all 4 warps (~4x less KV traffic); O kept in REGISTERS
 // (mma C-fragment) and rescaled per online-softmax step (no shared O
 // round-trip); online softmax in registers via quad shuffles. V is staged
 // transposed so the P@V B-operand is natural; P passes through a tiny shared
-// buffer to skip the C->A fragment repack. ~2.5x the WMMA kernel (microbench,
-// hd=128). HD==128, block_size==16 only.
+// buffer to skip the C->A fragment repack. ~2.5x a WMMA implementation
+// (microbench, hd=128). HD==128, block_size==16 only.
 static __device__ __forceinline__ unsigned FqaPack(__nv_bfloat16 a,
                                                    __nv_bfloat16 b) {
   __nv_bfloat162 t = __halves2bfloat162(a, b);
@@ -619,7 +381,7 @@ __global__ void AttnPrefillMmaKernel(
   int ql = qlen[r], qs = qstart[r];
   int qbase = blockIdx.x * 64 + warp * 16;
   int kvh = h / (n_heads / n_kv), kv_dim = n_kv * HDc;
-  const int* btr = bt + (size_t)r * max_blocks;
+  const int* btr = bt + static_cast<int64_t>(r) * max_blocks;
   if (blockIdx.x * 64 >= ql) return;  // whole block past this request's rows
 
   __shared__ bf16 Ksh[16 * HDc];  // cp.async-staged K tile (natural layout)
@@ -629,10 +391,10 @@ __global__ void AttnPrefillMmaKernel(
 
   unsigned qa[8][4];
   for (int kk = 0; kk < 8; ++kk) {
-    const bf16* qp =
-        q + (size_t)(qs + qbase) * q_stride + (size_t)h * HDc + kk * 16;
-#define FQ_QG(row, col)                                      \
-  ((qbase + (row)) < ql ? qp[(size_t)(row)*q_stride + (col)] \
+    const bf16* qp = q + static_cast<int64_t>(qs + qbase) * q_stride +
+                     static_cast<int64_t>(h) * HDc + kk * 16;
+#define FQ_QG(row, col)                                                    \
+  ((qbase + (row)) < ql ? qp[static_cast<int64_t>(row) * q_stride + (col)] \
                         : __float2bfloat16(0.f))
     qa[kk][0] = FqaPack(FQ_QG(grp, tg * 2), FQ_QG(grp, tg * 2 + 1));
     qa[kk][1] = FqaPack(FQ_QG(grp + 8, tg * 2), FQ_QG(grp + 8, tg * 2 + 1));
@@ -656,15 +418,16 @@ __global__ void AttnPrefillMmaKernel(
   // only ~0.9% e2e, so single-buffer staging keeps the register-O + mma +
   // K/V-reuse win. See prefix-cache-large-hit-bug.
   auto stage = [&](int kt) {
-    size_t kvbase = (size_t)btr[kt] * 16 * kv_dim + (size_t)kvh * HDc;
+    int64_t kvbase = static_cast<int64_t>(btr[kt]) * 16 * kv_dim +
+                     static_cast<int64_t>(kvh) * HDc;
     for (int c = threadIdx.x; c < 16 * 16; c += 128) {
       int key = c >> 4, ck = c & 15;  // 16B (8 bf16) chunks
-      __pipeline_memcpy_async(&Ksh[key * HDc + ck * 8],
-                              &cache_k[kvbase + (size_t)key * kv_dim + ck * 8],
-                              16);
-      __pipeline_memcpy_async(&Vsh[key * HDc + ck * 8],
-                              &cache_v[kvbase + (size_t)key * kv_dim + ck * 8],
-                              16);
+      __pipeline_memcpy_async(
+          &Ksh[key * HDc + ck * 8],
+          &cache_k[kvbase + static_cast<int64_t>(key) * kv_dim + ck * 8], 16);
+      __pipeline_memcpy_async(
+          &Vsh[key * HDc + ck * 8],
+          &cache_v[kvbase + static_cast<int64_t>(key) * kv_dim + ck * 8], 16);
     }
     __pipeline_commit();
   };
@@ -758,15 +521,15 @@ __global__ void AttnPrefillMmaKernel(
   for (int nt = 0; nt < NT; nt++) {
     int rr0 = qbase + grp, rr1 = qbase + grp + 8, hd = nt * 8 + tg * 2;
     if (rr0 < ql) {
-      out[((size_t)(qs + rr0) * n_heads + h) * HDc + hd] =
+      out[(static_cast<int64_t>(qs + rr0) * n_heads + h) * HDc + hd] =
           __float2bfloat16(O[nt][0] * inv0);
-      out[((size_t)(qs + rr0) * n_heads + h) * HDc + hd + 1] =
+      out[(static_cast<int64_t>(qs + rr0) * n_heads + h) * HDc + hd + 1] =
           __float2bfloat16(O[nt][1] * inv0);
     }
     if (rr1 < ql) {
-      out[((size_t)(qs + rr1) * n_heads + h) * HDc + hd] =
+      out[(static_cast<int64_t>(qs + rr1) * n_heads + h) * HDc + hd] =
           __float2bfloat16(O[nt][2] * inv1);
-      out[((size_t)(qs + rr1) * n_heads + h) * HDc + hd + 1] =
+      out[(static_cast<int64_t>(qs + rr1) * n_heads + h) * HDc + hd + 1] =
           __float2bfloat16(O[nt][3] * inv1);
     }
   }
@@ -779,26 +542,12 @@ void LaunchAttnPrefill(const bf16* q, int q_stride, const bf16* cache_k,
                        const int* bt, int max_blocks, int block_size,
                        float scale, cudaStream_t s) {
   if (R <= 0) return;
-  static int v2 = -1;
-  if (v2 < 0) {
-    const char* e = std::getenv("FQ_PREFILL_V2");
-    v2 = (e && atoi(e) == 0) ? 0 : 1;
-  }
-  // v2 mma.sync path: head_dim==128 (16 n8-tiles) + one 16-key tile per paged
-  // block (block_size==16).
-  if (v2 && head_dim == 128 && block_size == 16) {
-    dim3 grid((max_qlen + 63) / 64, n_heads, R);
-    AttnPrefillMmaKernel<<<grid, 128, 0, s>>>(
-        q, q_stride, cache_k, cache_v, out, n_heads, n_kv, pos, qstart, qlen,
-        rids, bt, max_blocks, scale);
-    return;
-  }
-  // fallback: WMMA kernel.
-  int qtiles = (max_qlen + 15) / 16;
-  dim3 grid(qtiles, n_heads, R);
-  AttnPrefillKernel<<<grid, 32, 0, s>>>(q, q_stride, cache_k, cache_v, out,
-                                        n_heads, n_kv, pos, qstart, qlen, rids,
-                                        bt, max_blocks, scale);
+  assert(head_dim == 128 &&
+         block_size == 16);  // Qwen3: 16 n8-tiles, 1 tile/blk
+  dim3 grid((max_qlen + 63) / 64, n_heads, R);
+  AttnPrefillMmaKernel<<<grid, 128, 0, s>>>(q, q_stride, cache_k, cache_v, out,
+                                            n_heads, n_kv, pos, qstart, qlen,
+                                            rids, bt, max_blocks, scale);
 }
 
 // Gather S rows: out[i, :] = x[rows[i], :]   (one block per gathered row, BF16)
@@ -806,8 +555,8 @@ __global__ void GatherRowsKernel(const bf16* __restrict__ x,
                                  const int* __restrict__ rows,
                                  bf16* __restrict__ out, int H) {
   int i = blockIdx.x;
-  const bf16* src = x + (size_t)rows[i] * H;
-  bf16* dst = out + (size_t)i * H;
+  const bf16* src = x + static_cast<int64_t>(rows[i]) * H;
+  bf16* dst = out + static_cast<int64_t>(i) * H;
   for (int j = threadIdx.x; j < H; j += blockDim.x) dst[j] = src[j];
 }
 
@@ -833,67 +582,77 @@ void LaunchAdd(bf16* out, const bf16* in, int N, cudaStream_t s) {
 __global__ void SiluMulKernel(const bf16* __restrict__ gateup,
                               bf16* __restrict__ h, int M, int I) {
   int idx = blockIdx.x * blockDim.x + threadIdx.x;
-  if (idx >= (size_t)M * I) return;
+  if (idx >= static_cast<int64_t>(M) * I) return;
   int m = idx / I, i = idx % I;
-  const bf16* row = gateup + (size_t)m * 2 * I;
+  const bf16* row = gateup + static_cast<int64_t>(m) * 2 * I;
   float g = __bfloat162float(row[i]);
   h[idx] =
       __float2bfloat16((g / (1.0f + expf(-g))) * __bfloat162float(row[I + i]));
 }
 void LaunchSiluMul(const bf16* gateup, bf16* h, int M, int I, cudaStream_t s) {
   int block = 256;
-  long N = (long)M * I;
+  long N = static_cast<long>(M) * I;
   SiluMulKernel<<<(N + block - 1) / block, block, 0, s>>>(gateup, h, M, I);
 }
 
-// Batched sampling: one block per row of logits[B, N]. Greedy (invT[b] <= 0)
-// reduces an argmax; otherwise temperature softmax + inverse-CDF categorical
-// sampling, restricted to the nucleus when top_p[b] < 1. Each thread owns a
-// CONTIGUOUS index range so the cumulative scan runs in token-id order (any
-// consistent order gives the same distribution; contiguous makes each thread's
-// prefix a true prefix over token ids). Nucleus = smallest set of highest-prob
-// tokens with cumulative prob >= top_p, found by binary-searching a weight
-// threshold wt with sum_{w_i >= wt} w_i >= top_p*Z. No global sort — all work
-// stays in one block.
 static constexpr int kSampleThreads = 256;
-__global__ void SampleBatchKernel(const float* __restrict__ logits, int N,
-                                  const float* __restrict__ invT,
-                                  const float* __restrict__ topp,
-                                  const float* __restrict__ u,
-                                  int* __restrict__ out) {
-  int b = blockIdx.x, tid = threadIdx.x, nt = blockDim.x;
-  const float* lg = logits + (size_t)b * N;
+
+// Greedy: argmax over row b of logits[B, N] via a strided sweep + block reduce.
+// Rows with invT[b] > 0 are sampled instead (handled by SampleKernel), so this
+// block returns early for them.
+__global__ void ArgmaxKernel(const float* __restrict__ logits, int N,
+                             const float* __restrict__ invT,
+                             int* __restrict__ out) {
+  int b = blockIdx.x;
+  if (invT[b] > 0.0f) return;
+  int tid = threadIdx.x, nt = blockDim.x;
+  const float* lg = logits + static_cast<int64_t>(b) * N;
+
+  __shared__ float sval[kSampleThreads];
+  __shared__ int sidx[kSampleThreads];
+  float best = -1e30f;
+  int bi = 0;
+  for (int i = tid; i < N; i += nt) {
+    float v = lg[i];
+    if (v > best) {
+      best = v;
+      bi = i;
+    }
+  }
+  sval[tid] = best;
+  sidx[tid] = bi;
+  __syncthreads();
+  for (int s = nt >> 1; s > 0; s >>= 1) {
+    if (tid < s && sval[tid + s] > sval[tid]) {
+      sval[tid] = sval[tid + s];
+      sidx[tid] = sidx[tid + s];
+    }
+    __syncthreads();
+  }
+  if (tid == 0) out[b] = sidx[0];
+}
+
+// Temperature categorical: one block per row of logits[B, N]. Softmax (with
+// max-subtraction for stability) + inverse-CDF sampling, restricted to the
+// nucleus when top_p[b] < 1. Each thread owns a CONTIGUOUS index range so the
+// cumulative scan runs in token-id order (any consistent order gives the same
+// distribution; contiguous makes each thread's prefix a true prefix over token
+// ids). Nucleus = smallest set of highest-prob tokens with cumulative prob >=
+// top_p, found by binary-searching a weight threshold wt with
+// sum_{w_i >= wt} w_i >= top_p*Z. No global sort — all work stays in one block.
+// Rows with invT[b] <= 0 are greedy (handled by ArgmaxKernel), returned early.
+__global__ void SampleKernel(const float* __restrict__ logits, int N,
+                             const float* __restrict__ invT,
+                             const float* __restrict__ topp,
+                             const float* __restrict__ u,
+                             int* __restrict__ out) {
+  int b = blockIdx.x;
   float it = invT[b];
+  if (it <= 0.0f) return;
+  int tid = threadIdx.x, nt = blockDim.x;
+  const float* lg = logits + static_cast<int64_t>(b) * N;
 
   __shared__ float sval[kSampleThreads];  // reduction / partial-sum scratch
-  __shared__ int sidx[kSampleThreads];
-
-  // greedy: argmax over a strided sweep
-  if (it <= 0.0f) {
-    float best = -1e30f;
-    int bi = 0;
-    for (int i = tid; i < N; i += nt) {
-      float v = lg[i];
-      if (v > best) {
-        best = v;
-        bi = i;
-      }
-    }
-    sval[tid] = best;
-    sidx[tid] = bi;
-    __syncthreads();
-    for (int s = nt >> 1; s > 0; s >>= 1) {
-      if (tid < s && sval[tid + s] > sval[tid]) {
-        sval[tid] = sval[tid + s];
-        sidx[tid] = sidx[tid + s];
-      }
-      __syncthreads();
-    }
-    if (tid == 0) out[b] = sidx[0];
-    return;
-  }
-
-  // temperature categorical (full distribution, or nucleus when top_p < 1)
   int chunk = (N + nt - 1) / nt;
   int lo = min(tid * chunk, N), hi = min(lo + chunk, N);
 
@@ -997,8 +756,12 @@ __global__ void SampleBatchKernel(const float* __restrict__ logits, int N,
   if (tid == 0) out[b] = result;
 }
 
+// Greedy and sampled rows are disjoint (split by invT[b] sign), each kernel
+// returns early for rows it does not own, so the two launches over B blocks
+// together fill out[0..B).
 void LaunchSampleBatch(const float* logits, int B, int N, const float* invT,
                        const float* topp, const float* u, int* out,
                        cudaStream_t s) {
-  SampleBatchKernel<<<B, kSampleThreads, 0, s>>>(logits, N, invT, topp, u, out);
+  ArgmaxKernel<<<B, kSampleThreads, 0, s>>>(logits, N, invT, out);
+  SampleKernel<<<B, kSampleThreads, 0, s>>>(logits, N, invT, topp, u, out);
 }

@@ -1,6 +1,3 @@
-// Declarative model spec (dims + arch) parsed from config.json. No GPU/weights;
-// cheap to load. Used for KV-pool sizing, scheduler limits, and CLI validation.
-// ModelRuntime is the compute half; tokenizer/chat-template live in the Go app.
 #pragma once
 #include <fstream>
 #include <sstream>
@@ -8,29 +5,27 @@
 
 #include "rapidjson/document.h"
 
+// Declarative model spec (dims + arch) parsed from config.json; no GPU/weights.
+// Drives KV-pool sizing, scheduler limits, and CLI validation. Load() is
+// lenient (a missing/invalid file or unknown arch leaves it unsupported, dims
+// default); gate use with Supported(). ModelRuntime is the compute half.
 struct ModelSpec {
   int hidden_size = 4096;
   int num_layers = 36;
-  int num_heads = 32;    // query heads
-  int num_kv_heads = 8;  // key/value heads (GQA)
+  int num_heads = 32;
+  int num_kv_heads = 8;
   int head_dim = 128;
   int intermediate = 12288;
   int vocab_size = 151936;
   float rms_eps = 1e-6f;
   float rope_theta = 1000000.0f;
-  std::string arch;  // architectures[0] from config.json ("" if unreadable)
-  std::string dir;   // directory it was loaded from (config.json + weights +
-                     // vocab live here)
+  std::string arch;
+  std::string dir;
 
   int QDim() const { return num_heads * head_dim; }
   int KvDim() const { return num_kv_heads * head_dim; }
-  // Engine assumes dense Qwen3 layout (head_dim==128, GQA); reject anything
-  // else.
   bool Supported() const { return arch == "Qwen3ForCausalLM"; }
 
-  // Parse <dir>/config.json. Lenient: missing/invalid file or unknown arch
-  // leaves `arch` empty (gate with Supported()); dims read only for a supported
-  // arch, where a real Qwen3 config always provides them.
   static ModelSpec Load(const std::string& dir) {
     ModelSpec c;
     c.dir = dir;
@@ -44,8 +39,7 @@ struct ModelSpec {
     if (o.HasMember("architectures") && o["architectures"].IsArray() &&
         !o["architectures"].Empty() && o["architectures"][0].IsString())
       c.arch = o["architectures"][0].GetString();
-    if (!c.Supported())
-      return c;  // unknown layout: skip dim reads (fields may be absent)
+    if (!c.Supported()) return c;
 
     c.hidden_size = o["hidden_size"].GetInt();
     c.num_layers = o["num_hidden_layers"].GetInt();

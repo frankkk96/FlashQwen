@@ -8,4 +8,4 @@ repos:
     rev: v14.0.6
     hooks:
       - id: clang-format
-        files: ^engine/src/.*\.(cpp|hpp|cu|cuh)$
+        files: ^engine/src/.*\.(cc|h|cu|cuh)$

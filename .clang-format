@@ -1,4 +1,4 @@
-# Pure Google C++ style (80 columns). Applies to .cpp/.hpp and CUDA .cu/.cuh
+# Pure Google C++ style (80 columns). Applies to .cc/.h and CUDA .cu/.cuh
 # (clang-format treats CUDA as C++ for layout — it does not parse device code).
 BasedOnStyle: Google
 Standard: c++17

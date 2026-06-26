@@ -1,4 +1,4 @@
-# Pure Google C++ lint. Run over host translation units (.cpp + the .hpp they
+# Pure Google C++ lint. Run over host translation units (.cc + the .h they
 # pull in); .cu/.cuh device code is covered by clang-format only (clang-tidy
 # would need a clang CUDA toolchain to parse nvcc command lines — see scripts/lint.sh).
 Checks: >
@@ -17,7 +17,7 @@ Checks: >
   -clang-analyzer-security.insecureAPI.*
 
 WarningsAsErrors: ''
-HeaderFilterRegex: 'engine/src/.*\.(hpp|cuh)$'
+HeaderFilterRegex: 'engine/src/.*\.(h|cuh)$'
 FormatStyle: file
 
 # Google identifier conventions. Deliberate exemptions for this engine's idioms:
