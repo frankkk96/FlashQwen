@@ -35,7 +35,12 @@ __device__ __forceinline__ auto AccRowcol(Layout l) {
 }  // namespace
 
 // One CTA per (q-tile of TQ rows, head h, request r). 128 threads = 4 warps.
-static __global__ void CutePrefillKernel(const cbf16* __restrict__ q, int q_stride,
+// __launch_bounds__(128,4): cap at 128 regs/thread so 4 CTAs fit per SM on the
+// 4090 (65536 regs/SM) -> 33% occupancy vs 25% at the natural 153 regs; ptxas
+// hits 128 with zero spills (recompute, not spill). The hand kernel is stuck at
+// 3 CTAs/SM (156 regs).
+static __global__ void __launch_bounds__(128, 4)
+CutePrefillKernel(const cbf16* __restrict__ q, int q_stride,
                                   const cbf16* __restrict__ cache_kv,
                                   cbf16* __restrict__ out, int n_heads, int n_kv,
                                   const int* __restrict__ pos,
