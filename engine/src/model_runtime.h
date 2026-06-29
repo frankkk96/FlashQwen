@@ -89,11 +89,28 @@ struct ForwardInput {
 // out_tokens[logits_rows.size()].
 class ModelRuntime {
  public:
-  ModelRuntime(const ModelSpec& spec, const KvStore& store, int max_ctx,
-               int slots, int token_budget, unsigned seed);
+  // Loads weights + activation scratch. Does NOT take the KvStore: the KV pool
+  // is sized from the VRAM left AFTER this constructor runs, so it must be
+  // built afterwards and wired in via AttachKvStore() before the first Forward.
+  ModelRuntime(const ModelSpec& spec, int max_ctx, int slots, int token_budget,
+               unsigned seed);
   ~ModelRuntime();
 
+  // Attach the KV pool (built after this runtime so it gets the real leftover
+  // VRAM). Must be called before Forward().
+  void AttachKvStore(const KvStore& store) { store_ = &store; }
+
   void Forward(const ForwardInput& in, std::vector<int>& out_tokens);
+
+  // Async path for single-step async scheduling (FQ_ASYNC_SCHED). ForwardAsync
+  // launches the forward WITHOUT syncing and returns a ticket; the sampled
+  // tokens are D2H'd to a pinned ping-pong buffer. WaitForward(ticket) syncs on
+  // that launch and fills out_tokens. `feedback` makes the embedding read the
+  // previous step's sampled tokens straight from the GPU (d_arg_) instead of
+  // host-provided ids — so the next step can be built+launched before the
+  // previous step's tokens come back to the CPU.
+  int ForwardAsync(const ForwardInput& in, bool feedback);
+  void WaitForward(int ticket, std::vector<int>& out_tokens);
 
  private:
   // Fused weights (BF16, HF layout [OUT, IN]): d_qkv = [q|k|v] and d_gateup =
@@ -107,8 +124,11 @@ class ModelRuntime {
   DeviceBuffer<bf16> UploadBf16s(const std::vector<std::string>& names);
   DeviceBuffer<float> UploadFp32(const std::string& name);
   void PrecomputeRope();
-  void RunLayers(const ForwardInput& in);
-  void RunHeadAndSample(const ForwardInput& in, std::vector<int>& out_tokens);
+  void RunLayers(const ForwardInput& in);      // dispatcher (eager or CUDA graph)
+  void RunLayersBody(const ForwardInput& in);  // the actual layer-stack launches
+  // Gather sample rows, lm_head, sample; D2H the S tokens to host_out (async,
+  // no sync). Returns S.
+  int RunHeadAndSample(const ForwardInput& in, int* host_out);
   void UploadInputs(const ForwardInput& in);
   void GroupRequests(const ForwardInput& in);
 
@@ -131,6 +151,9 @@ class ModelRuntime {
   DeviceBuffer<bf16> d_x_, d_xb_, d_xb2_, d_qkv_, d_attn_, d_gateup_, d_hmlp_;
   DeviceBuffer<bf16> d_xg_;
   DeviceBuffer<float> d_logits_;
+  // FlashDecoding split partials (m, l, acc), preallocated once to the
+  // worst-case decode batch; the decode attention launchers write/read them.
+  DeviceBuffer<float> d_dec_pm_, d_dec_pl_, d_dec_pa_;
   DeviceBuffer<int> d_ids_, d_pos_, d_req_;
   DeviceBuffer<int> d_qstart_, d_qlen_;
   DeviceBuffer<int> d_decode_rids_, d_prefill_rids_;
@@ -146,4 +169,17 @@ class ModelRuntime {
 
   cudaStream_t stream_ = nullptr;
   cublasHandle_t cublas_ = nullptr;
+  static constexpr size_t kCublasWsBytes = 32 << 20;  // user cuBLAS workspace
+  void* cublas_ws_ = nullptr;
+  // CUDA-graph capture of the pure-decode layer stack (FQ_DECODE_GRAPH).
+  cudaGraphExec_t layers_graph_ = nullptr;
+  int graph_T_ = -1, graph_ndec_ = -1;
+  // Single-step async scheduling (FQ_ASYNC_SCHED): ping-pong events + pinned
+  // token buffers so two forwards can be in flight; embed_feedback_ routes the
+  // embedding to read d_arg_ (the previous sample) instead of d_ids_.
+  bool embed_feedback_ = false;
+  cudaEvent_t async_ev_[2] = {nullptr, nullptr};
+  int* async_pin_[2] = {nullptr, nullptr};
+  int async_S_[2] = {0, 0};
+  int async_parity_ = 0;
 };

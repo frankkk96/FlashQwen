@@ -21,6 +21,8 @@ endif()
 
 set(CMAKE_CXX_FLAGS_RELEASE "-O3")
 set(CMAKE_CUDA_FLAGS_RELEASE "-O3 --use_fast_math")
+# CUTLASS/CuTe headers (attn_cute.cu) need relaxed constexpr in device code.
+set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} --expt-relaxed-constexpr")
 
 # gRPC + Protobuf for the `serve` mode (the Go OpenAI gateway is the client). Prefer a CMake
 # config package (a source/conda build under /usr/local — e.g. the latest gRPC); fall back to the
@@ -70,11 +72,12 @@ add_executable(flashqwen-engine
   src/kernels.cu
   src/kv_store.cu
   src/model_runtime.cu
+  src/attn_cute.cu
   ${PROTO_SRCS}
 )
 find_package(CUDAToolkit REQUIRED)   # cuBLAS for the matmuls
 
-target_include_directories(flashqwen-engine PRIVATE src third_party ${GEN_DIR})  # third_party: RapidJSON + CLI11
+target_include_directories(flashqwen-engine PRIVATE src third_party third_party/cutlass/include ${GEN_DIR})  # third_party: RapidJSON + CLI11 + CUTLASS/CuTe
 target_link_libraries(flashqwen-engine PRIVATE ${GRPC_LIBS} CUDA::cublas)
 # Prefer the source-built gRPC/protobuf in /usr/local over any system (apt) copy at runtime.
 set_target_properties(flashqwen-engine PROPERTIES CUDA_SEPARABLE_COMPILATION ON

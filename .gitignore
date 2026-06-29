@@ -21,3 +21,6 @@ internal/supervisor/bin/flashqwen-engine
 
 # experiment notes / scratch docs (local only)
 exps/
+
+# Vendored CUTLASS headers (fetch via: pip download nvidia-cutlass; unzip wheel)
+engine/third_party/cutlass/

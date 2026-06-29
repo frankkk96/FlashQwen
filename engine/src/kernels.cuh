@@ -79,32 +79,17 @@ void LaunchHeadNormRope(bf16* buf, const float* wq, const float* wk,
 // here and in the write side (kv_store.cu). `bt` holds one block table per
 // request (stride `max_blocks`).
 //
-// Attention is split by request type (RunLayers dispatches each on its subset):
-// prefill (q_len>1) and decode (q_len==1). Shared contract: q is read from the
-// fused-QKV buffer (row stride `q_stride`), out is [T, n_heads, head_dim];
-// request r owns rows [qstart[r], +qlen[r]) at positions pos[], attending keys
-// [0, pos] (causal); `rids[grid_slot]` -> request id (R / n_decode entries).
+// The attention kernels themselves (prefill q_len>1, decode q_len==1) live in
+// attn_cute.cu (CuTe/CUTLASS); this header only owns the shared decode-partials
+// sizing they share with ModelRuntime.
 
-// Prefill (q_len>1): tensor-core FlashAttention-2 (see kernels.cu). Requires
-// head_dim==128 and block_size==16 (Qwen3 + kKvBlock). max_qlen sets
-// the q-tile grid.
-void LaunchAttnPrefill(const bf16* q, int q_stride, const bf16* cache_kv,
-                       bf16* out, int n_heads, int n_kv, int head_dim,
-                       const int* pos, const int* qstart, const int* qlen,
-                       const int* rids, int R, int max_qlen, const int* bt,
-                       int max_blocks, int block_size, float scale,
-                       cudaStream_t s);
-
-// Decode (q_len==1): FlashDecoding. One block per (head, decode-request); warps
-// split the KV range and online-softmax their slices, reading K/V straight from
-// the cache (a single query has no reuse, so staging would only add traffic),
-// then an in-block combine merges the per-warp partials.
-void LaunchAttnDecode(const bf16* q, int q_stride, const bf16* cache_kv,
-                      bf16* out, int n_heads, int n_kv, int head_dim,
-                      const int* pos, const int* qstart, const int* decode_rids,
-                      int n_decode, const int* bt, int max_blocks,
-                      int block_size, float scale, int max_decode,
-                      cudaStream_t s);
+// Max grid.z KV-splits for the decode path. The split partials pm/pl/pa are
+// owned/preallocated by the caller (ModelRuntime), sized DecodePartialFloats():
+// pm/pl one float per (decode-slot, head, split); pa adds head_dim.
+constexpr int kMaxKsplit = 16;
+inline size_t DecodePartialFloats(int max_decode) {
+  return static_cast<size_t>(max_decode) * 64 /*heads guard*/ * kMaxKsplit;
+}
 
 // Gather S rows from x[*, H] into out[S, H]: out[i] = x[rows[i]] (BF16). Pulls
 // the per-request last-token rows out of the flattened batch before the final
