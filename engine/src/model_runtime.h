@@ -114,7 +114,8 @@ class ModelRuntime {
   DeviceBuffer<bf16> UploadBf16s(const std::vector<std::string>& names);
   DeviceBuffer<float> UploadFp32(const std::string& name);
   void PrecomputeRope();
-  void RunLayers(const ForwardInput& in);
+  void RunLayers(const ForwardInput& in);      // dispatcher (eager or CUDA graph)
+  void RunLayersBody(const ForwardInput& in);  // the actual layer-stack launches
   void RunHeadAndSample(const ForwardInput& in, std::vector<int>& out_tokens);
   void UploadInputs(const ForwardInput& in);
   void GroupRequests(const ForwardInput& in);
@@ -156,4 +157,9 @@ class ModelRuntime {
 
   cudaStream_t stream_ = nullptr;
   cublasHandle_t cublas_ = nullptr;
+  static constexpr size_t kCublasWsBytes = 32 << 20;  // user cuBLAS workspace
+  void* cublas_ws_ = nullptr;
+  // CUDA-graph capture of the pure-decode layer stack (FQ_DECODE_GRAPH).
+  cudaGraphExec_t layers_graph_ = nullptr;
+  int graph_T_ = -1, graph_ndec_ = -1;
 };

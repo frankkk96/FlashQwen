@@ -152,6 +152,10 @@ ModelRuntime::ModelRuntime(const ModelSpec& spec, int max_ctx, int slots,
   CUBLAS_CHECK(cublasCreate(&cublas_));
   CUBLAS_CHECK(cublasSetStream(cublas_, stream_));
   CUBLAS_CHECK(cublasSetMathMode(cublas_, CUBLAS_DEFAULT_MATH));
+  // User-owned cuBLAS workspace so GEMMs don't cudaMalloc internally during
+  // CUDA-graph capture (FQ_DECODE_GRAPH).
+  CUDA_CHECK(cudaMalloc(&cublas_ws_, kCublasWsBytes));
+  CUBLAS_CHECK(cublasSetWorkspace(cublas_, cublas_ws_, kCublasWsBytes));
 
   size_t freeb, totalb;
   CUDA_CHECK(cudaMemGetInfo(&freeb, &totalb));
@@ -165,7 +169,40 @@ ModelRuntime::ModelRuntime(const ModelSpec& spec, int max_ctx, int slots,
 // Unified layer stack over all query rows (prefill chunks + decodes together,
 // no split). Per-token ops run on the flattened batch; attention resolves each
 // request's rows (qstart/qlen), positions (d_pos_) and KV (d_bt_) itself.
+// Pure-decode steps (no prefill) have a fixed launch sequence + configs for a
+// given (T, n_decode), so they can be captured into a CUDA graph once and
+// replayed — eliminating per-step launch overhead. Opt-in via FQ_DECODE_GRAPH;
+// inputs (block tables, positions, ids) live in fixed buffers updated eagerly
+// before each replay, so the recorded kernels read the new step's data.
+// Experimental: the engine is ~98% GPU-busy even at conc=1, so the recoverable
+// idle is small (see docs/exps/s11). Recaptured if (T, n_decode) changes.
 void ModelRuntime::RunLayers(const ForwardInput& in) {
+  static const bool kDecodeGraph = [] {
+    const char* e = std::getenv("FQ_DECODE_GRAPH");
+    return e && e[0] == '1';
+  }();
+  int T = in.NumRows();
+  if (kDecodeGraph && n_prefill_ == 0 && n_decode_ > 0) {
+    if (layers_graph_ && graph_T_ == T && graph_ndec_ == n_decode_) {
+      CUDA_CHECK(cudaGraphLaunch(layers_graph_, stream_));
+      return;
+    }
+    if (layers_graph_) CUDA_CHECK(cudaGraphExecDestroy(layers_graph_));
+    CUDA_CHECK(cudaStreamBeginCapture(stream_, cudaStreamCaptureModeThreadLocal));
+    RunLayersBody(in);
+    cudaGraph_t g;
+    CUDA_CHECK(cudaStreamEndCapture(stream_, &g));
+    CUDA_CHECK(cudaGraphInstantiate(&layers_graph_, g, 0));
+    CUDA_CHECK(cudaGraphDestroy(g));
+    graph_T_ = T;
+    graph_ndec_ = n_decode_;
+    CUDA_CHECK(cudaGraphLaunch(layers_graph_, stream_));
+    return;
+  }
+  RunLayersBody(in);
+}
+
+void ModelRuntime::RunLayersBody(const ForwardInput& in) {
   int T = in.NumRows();
   const ModelSpec& c = spec_;
   int H = c.hidden_size, QD = c.QDim(), KVD = c.KvDim(), I = c.intermediate;
@@ -340,6 +377,8 @@ void ModelRuntime::RunHeadAndSample(const ForwardInput& in,
 // Each DeviceBuffer member frees its own device memory; only the cuBLAS/stream
 // handles, which are not plain allocations, need explicit teardown.
 ModelRuntime::~ModelRuntime() {
+  if (layers_graph_) cudaGraphExecDestroy(layers_graph_);
+  if (cublas_ws_) cudaFree(cublas_ws_);
   if (cublas_) cublasDestroy(cublas_);
   if (stream_) cudaStreamDestroy(stream_);
 }
