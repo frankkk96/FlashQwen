@@ -17,6 +17,9 @@ namespace {
 constexpr int HD = 128;  // head_dim
 constexpr int TQ = 64;   // query rows per CTA (4 warps x 16)
 constexpr int TK = 16;   // key tile == page size
+constexpr int G = 4;     // GQA group = n_heads/n_kv (asserted)
+constexpr int DPL = 4;   // head_dim/32: dims held per lane (decode)
+constexpr int NW = 4;    // warps per decode CTA splitting the key range
 }  // namespace
 
 // One CTA per (q-tile of TQ rows, head h, request r). 128 threads = 4 warps.
@@ -159,4 +162,82 @@ void LaunchAttnPrefillCute(const __nv_bfloat16* q, int q_stride,
       reinterpret_cast<const cbf16*>(q), q_stride,
       reinterpret_cast<const cbf16*>(cache_kv), reinterpret_cast<cbf16*>(out),
       n_heads, n_kv, pos, qstart, qlen, rids, bt, max_blocks, scale);
+}
+
+// Decode (q_len==1): FlashDecoding. One CTA per (kv-head, decode request); NW
+// warps split the key range, each runs a partial online softmax, then an in-CTA
+// combine. q_len=1 has no MMA to use, so CuTe wraps the paged K/V tensor views
+// and the compute is warp-shuffle gemv. The G query heads of a group reuse each
+// K/V load. No grid.z split: at decode concurrency n_kv*n_decode CTAs saturate.
+static __global__ void CuteDecodeKernel(
+    const cbf16* __restrict__ q, int q_stride, const cbf16* __restrict__ cache_kv,
+    cbf16* __restrict__ out, int n_heads, int n_kv, const int* __restrict__ pos,
+    const int* __restrict__ qstart, const int* __restrict__ decode_rids,
+    const int* __restrict__ bt, int max_blocks, float scale) {
+  int kvh = blockIdx.x, di = blockIdx.y;
+  int w = threadIdx.x >> 5, lane = threadIdx.x & 31;
+  int r = decode_rids[di], flat = qstart[r], qpos = pos[flat];
+  int kv_dim = n_kv * HD;
+  int64_t plane = static_cast<int64_t>(TK) * kv_dim;
+  const int* btr = bt + r * max_blocks;
+
+  float qreg[G][DPL];
+  for (int g = 0; g < G; ++g) {
+    const cbf16* qv = q + static_cast<int64_t>(flat) * q_stride +
+                      static_cast<int64_t>(kvh * G + g) * HD;
+    for (int i = 0; i < DPL; ++i) qreg[g][i] = float(qv[lane + i * 32]);
+  }
+  float m[G], l[G], acc[G][DPL];
+  for (int g = 0; g < G; ++g) { m[g] = -1e30f; l[g] = 0.f;
+    for (int i = 0; i < DPL; ++i) acc[g][i] = 0.f; }
+
+  for (int kpos = w; kpos <= qpos; kpos += NW) {
+    int64_t base = static_cast<int64_t>(btr[kpos / TK]) * kKvPlanes * plane +
+                   static_cast<int64_t>(kpos % TK) * kv_dim +
+                   static_cast<int64_t>(kvh) * HD;
+    Tensor K = make_tensor(make_gmem_ptr(cache_kv + base), make_layout(Shape<Int<HD>>{}));
+    Tensor V = make_tensor(make_gmem_ptr(cache_kv + base + plane), make_layout(Shape<Int<HD>>{}));
+    float kreg[DPL], vreg[DPL];
+    for (int i = 0; i < DPL; ++i) { kreg[i] = float(K(lane + i * 32)); vreg[i] = float(V(lane + i * 32)); }
+    for (int g = 0; g < G; ++g) {
+      float p = 0; for (int i = 0; i < DPL; ++i) p += qreg[g][i] * kreg[i];
+      for (int o = 16; o > 0; o >>= 1) p += __shfl_xor_sync(0xffffffff, p, o);
+      float score = p * scale;
+      float nm = fmaxf(m[g], score), corr = __expf(m[g] - nm), pp = __expf(score - nm);
+      l[g] = l[g] * corr + pp;
+      for (int i = 0; i < DPL; ++i) acc[g][i] = acc[g][i] * corr + pp * vreg[i];
+      m[g] = nm;
+    }
+  }
+
+  __shared__ float sm[G][NW], sl[G][NW], sa[G][NW][HD];
+  for (int g = 0; g < G; ++g) { sm[g][w] = m[g]; sl[g][w] = l[g];
+    for (int i = 0; i < DPL; ++i) sa[g][w][lane + i * 32] = acc[g][i]; }
+  __syncthreads();
+  if (w == 0) {
+    for (int g = 0; g < G; ++g) {
+      float gm = -1e30f; for (int t = 0; t < NW; ++t) gm = fmaxf(gm, sm[g][t]);
+      float gl = 0.f, gacc[DPL]; for (int i = 0; i < DPL; ++i) gacc[i] = 0.f;
+      for (int t = 0; t < NW; ++t) { float c = __expf(sm[g][t] - gm); gl += sl[g][t] * c;
+        for (int i = 0; i < DPL; ++i) gacc[i] += sa[g][t][lane + i * 32] * c; }
+      float inv = gl > 0 ? 1.f / gl : 0.f;
+      cbf16* o = out + (static_cast<int64_t>(flat) * n_heads + (kvh * G + g)) * HD;
+      for (int i = 0; i < DPL; ++i) o[lane + i * 32] = cbf16(gacc[i] * inv);
+    }
+  }
+}
+
+void LaunchAttnDecodeCute(const __nv_bfloat16* q, int q_stride,
+                          const __nv_bfloat16* cache_kv, __nv_bfloat16* out,
+                          int n_heads, int n_kv, int head_dim, const int* pos,
+                          const int* qstart, const int* decode_rids, int n_decode,
+                          const int* bt, int max_blocks, int block_size,
+                          float scale, int max_decode, cudaStream_t s) {
+  if (n_decode <= 0) return;
+  assert(head_dim == HD && n_heads / n_kv == G && block_size == TK);
+  dim3 grid(n_kv, n_decode);
+  CuteDecodeKernel<<<grid, NW * 32, 0, s>>>(
+      reinterpret_cast<const cbf16*>(q), q_stride,
+      reinterpret_cast<const cbf16*>(cache_kv), reinterpret_cast<cbf16*>(out),
+      n_heads, n_kv, pos, qstart, decode_rids, bt, max_blocks, scale);
 }
