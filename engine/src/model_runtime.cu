@@ -1,8 +1,10 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 
+#include "attn_cute.h"
 #include "log.h"
 #include "model_runtime.h"
 
@@ -192,10 +194,17 @@ void ModelRuntime::RunLayers(const ForwardInput& in) {
     LaunchAttnDecode(d_qkv_.Get(), QKV, store_->KV(l), d_attn_.Get(), nH, nKV,
                      hd, d_pos_.Get(), d_qstart_.Get(), d_decode_rids_.Get(),
                      n_decode_, d_bt_.Get(), bt_stride_, blk, scale, slots_, s);
-    LaunchAttnPrefill(d_qkv_.Get(), QKV, store_->KV(l), d_attn_.Get(), nH, nKV,
-                      hd, d_pos_.Get(), d_qstart_.Get(), d_qlen_.Get(),
-                      d_prefill_rids_.Get(), n_prefill_, prefill_max_qlen_,
-                      d_bt_.Get(), bt_stride_, blk, scale, s);
+    // CuTe (CUTLASS) prefill path, opt-in via FQ_ATTN_CUTE=1; default is the
+    // hand-written mma kernel. Read once (env is process-constant).
+    static const bool kCutePrefill = [] {
+      const char* e = std::getenv("FQ_ATTN_CUTE");
+      return e && e[0] == '1';
+    }();
+    auto prefill = kCutePrefill ? LaunchAttnPrefillCute : LaunchAttnPrefill;
+    prefill(d_qkv_.Get(), QKV, store_->KV(l), d_attn_.Get(), nH, nKV, hd,
+            d_pos_.Get(), d_qstart_.Get(), d_qlen_.Get(), d_prefill_rids_.Get(),
+            n_prefill_, prefill_max_qlen_, d_bt_.Get(), bt_stride_, blk, scale,
+            s);
 
     LaunchGemm(cublas_, d_attn_.Get(), L.d_o_proj.Get(), d_xb2_.Get(), T, QD, H,
                CUDA_R_16BF);
