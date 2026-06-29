@@ -132,7 +132,10 @@ vLLM** (`--no-enable-prefix-caching`, bf16, 0.9 mem).
 | S14 | activation right-sizing + KV-pool / OOB fix | `e5a99c8` | 1341 (97.5%) | 908 (96.2%) | 605 (92.8%) |
 | S15 | automatic prefix caching (content-hashed KV reuse) | `fad12b7` | ≈S14* | ≈S14* | ≈S14* |
 | **S16** | **prefill attention rewrite: WMMA → `mma.sync` (FlashAttention-style)** | `feat/prefix-caching` | **1318 (94.6%)** | **927 (97.7%)** | **640 (98.1%)** |
-| **vLLM** (no prefix cache) | reference | — | **1376 / 1393** | **944 / 948** | **652** |
+| **S18** | **attention rewritten in CuTe/CUTLASS (prefill + decode), 4090-tuned** — opt-in `FQ_ATTN_CUTE` | `feat/cutlass-gemm-attn` | **1340 (96.4%)** | **963 (99.2%)** | **655 (98.6%)** |
+| **vLLM** (no prefix cache) | reference | — | **1376 / 1393 / 1390** | **944 / 948 / 971** | **652 / 664** |
+
+(S18 reference is its own same-session vLLM: 1390 / 971 / 664.)
 
 \* S15 (prefix caching) is neutral on pure-random input (no cross-request prefix); its win shows only
 on shared-prefix workloads (**+36%** with a 512-token shared prefix, on par with vLLM's +37%). The S16
