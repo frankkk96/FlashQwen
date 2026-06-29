@@ -15,7 +15,8 @@ DeviceBuffer<bf16> ModelRuntime::UploadBf16(const std::string& name) {
 }
 
 // Upload several BF16 tensors stacked on their OUT (row) dim into one buffer —
-// the contiguous [sum(OUT_i), IN] layout a fused projection (QKV, gate|up) needs.
+// the contiguous [sum(OUT_i), IN] layout a fused projection (QKV, gate|up)
+// needs.
 DeviceBuffer<bf16> ModelRuntime::UploadBf16s(
     const std::vector<std::string>& names) {
   size_t total = 0;
@@ -93,8 +94,8 @@ ModelRuntime::ModelRuntime(const ModelSpec& spec, const KvStore& store,
     auto attn = [&](const char* n) { return p + "self_attn." + n; };
     auto mlp = [&](const char* n) { return p + "mlp." + n; };
     Layer& L = layers_[l];
-    L.d_qkv = UploadBf16s({attn("q_proj.weight"), attn("k_proj.weight"),
-                           attn("v_proj.weight")});
+    L.d_qkv = UploadBf16s(
+        {attn("q_proj.weight"), attn("k_proj.weight"), attn("v_proj.weight")});
     L.d_o_proj = UploadBf16(attn("o_proj.weight"));
     L.d_q_norm = UploadFp32(attn("q_norm.weight"));
     L.d_k_norm = UploadFp32(attn("k_norm.weight"));
@@ -188,14 +189,13 @@ void ModelRuntime::RunLayers(const ForwardInput& in) {
 
     store_->StoreKV(l, d_qkv_.Get(), d_bt_.Get(), bt_stride_, d_req_.Get(),
                     d_pos_.Get(), T, s);
-    LaunchAttnDecode(d_qkv_.Get(), QKV, store_->K(l), store_->V(l),
-                     d_attn_.Get(), nH, nKV, hd, d_pos_.Get(), d_qstart_.Get(),
-                     d_decode_rids_.Get(), n_decode_, d_bt_.Get(), bt_stride_,
-                     blk, scale, slots_, s);
-    LaunchAttnPrefill(
-        d_qkv_.Get(), QKV, store_->K(l), store_->V(l), d_attn_.Get(), nH, nKV,
-        hd, d_pos_.Get(), d_qstart_.Get(), d_qlen_.Get(), d_prefill_rids_.Get(),
-        n_prefill_, prefill_max_qlen_, d_bt_.Get(), bt_stride_, blk, scale, s);
+    LaunchAttnDecode(d_qkv_.Get(), QKV, store_->KV(l), d_attn_.Get(), nH, nKV,
+                     hd, d_pos_.Get(), d_qstart_.Get(), d_decode_rids_.Get(),
+                     n_decode_, d_bt_.Get(), bt_stride_, blk, scale, slots_, s);
+    LaunchAttnPrefill(d_qkv_.Get(), QKV, store_->KV(l), d_attn_.Get(), nH, nKV,
+                      hd, d_pos_.Get(), d_qstart_.Get(), d_qlen_.Get(),
+                      d_prefill_rids_.Get(), n_prefill_, prefill_max_qlen_,
+                      d_bt_.Get(), bt_stride_, blk, scale, s);
 
     LaunchGemm(cublas_, d_attn_.Get(), L.d_o_proj.Get(), d_xb2_.Get(), T, QD, H,
                CUDA_R_16BF);

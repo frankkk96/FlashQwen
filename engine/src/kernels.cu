@@ -100,20 +100,17 @@ void LaunchEmbed(const int* ids, const bf16* embed, bf16* out, int M, int H,
 
 // Fused per-head RMSNorm + RoPE (rotate-half, matching HF Qwen) over the q AND
 // k slices of a fused QKV row of width `stride` in one launch: the q heads
-// (weight wq) and k heads (weight wk) are contiguous, so head g of token m lives
-// at buf + m*stride + g*head_dim for g in [0, n_q+n_kv); g < n_q is a q head,
-// else a k head. v is left untouched. Angles come from precomputed cos/sin
-// tables ([max_pos, head_dim/2]) indexed by pos[m] (no per-call transcendental;
-// tables are identical across all layers and built once). One block per
-// (token, head); blockDim == head_dim. FP32 math.
-__global__ void HeadNormRopeKernel(bf16* __restrict__ buf,
-                                   const float* __restrict__ wq,
-                                   const float* __restrict__ wk,
-                                   const float* __restrict__ cos_tab,
-                                   const float* __restrict__ sin_tab,
-                                   const int* __restrict__ pos, int n_q,
-                                   int n_kv, int head_dim, int stride,
-                                   float eps) {
+// (weight wq) and k heads (weight wk) are contiguous, so head g of token m
+// lives at buf + m*stride + g*head_dim for g in [0, n_q+n_kv); g < n_q is a q
+// head, else a k head. v is left untouched. Angles come from precomputed
+// cos/sin tables ([max_pos, head_dim/2]) indexed by pos[m] (no per-call
+// transcendental; tables are identical across all layers and built once). One
+// block per (token, head); blockDim == head_dim. FP32 math.
+__global__ void HeadNormRopeKernel(
+    bf16* __restrict__ buf, const float* __restrict__ wq,
+    const float* __restrict__ wk, const float* __restrict__ cos_tab,
+    const float* __restrict__ sin_tab, const int* __restrict__ pos, int n_q,
+    int n_kv, int head_dim, int stride, float eps) {
   int hpr = n_q + n_kv;  // q + k heads per row
   int row = blockIdx.x;  // over M * hpr
   int m = row / hpr, g = row % hpr;
@@ -150,18 +147,17 @@ void LaunchHeadNormRope(bf16* buf, const float* wq, const float* wk,
                         const float* cos_tab, const float* sin_tab,
                         const int* pos, int M, int n_q, int n_kv, int head_dim,
                         int stride, float eps, cudaStream_t s) {
-  HeadNormRopeKernel<<<M * (n_q + n_kv), head_dim, head_dim * sizeof(float),
-                       s>>>(buf, wq, wk, cos_tab, sin_tab, pos, n_q, n_kv,
-                            head_dim, stride, eps);
+  HeadNormRopeKernel<<<M*(n_q + n_kv), head_dim, head_dim * sizeof(float), s>>>(
+      buf, wq, wk, cos_tab, sin_tab, pos, n_q, n_kv, head_dim, stride, eps);
 }
 
 // ==== Paged-KV attention ====
 // Split by request type (dispatched from RunLayers): prefill (q_len>1) ->
 // AttnPrefill (tensor cores), decode (q_len==1) -> AttnDecode (FlashDecoding).
-// Both read the paged KV pool [num_blocks, kBlock, kv_dim] via per-request
-// block tables `bt` (stride max_blocks); q comes from the fused-QKV buffer at
-// row stride q_stride. `rids[grid_slot]` -> request id, so each runs on its
-// subset.
+// Both read the combined paged KV pool [num_blocks, 2, kBlock, kv_dim] via
+// per-request block tables `bt` (stride max_blocks); q comes from the fused-QKV
+// buffer at row stride q_stride. `rids[grid_slot]` -> request id, so each runs
+// on its subset.
 
 // GQA-shared FlashDecoding (decode path). One block owns a (kv-head, request)
 // and computes all G = n_heads/n_kv query heads, loading each K/V element ONCE
@@ -180,12 +176,12 @@ void LaunchHeadNormRope(bf16* buf, const float* wq, const float* wk,
 // n_heads/n_kv=4 => G = 4; NW = 8 warps/block. LaunchAttnDecode asserts these.
 constexpr int NW = 8, DPL = 4, G = 4;
 __global__ void AttnDecodeGqaKernel(
-    const bf16* __restrict__ q, int q_stride, const bf16* __restrict__ cache_k,
-    const bf16* __restrict__ cache_v, float* __restrict__ pm,
-    float* __restrict__ pl, float* __restrict__ pa, int n_heads, int n_kv,
-    int head_dim, const int* __restrict__ pos, const int* __restrict__ qstart,
-    const int* __restrict__ decode_rids, const int* __restrict__ bt,
-    int max_blocks, int block_size, float scale, int ksplit) {
+    const bf16* __restrict__ q, int q_stride, const bf16* __restrict__ cache_kv,
+    float* __restrict__ pm, float* __restrict__ pl, float* __restrict__ pa,
+    int n_heads, int n_kv, int head_dim, const int* __restrict__ pos,
+    const int* __restrict__ qstart, const int* __restrict__ decode_rids,
+    const int* __restrict__ bt, int max_blocks, int block_size, float scale,
+    int ksplit) {
   int kvh = blockIdx.x;  // kv head (owns this GQA group)
   int di = blockIdx.y;   // decode-request slot
   int sp = blockIdx.z;   // KV split
@@ -214,13 +210,14 @@ __global__ void AttnDecodeGqaKernel(
 
   // warp w of split sp streams keys sp*NW+w, +NW*ksplit, ... (each key hits
   // exactly one (sp,w)).
+  int64_t plane = static_cast<int64_t>(block_size) * kv_dim;  // K plane -> V
   for (int kpos = sp * NW + w; kpos <= qpos; kpos += NW * ksplit) {
     int64_t base =
-        static_cast<int64_t>(btr[kpos / block_size]) * block_size * kv_dim +
+        static_cast<int64_t>(btr[kpos / block_size]) * kKvPlanes * plane +
         static_cast<int64_t>(kpos % block_size) * kv_dim +
         static_cast<int64_t>(kvh) * head_dim;
-    const bf16* kc = cache_k + base;
-    const bf16* vc = cache_v + base;
+    const bf16* kc = cache_kv + base;
+    const bf16* vc = cache_kv + base + plane;
     float kreg[DPL], vreg[DPL];  // K/V loaded ONCE, reused across the G heads
 #pragma unroll
     for (int i = 0; i < DPL; ++i) {
@@ -308,12 +305,12 @@ __global__ void AttnDecodeCombineKernel(
       __float2bfloat16(gacc * inv);
 }
 
-void LaunchAttnDecode(const bf16* q, int q_stride, const bf16* cache_k,
-                      const bf16* cache_v, bf16* out, int n_heads, int n_kv,
-                      int head_dim, const int* pos, const int* qstart,
-                      const int* decode_rids, int n_decode, const int* bt,
-                      int max_blocks, int block_size, float scale,
-                      int max_decode, cudaStream_t s) {
+void LaunchAttnDecode(const bf16* q, int q_stride, const bf16* cache_kv,
+                      bf16* out, int n_heads, int n_kv, int head_dim,
+                      const int* pos, const int* qstart, const int* decode_rids,
+                      int n_decode, const int* bt, int max_blocks,
+                      int block_size, float scale, int max_decode,
+                      cudaStream_t s) {
   if (n_decode <= 0) return;
   assert(head_dim == 128 && n_heads / n_kv == 4);  // Qwen3-8B: DPL=4, G=4
 
@@ -336,8 +333,8 @@ void LaunchAttnDecode(const bf16* q, int q_stride, const bf16* cache_k,
   }
   dim3 g1(n_kv, n_decode, ksplit);
   AttnDecodeGqaKernel<<<g1, NW * 32, 0, s>>>(
-      q, q_stride, cache_k, cache_v, pm, pl, pa, n_heads, n_kv, head_dim, pos,
-      qstart, decode_rids, bt, max_blocks, block_size, scale, ksplit);
+      q, q_stride, cache_kv, pm, pl, pa, n_heads, n_kv, head_dim, pos, qstart,
+      decode_rids, bt, max_blocks, block_size, scale, ksplit);
   dim3 g2(n_heads, n_decode);
   AttnDecodeCombineKernel<<<g2, head_dim, 0, s>>>(
       pm, pl, pa, out, n_heads, head_dim, qstart, decode_rids, ksplit);
@@ -369,11 +366,11 @@ static __device__ __forceinline__ void FqaMma(float d[4], const unsigned a[4],
         "f"(c[0]), "f"(c[1]), "f"(c[2]), "f"(c[3]));
 }
 __global__ void AttnPrefillMmaKernel(
-    const bf16* __restrict__ q, int q_stride, const bf16* __restrict__ cache_k,
-    const bf16* __restrict__ cache_v, bf16* __restrict__ out, int n_heads,
-    int n_kv, const int* __restrict__ pos, const int* __restrict__ qstart,
-    const int* __restrict__ qlen, const int* __restrict__ rids,
-    const int* __restrict__ bt, int max_blocks, float scale) {
+    const bf16* __restrict__ q, int q_stride, const bf16* __restrict__ cache_kv,
+    bf16* __restrict__ out, int n_heads, int n_kv, const int* __restrict__ pos,
+    const int* __restrict__ qstart, const int* __restrict__ qlen,
+    const int* __restrict__ rids, const int* __restrict__ bt, int max_blocks,
+    float scale) {
   constexpr int HDc = 128, NT = HDc / 8;
   int r = rids[blockIdx.z], h = blockIdx.y;
   int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, grp = lane >> 2,
@@ -417,17 +414,20 @@ __global__ void AttnPrefillMmaKernel(
   // prefills — few query rows + many K/V tiles), and cp.async overlap was worth
   // only ~0.9% e2e, so single-buffer staging keeps the register-O + mma +
   // K/V-reuse win. See prefix-cache-large-hit-bug.
+  int64_t plane = static_cast<int64_t>(16) * kv_dim;  // K plane -> V plane
   auto stage = [&](int kt) {
-    int64_t kvbase = static_cast<int64_t>(btr[kt]) * 16 * kv_dim +
+    int64_t kvbase = static_cast<int64_t>(btr[kt]) * kKvPlanes * plane +
                      static_cast<int64_t>(kvh) * HDc;
     for (int c = threadIdx.x; c < 16 * 16; c += 128) {
       int key = c >> 4, ck = c & 15;  // 16B (8 bf16) chunks
       __pipeline_memcpy_async(
           &Ksh[key * HDc + ck * 8],
-          &cache_k[kvbase + static_cast<int64_t>(key) * kv_dim + ck * 8], 16);
+          &cache_kv[kvbase + static_cast<int64_t>(key) * kv_dim + ck * 8], 16);
       __pipeline_memcpy_async(
           &Vsh[key * HDc + ck * 8],
-          &cache_v[kvbase + static_cast<int64_t>(key) * kv_dim + ck * 8], 16);
+          &cache_kv[kvbase + plane + static_cast<int64_t>(key) * kv_dim +
+                    ck * 8],
+          16);
     }
     __pipeline_commit();
   };
@@ -535,19 +535,19 @@ __global__ void AttnPrefillMmaKernel(
   }
 }
 
-void LaunchAttnPrefill(const bf16* q, int q_stride, const bf16* cache_k,
-                       const bf16* cache_v, bf16* out, int n_heads, int n_kv,
-                       int head_dim, const int* pos, const int* qstart,
-                       const int* qlen, const int* rids, int R, int max_qlen,
-                       const int* bt, int max_blocks, int block_size,
-                       float scale, cudaStream_t s) {
+void LaunchAttnPrefill(const bf16* q, int q_stride, const bf16* cache_kv,
+                       bf16* out, int n_heads, int n_kv, int head_dim,
+                       const int* pos, const int* qstart, const int* qlen,
+                       const int* rids, int R, int max_qlen, const int* bt,
+                       int max_blocks, int block_size, float scale,
+                       cudaStream_t s) {
   if (R <= 0) return;
   assert(head_dim == 128 &&
          block_size == 16);  // Qwen3: 16 n8-tiles, 1 tile/blk
   dim3 grid((max_qlen + 63) / 64, n_heads, R);
-  AttnPrefillMmaKernel<<<grid, 128, 0, s>>>(q, q_stride, cache_k, cache_v, out,
-                                            n_heads, n_kv, pos, qstart, qlen,
-                                            rids, bt, max_blocks, scale);
+  AttnPrefillMmaKernel<<<grid, 128, 0, s>>>(q, q_stride, cache_kv, out, n_heads,
+                                            n_kv, pos, qstart, qlen, rids, bt,
+                                            max_blocks, scale);
 }
 
 // Gather S rows: out[i, :] = x[rows[i], :]   (one block per gathered row, BF16)

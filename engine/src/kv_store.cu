@@ -32,13 +32,11 @@ KvStore::KvStore(const ModelSpec& spec, int max_ctx, float gpu_mem_fraction)
     throw std::runtime_error(msg);
   }
 
-  d_k_.resize(spec.num_layers);
-  d_v_.resize(spec.num_layers);
+  d_kv_.resize(spec.num_layers);
   for (int l = 0; l < spec.num_layers; ++l) {
-    CUDA_CHECK(cudaMalloc(&d_k_[l], static_cast<size_t>(num_blocks_) *
-                                        kKvBlock * kvd * sizeof(bf16)));
-    CUDA_CHECK(cudaMalloc(&d_v_[l], static_cast<size_t>(num_blocks_) *
-                                        kKvBlock * kvd * sizeof(bf16)));
+    CUDA_CHECK(cudaMalloc(&d_kv_[l], static_cast<size_t>(num_blocks_) *
+                                         kKvPlanes * kKvBlock * kvd *
+                                         sizeof(bf16)));
   }
 
   CUDA_CHECK(cudaMemGetInfo(&freeb, &totalb));
@@ -50,36 +48,35 @@ KvStore::KvStore(const ModelSpec& spec, int max_ctx, float gpu_mem_fraction)
 }
 
 KvStore::~KvStore() {
-  for (auto p : d_k_)
-    if (p) cudaFree(p);
-  for (auto p : d_v_)
+  for (auto p : d_kv_)
     if (p) cudaFree(p);
 }
 
-// Write side: scatter freshly-projected K AND V rows into the pool in one pass
-// (attention kernels read it; see kernels.cu). Token m -> block-table row
-// bt_row[m] of `bt`, logical position pos[m]. K and V share the same physical
-// address, so it is translated once and used for both writes. The K/V slices
-// live in the fused qkv row at k_off / v_off (stride src_stride).
+// Write side: scatter freshly-projected K AND V rows into the combined pool in
+// one pass (attention kernels read it; see kernels.cu). Token m -> block-table
+// row bt_row[m] of `bt`, logical position pos[m]. The K destination is computed
+// once; V lives one plane stride (kKvBlock*kv_dim) further in the same tensor
+// (FlashInfer NHD; see kv_layout.h). The K/V slices live in the fused qkv row
+// at k_off / v_off (stride src_stride).
 __global__ void StoreKvKernel(const bf16* __restrict__ qkv, int src_stride,
-                              int k_off, int v_off, bf16* __restrict__ k_cache,
-                              bf16* __restrict__ v_cache,
+                              int k_off, int v_off, bf16* __restrict__ kv_cache,
                               const int* __restrict__ bt, int bt_stride,
                               int kv_dim, const int* __restrict__ bt_row,
                               const int* __restrict__ pos, int M) {
   int idx = blockIdx.x * blockDim.x + threadIdx.x;
   if (idx >= M * kv_dim) return;
   int m = idx / kv_dim, i = idx % kv_dim;
-  // Logical position pos[m] -> physical row: block_table[pos/bs]*bs + pos%bs.
+  // Logical position pos[m] -> physical K slot: block_table[pos/bs] selects the
+  // block, *kKvPlanes makes room for the K and V planes, +pos%bs is the token.
   // The attention read side mirrors this addressing inline (see kernels.cu).
   const int* btr = bt + static_cast<int64_t>(bt_row[m]) * bt_stride;
   int p = pos[m];
-  int64_t phys =
-      static_cast<int64_t>(btr[p / kKvBlock]) * kKvBlock + (p % kKvBlock);
-  int64_t dst = phys * kv_dim + i;
+  int64_t plane = static_cast<int64_t>(kKvBlock) * kv_dim;
+  int64_t k_dst = static_cast<int64_t>(btr[p / kKvBlock]) * kKvPlanes * plane +
+                  static_cast<int64_t>(p % kKvBlock) * kv_dim + i;
   int64_t base = static_cast<int64_t>(m) * src_stride;
-  k_cache[dst] = qkv[base + k_off + i];
-  v_cache[dst] = qkv[base + v_off + i];
+  kv_cache[k_dst] = qkv[base + k_off + i];
+  kv_cache[k_dst + plane] = qkv[base + v_off + i];
 }
 
 void KvStore::StoreKV(int layer, const bf16* qkv, const int* bt, int bt_stride,
@@ -89,6 +86,6 @@ void KvStore::StoreKV(int layer, const bf16* qkv, const int* bt, int bt_stride,
   int src_stride = qd + 2 * kvd, k_off = qd, v_off = qd + kvd;
   int n = M * kvd, blk = 256;
   StoreKvKernel<<<(n + blk - 1) / blk, blk, 0, s>>>(
-      qkv, src_stride, k_off, v_off, d_k_[layer], d_v_[layer], bt, bt_stride,
-      kvd, bt_row, pos, M);
+      qkv, src_stride, k_off, v_off, d_kv_[layer], bt, bt_stride, kvd, bt_row,
+      pos, M);
 }
