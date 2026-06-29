@@ -58,8 +58,8 @@ void ModelRuntime::PrecomputeRope() {
     for (int i = 0; i < half; ++i) {
       float inv = std::pow(spec_.rope_theta, -2.0f * i / spec_.head_dim);
       float ang = p * inv;
-      cs[static_cast<int64_t>(p) * half + i] = std::cos(ang);
-      sn[static_cast<int64_t>(p) * half + i] = std::sin(ang);
+      cs[p * half + i] = std::cos(ang);
+      sn[p * half + i] = std::sin(ang);
     }
   d_cos_tab_ = DeviceBuffer<float>(cs.size());
   d_sin_tab_ = DeviceBuffer<float>(sn.size());
@@ -230,7 +230,7 @@ void ModelRuntime::UploadInputs(const ForwardInput& in) {
   for (auto& t : bts) mb = std::max(mb, static_cast<int>(t.size()));
   bt_stride_ = mb;
   for (int r = 0; r < R; ++r) {
-    int* row = h_bt_.data() + static_cast<int64_t>(r) * mb;
+    int* row = h_bt_.data() + r * mb;
     for (int g = 0; g < mb; ++g)
       row[g] = g < static_cast<int>(bts[r].size()) ? bts[r][g] : 0;
   }

@@ -69,12 +69,12 @@ __global__ void StoreKvKernel(const bf16* __restrict__ qkv, int src_stride,
   // Logical position pos[m] -> physical K slot: block_table[pos/bs] selects the
   // block, *kKvPlanes makes room for the K and V planes, +pos%bs is the token.
   // The attention read side mirrors this addressing inline (see kernels.cu).
-  const int* btr = bt + static_cast<int64_t>(bt_row[m]) * bt_stride;
+  const int* btr = bt + bt_row[m] * bt_stride;
   int p = pos[m];
   int64_t plane = static_cast<int64_t>(kKvBlock) * kv_dim;
   int64_t k_dst = static_cast<int64_t>(btr[p / kKvBlock]) * kKvPlanes * plane +
                   static_cast<int64_t>(p % kKvBlock) * kv_dim + i;
-  int64_t base = static_cast<int64_t>(m) * src_stride;
+  int base = m * src_stride;
   kv_cache[k_dst] = qkv[base + k_off + i];
   kv_cache[k_dst + plane] = qkv[base + v_off + i];
 }
