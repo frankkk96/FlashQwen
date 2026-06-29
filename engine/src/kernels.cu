@@ -20,8 +20,8 @@ __global__ void RmsnormKernel(const bf16* __restrict__ x,
                               const float* __restrict__ w,
                               bf16* __restrict__ out, int M, int H, float eps) {
   int m = blockIdx.x;
-  const bf16* xr = x + static_cast<int64_t>(m) * H;
-  bf16* outr = out + static_cast<int64_t>(m) * H;
+  const bf16* xr = x + m * H;
+  bf16* outr = out + m * H;
 
   extern __shared__ float red[];
   float local = 0.f;
@@ -54,9 +54,9 @@ __global__ void AddRmsnormKernel(bf16* __restrict__ x,
                                  bf16* __restrict__ out, int M, int H,
                                  float eps) {
   int m = blockIdx.x;
-  bf16* xr = x + static_cast<int64_t>(m) * H;
-  const bf16* rr = res + static_cast<int64_t>(m) * H;
-  bf16* outr = out + static_cast<int64_t>(m) * H;
+  bf16* xr = x + m * H;
+  const bf16* rr = res + m * H;
+  bf16* outr = out + m * H;
 
   extern __shared__ float red[];
   float local = 0.f;
@@ -88,8 +88,8 @@ __global__ void EmbedKernel(const int* __restrict__ ids,
                             const bf16* __restrict__ embed,
                             bf16* __restrict__ out, int M, int H) {
   int m = blockIdx.x;
-  const bf16* src = embed + static_cast<int64_t>(ids[m]) * H;
-  bf16* dst = out + static_cast<int64_t>(m) * H;
+  const bf16* src = embed + ids[m] * H;
+  bf16* dst = out + m * H;
   for (int i = threadIdx.x; i < H; i += blockDim.x) dst[i] = src[i];
 }
 
@@ -117,8 +117,7 @@ __global__ void HeadNormRopeKernel(
   const float* w = g < n_q ? wq : wk;
   int t = threadIdx.x;  // 0..head_dim-1
   int half = head_dim >> 1;
-  bf16* v = buf + static_cast<int64_t>(m) * stride +
-            static_cast<int64_t>(g) * head_dim;
+  bf16* v = buf + m * stride + g * head_dim;
 
   extern __shared__ float sh[];  // [0,head_dim): reduction then normed values
   float x = __bfloat162float(v[t]);
@@ -134,8 +133,8 @@ __global__ void HeadNormRopeKernel(
   __syncthreads();
 
   if (t < half) {
-    const float* cb = cos_tab + static_cast<int64_t>(pos[m]) * half;
-    const float* sb = sin_tab + static_cast<int64_t>(pos[m]) * half;
+    const float* cb = cos_tab + pos[m] * half;
+    const float* sb = sin_tab + pos[m] * half;
     float cs = cb[t], sn = sb[t];
     float x1 = sh[t], x2 = sh[t + half];
     v[t] = __float2bfloat16(x1 * cs - x2 * sn);
@@ -188,13 +187,12 @@ __global__ void AttnDecodeGqaKernel(
   int w = threadIdx.x >> 5, lane = threadIdx.x & 31;
   int r = decode_rids[di], flat = qstart[r], qpos = pos[flat];
   int kv_dim = n_kv * head_dim;
-  const int* btr = bt + static_cast<int64_t>(r) * max_blocks;
+  const int* btr = bt + r * max_blocks;
 
   float qreg[G][DPL];  // the G query heads of this group, in registers
 #pragma unroll
   for (int g = 0; g < G; ++g) {
-    const bf16* qv = q + static_cast<int64_t>(flat) * q_stride +
-                     static_cast<int64_t>(kvh * G + g) * head_dim;
+    const bf16* qv = q + flat * q_stride + (kvh * G + g) * head_dim;
 #pragma unroll
     for (int i = 0; i < DPL; ++i)
       qreg[g][i] = __bfloat162float(qv[lane + (i << 5)]);
@@ -268,7 +266,7 @@ __global__ void AttnDecodeGqaKernel(
         for (int i = 0; i < DPL; ++i) gacc[i] += sa[g][t][lane + (i << 5)] * c;
       }
       int h = kvh * G + g;
-      int64_t idx = (static_cast<int64_t>(di) * n_heads + h) * ksplit + sp;
+      int idx = (di * n_heads + h) * ksplit + sp;
       if (lane == 0) {
         pm[idx] = gm;
         pl[idx] = gl;
@@ -290,7 +288,7 @@ __global__ void AttnDecodeCombineKernel(
     const int* __restrict__ decode_rids, int ksplit) {
   int h = blockIdx.x, di = blockIdx.y, d = threadIdx.x;
   int r = decode_rids[di], flat = qstart[r];
-  int64_t base = (static_cast<int64_t>(di) * n_heads + h) * ksplit;
+  int base = (di * n_heads + h) * ksplit;
   float gm = -1e30f;
   for (int s = 0; s < ksplit; ++s) gm = fmaxf(gm, pm[base + s]);
   float gl = 0.f, gacc = 0.f;
@@ -301,8 +299,7 @@ __global__ void AttnDecodeCombineKernel(
     gacc += pa[(base + s) * head_dim + d] * c;
   }
   float inv = gl > 0.f ? 1.0f / gl : 0.f;
-  out[(static_cast<int64_t>(flat) * n_heads + h) * head_dim + d] =
-      __float2bfloat16(gacc * inv);
+  out[(flat * n_heads + h) * head_dim + d] = __float2bfloat16(gacc * inv);
 }
 
 void LaunchAttnDecode(const bf16* q, int q_stride, const bf16* cache_kv,
@@ -378,7 +375,7 @@ __global__ void AttnPrefillMmaKernel(
   int ql = qlen[r], qs = qstart[r];
   int qbase = blockIdx.x * 64 + warp * 16;
   int kvh = h / (n_heads / n_kv), kv_dim = n_kv * HDc;
-  const int* btr = bt + static_cast<int64_t>(r) * max_blocks;
+  const int* btr = bt + r * max_blocks;
   if (blockIdx.x * 64 >= ql) return;  // whole block past this request's rows
 
   __shared__ bf16 Ksh[16 * HDc];  // cp.async-staged K tile (natural layout)
@@ -388,11 +385,9 @@ __global__ void AttnPrefillMmaKernel(
 
   unsigned qa[8][4];
   for (int kk = 0; kk < 8; ++kk) {
-    const bf16* qp = q + static_cast<int64_t>(qs + qbase) * q_stride +
-                     static_cast<int64_t>(h) * HDc + kk * 16;
-#define FQ_QG(row, col)                                                    \
-  ((qbase + (row)) < ql ? qp[static_cast<int64_t>(row) * q_stride + (col)] \
-                        : __float2bfloat16(0.f))
+    const bf16* qp = q + (qs + qbase) * q_stride + h * HDc + kk * 16;
+#define FQ_QG(row, col) \
+  ((qbase + (row)) < ql ? qp[(row)*q_stride + (col)] : __float2bfloat16(0.f))
     qa[kk][0] = FqaPack(FQ_QG(grp, tg * 2), FQ_QG(grp, tg * 2 + 1));
     qa[kk][1] = FqaPack(FQ_QG(grp + 8, tg * 2), FQ_QG(grp + 8, tg * 2 + 1));
     qa[kk][2] = FqaPack(FQ_QG(grp, tg * 2 + 8), FQ_QG(grp, tg * 2 + 9));
@@ -521,15 +516,15 @@ __global__ void AttnPrefillMmaKernel(
   for (int nt = 0; nt < NT; nt++) {
     int rr0 = qbase + grp, rr1 = qbase + grp + 8, hd = nt * 8 + tg * 2;
     if (rr0 < ql) {
-      out[(static_cast<int64_t>(qs + rr0) * n_heads + h) * HDc + hd] =
+      out[((qs + rr0) * n_heads + h) * HDc + hd] =
           __float2bfloat16(O[nt][0] * inv0);
-      out[(static_cast<int64_t>(qs + rr0) * n_heads + h) * HDc + hd + 1] =
+      out[((qs + rr0) * n_heads + h) * HDc + hd + 1] =
           __float2bfloat16(O[nt][1] * inv0);
     }
     if (rr1 < ql) {
-      out[(static_cast<int64_t>(qs + rr1) * n_heads + h) * HDc + hd] =
+      out[((qs + rr1) * n_heads + h) * HDc + hd] =
           __float2bfloat16(O[nt][2] * inv1);
-      out[(static_cast<int64_t>(qs + rr1) * n_heads + h) * HDc + hd + 1] =
+      out[((qs + rr1) * n_heads + h) * HDc + hd + 1] =
           __float2bfloat16(O[nt][3] * inv1);
     }
   }
@@ -555,8 +550,8 @@ __global__ void GatherRowsKernel(const bf16* __restrict__ x,
                                  const int* __restrict__ rows,
                                  bf16* __restrict__ out, int H) {
   int i = blockIdx.x;
-  const bf16* src = x + static_cast<int64_t>(rows[i]) * H;
-  bf16* dst = out + static_cast<int64_t>(i) * H;
+  const bf16* src = x + rows[i] * H;
+  bf16* dst = out + i * H;
   for (int j = threadIdx.x; j < H; j += blockDim.x) dst[j] = src[j];
 }
 
@@ -582,16 +577,16 @@ void LaunchAdd(bf16* out, const bf16* in, int N, cudaStream_t s) {
 __global__ void SiluMulKernel(const bf16* __restrict__ gateup,
                               bf16* __restrict__ h, int M, int I) {
   int idx = blockIdx.x * blockDim.x + threadIdx.x;
-  if (idx >= static_cast<int64_t>(M) * I) return;
+  if (idx >= M * I) return;
   int m = idx / I, i = idx % I;
-  const bf16* row = gateup + static_cast<int64_t>(m) * 2 * I;
+  const bf16* row = gateup + m * 2 * I;
   float g = __bfloat162float(row[i]);
   h[idx] =
       __float2bfloat16((g / (1.0f + expf(-g))) * __bfloat162float(row[I + i]));
 }
 void LaunchSiluMul(const bf16* gateup, bf16* h, int M, int I, cudaStream_t s) {
   int block = 256;
-  long N = static_cast<long>(M) * I;
+  int N = M * I;
   SiluMulKernel<<<(N + block - 1) / block, block, 0, s>>>(gateup, h, M, I);
 }
 
@@ -606,7 +601,7 @@ __global__ void ArgmaxKernel(const float* __restrict__ logits, int N,
   int b = blockIdx.x;
   if (invT[b] > 0.0f) return;
   int tid = threadIdx.x, nt = blockDim.x;
-  const float* lg = logits + static_cast<int64_t>(b) * N;
+  const float* lg = logits + b * N;
 
   __shared__ float sval[kSampleThreads];
   __shared__ int sidx[kSampleThreads];
@@ -650,7 +645,7 @@ __global__ void SampleKernel(const float* __restrict__ logits, int N,
   float it = invT[b];
   if (it <= 0.0f) return;
   int tid = threadIdx.x, nt = blockDim.x;
-  const float* lg = logits + static_cast<int64_t>(b) * N;
+  const float* lg = logits + b * N;
 
   __shared__ float sval[kSampleThreads];  // reduction / partial-sum scratch
   int chunk = (N + nt - 1) / nt;
