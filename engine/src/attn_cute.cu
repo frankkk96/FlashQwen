@@ -39,14 +39,24 @@ static __global__ void CutePrefillKernel(const cbf16* __restrict__ q, int q_stri
   if (q0 >= ql) return;
   int tid = threadIdx.x;
 
-  __shared__ cbf16 sQ[TQ * HD], sK[TK * HD], sV[TK * HD], sP[TQ * TK];
-  __shared__ float sS[TQ * TK], sM[TQ], sL[TQ], sCorr[TQ];
+  // Dynamic smem, aliased: Q (16KB) is loaded, copied to registers, then its
+  // memory is recycled for the K/V/S/P tiles (disjoint in the loop). Keeps
+  // per-CTA smem ~16KB (vs 31KB if Q stayed resident) for occupancy parity
+  // with the hand-written kernel.
+  extern __shared__ char smem[];
+  cbf16* sK = reinterpret_cast<cbf16*>(smem);          // [TK*HD]  [0,4K)
+  cbf16* sV = sK + TK * HD;                             // [TK*HD]  [4K,8K)
+  float* sS = reinterpret_cast<float*>(sV + TK * HD);  // [TQ*TK]  [8K,12K)
+  cbf16* sP = reinterpret_cast<cbf16*>(sS + TQ * TK);  // [TQ*TK]  [12K,14K)
+  cbf16* sQ = reinterpret_cast<cbf16*>(smem);          // [TQ*HD] aliases sK..sP
+  __shared__ float sM[TQ], sL[TQ], sCorr[TQ];
 
   for (int i = tid; i < TQ * HD; i += blockDim.x) {
     int row = i / HD, col = i % HD, grow = q0 + row;
     sQ[i] = grow < ql ? q[(qs + grow) * q_stride + h * HD + col] : cbf16(0.f);
   }
   for (int row = tid; row < TQ; row += blockDim.x) { sM[row] = -1e30f; sL[row] = 0.f; }
+  __syncthreads();
 
   TiledMMA mmaQK = make_tiled_mma(SM80_16x8x16_F32BF16BF16F32_TN{}, Layout<Shape<_4, _1, _1>>{});
   TiledMMA mmaPV = make_tiled_mma(SM80_16x8x16_F32BF16BF16F32_TN{}, Layout<Shape<_4, _1, _1>>{});
@@ -59,6 +69,12 @@ static __global__ void CutePrefillKernel(const cbf16* __restrict__ q, int q_stri
   Tensor sPt = make_tensor(make_smem_ptr(sP), make_layout(Shape<Int<TQ>, Int<TK>>{}, LayoutRight{}));
   // V^T view [HD, TK]: element (hd,key) = sV[key*HD + hd] -> stride (1, HD).
   Tensor sVt = make_tensor(make_smem_ptr(sV), make_layout(Shape<Int<HD>, Int<TK>>{}, Stride<_1, Int<HD>>{}));
+
+  // Q -> registers ONCE (A-operand), reused across all key tiles; then recycle
+  // the smem that held Q for the K/V/S/P tiles.
+  Tensor tSrQ = thrQK.partition_fragment_A(sQt);
+  copy(thrQK.partition_A(sQt), tSrQ);
+  __syncthreads();
 
   Tensor tOrO = partition_fragment_C(mmaPV, Shape<Int<TQ>, Int<HD>>{});
   clear(tOrO);
@@ -77,11 +93,9 @@ static __global__ void CutePrefillKernel(const cbf16* __restrict__ q, int q_stri
     }
     __syncthreads();
 
-    Tensor tSrQ = thrQK.partition_fragment_A(sQt);
     Tensor tSrK = thrQK.partition_fragment_B(sKt);
     Tensor tSrS = partition_fragment_C(mmaQK, Shape<Int<TQ>, Int<TK>>{});
     clear(tSrS);
-    copy(thrQK.partition_A(sQt), tSrQ);
     copy(thrQK.partition_B(sKt), tSrK);
     gemm(mmaQK, tSrQ, tSrK, tSrS);
     copy(tSrS, thrQK.partition_C(sSt));
@@ -140,7 +154,8 @@ void LaunchAttnPrefillCute(const __nv_bfloat16* q, int q_stride,
   if (R <= 0) return;
   assert(head_dim == HD && block_size == TK);
   dim3 grid((max_qlen + TQ - 1) / TQ, n_heads, R);
-  CutePrefillKernel<<<grid, 128, 0, s>>>(
+  int smem = TQ * HD * sizeof(cbf16);  // 16KB: Q footprint (recycled for K/V/S/P)
+  CutePrefillKernel<<<grid, 128, smem, s>>>(
       reinterpret_cast<const cbf16*>(q), q_stride,
       reinterpret_cast<const cbf16*>(cache_kv), reinterpret_cast<cbf16*>(out),
       n_heads, n_kv, pos, qstart, qlen, rids, bt, max_blocks, scale);
