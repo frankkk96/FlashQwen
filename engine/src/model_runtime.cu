@@ -174,19 +174,14 @@ ModelRuntime::ModelRuntime(const ModelSpec& spec, int max_ctx, int slots,
 // no split). Per-token ops run on the flattened batch; attention resolves each
 // request's rows (qstart/qlen), positions (d_pos_) and KV (d_bt_) itself.
 // Pure-decode steps (no prefill) have a fixed launch sequence + configs for a
-// given (T, n_decode), so they can be captured into a CUDA graph once and
-// replayed — eliminating per-step launch overhead. Opt-in via FQ_DECODE_GRAPH;
-// inputs (block tables, positions, ids) live in fixed buffers updated eagerly
-// before each replay, so the recorded kernels read the new step's data.
-// Experimental: the engine is ~98% GPU-busy even at conc=1, so the recoverable
-// idle is small (see docs/exps/s11). Recaptured if (T, n_decode) changes.
+// given (T, n_decode), so the layer stack is captured into a CUDA graph once
+// and replayed — eliminating per-step launch overhead. Inputs (block tables,
+// positions, ids) live in fixed buffers updated eagerly before each replay, so
+// the recorded kernels read the new step's data. Recaptured if (T, n_decode)
+// changes; mixed/prefill steps run eager.
 void ModelRuntime::RunLayers(const ForwardInput& in) {
-  static const bool kDecodeGraph = [] {
-    const char* e = std::getenv("FQ_DECODE_GRAPH");
-    return e && e[0] == '1';
-  }();
   int T = in.NumRows();
-  if (kDecodeGraph && n_prefill_ == 0 && n_decode_ > 0) {
+  if (n_prefill_ == 0 && n_decode_ > 0) {
     if (layers_graph_ && graph_T_ == T && graph_ndec_ == n_decode_) {
       CUDA_CHECK(cudaGraphLaunch(layers_graph_, stream_));
       return;
@@ -238,22 +233,17 @@ void ModelRuntime::RunLayersBody(const ForwardInput& in) {
 
     store_->StoreKV(l, d_qkv_.Get(), d_bt_.Get(), bt_stride_, d_req_.Get(),
                     d_pos_.Get(), T, s);
-    // CuTe (CUTLASS) attention path, opt-in via FQ_ATTN_CUTE=1; default is the
-    // hand-written kernels. Read once (env is process-constant).
-    static const bool kCuteAttn = [] {
-      const char* e = std::getenv("FQ_ATTN_CUTE");
-      return e && e[0] == '1';
-    }();
-    auto decode = kCuteAttn ? LaunchAttnDecodeCute : LaunchAttnDecode;
-    decode(d_qkv_.Get(), QKV, store_->KV(l), d_attn_.Get(), nH, nKV, hd,
-           d_pos_.Get(), d_qstart_.Get(), d_decode_rids_.Get(), n_decode_,
-           d_bt_.Get(), bt_stride_, blk, scale, d_dec_pm_.Get(), d_dec_pl_.Get(),
-           d_dec_pa_.Get(), s);
-    auto prefill = kCuteAttn ? LaunchAttnPrefillCute : LaunchAttnPrefill;
-    prefill(d_qkv_.Get(), QKV, store_->KV(l), d_attn_.Get(), nH, nKV, hd,
-            d_pos_.Get(), d_qstart_.Get(), d_qlen_.Get(), d_prefill_rids_.Get(),
-            n_prefill_, prefill_max_qlen_, d_bt_.Get(), bt_stride_, blk, scale,
-            s);
+    // Attention: CuTe/CUTLASS kernels (see attn_cute.cu). Decode (q_len==1) and
+    // prefill (q_len>1) run on their respective row subsets.
+    LaunchAttnDecodeCute(d_qkv_.Get(), QKV, store_->KV(l), d_attn_.Get(), nH,
+                         nKV, hd, d_pos_.Get(), d_qstart_.Get(),
+                         d_decode_rids_.Get(), n_decode_, d_bt_.Get(),
+                         bt_stride_, blk, scale, d_dec_pm_.Get(),
+                         d_dec_pl_.Get(), d_dec_pa_.Get(), s);
+    LaunchAttnPrefillCute(d_qkv_.Get(), QKV, store_->KV(l), d_attn_.Get(), nH,
+                          nKV, hd, d_pos_.Get(), d_qstart_.Get(), d_qlen_.Get(),
+                          d_prefill_rids_.Get(), n_prefill_, prefill_max_qlen_,
+                          d_bt_.Get(), bt_stride_, blk, scale, s);
 
     LaunchGemm(cublas_, d_attn_.Get(), L.d_o_proj.Get(), d_xb2_.Get(), T, QD, H,
                CUDA_R_16BF);

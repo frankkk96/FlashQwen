@@ -10,10 +10,7 @@
 
 Scheduler::Scheduler(ModelRuntime& model, BlockAllocator& alloc,
                      const SchedulerConfig& cfg)
-    : model_(model), alloc_(alloc), cfg_(cfg) {
-  const char* e = std::getenv("FQ_ASYNC_SCHED");
-  async_on_ = e && e[0] == '1';
-}
+    : model_(model), alloc_(alloc), cfg_(cfg) {}
 
 namespace {
 uint64_t HashBlock(uint64_t parent, const Request& r, int start, int n) {
@@ -116,13 +113,6 @@ bool Scheduler::Grow(Request* r, int upto) {
   return true;
 }
 
-void Scheduler::Step() {
-  if (async_on_)
-    StepAsync();
-  else
-    StepSync();
-}
-
 // Drop cancelled requests, then admit waiting -> running up to the slot cap.
 void Scheduler::AdmitAndDrop() {
   auto drop_cancelled = [this](auto& queue) {
@@ -178,25 +168,6 @@ bool Scheduler::BuildBatch(CurrentBatch& batch, int& step_prefill,
   return !batch.Empty();
 }
 
-void Scheduler::StepSync() {
-  AdmitAndDrop();
-  CurrentBatch batch;
-  int step_prefill = 0, step_decode = 0;
-  if (!BuildBatch(batch, step_prefill, step_decode)) return;
-  stat_steps_++;
-  stat_prefill_rows_ += step_prefill;
-  stat_decode_rows_ += step_decode;
-  stat_fwd_rows_ += step_prefill + step_decode;
-  int used = alloc_.NumBlocks() - alloc_.NumFree();
-  if (used > stat_peak_used_) stat_peak_used_ = used;
-  if (stat_steps_ % 200 == 0) LogKvstat();
-  model_.Forward(batch.input, batch.sampled);
-  batch.Apply();
-  if (cfg_.use_prefix_cache)
-    for (Request* r : batch.requests) CacheFilled(r);
-  for (Request* r : batch.finished) Retire(r);
-}
-
 // Wait on the in-flight async batch, accept its sampled tokens (skipping
 // requests an earlier step already finished — their token is wasted), and move
 // newly-finished requests to retiring_ (kept alive + KV held until the next
@@ -222,13 +193,13 @@ void Scheduler::ProcessPending() {
       }
 }
 
-// Single-step async: keep one forward in flight (pending_batch_) and process the
-// previous one's output while it runs. The pipeline only continues across
-// pure-decode steps whose request set is unchanged (so the previous step's
-// GPU-resident sampled tokens map 1:1 to this step's rows and are fed back via
-// embed feedback). Any set change (finish / admit / a prefill step) drains the
-// pipeline and falls back to a synchronous step.
-void Scheduler::StepAsync() {
+// One scheduling step (single-step async): keep one forward in flight
+// (pending_batch_) and process the previous one's output while it runs. The
+// pipeline only continues across pure-decode steps whose request set is
+// unchanged (so the previous step's GPU-resident sampled tokens map 1:1 to this
+// step's rows and are fed back via embed feedback). Any set change (finish /
+// admit / a prefill step) drains the pipeline and runs that step synchronously.
+void Scheduler::Step() {
   if (!pending_valid_) AdmitAndDrop();
   CurrentBatch cand;
   int pf = 0, dec = 0;

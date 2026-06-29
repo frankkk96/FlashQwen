@@ -179,8 +179,6 @@ class Scheduler {
   }
 
   void Step();
-  void StepSync();
-  void StepAsync();
   void AdmitAndDrop();
   bool BuildBatch(CurrentBatch& batch, int& step_prefill, int& step_decode);
   void ProcessPending();  // wait + accept-sample + retire the in-flight async batch
@@ -216,11 +214,9 @@ class Scheduler {
   std::deque<std::unique_ptr<Request>> waiting_;
   std::vector<std::unique_ptr<Request>> running_;
 
-  // Single-step async scheduling (FQ_ASYNC_SCHED): one forward stays in flight
-  // (pending_batch_) while the CPU processes the previous one. retiring_ keeps
-  // finished requests alive until the in-flight batch that still references
-  // them is applied.
-  bool async_on_ = false;
+  // Single-step async scheduling: one forward stays in flight (pending_batch_)
+  // while the CPU processes the previous one. retiring_ keeps finished requests
+  // alive until the in-flight batch that still references them is applied.
   bool pending_valid_ = false;
   int pending_ticket_ = 0;
   CurrentBatch pending_batch_;
