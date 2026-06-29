@@ -8,6 +8,7 @@
 
 #include "attn_cute.h"
 #include "cute/tensor.hpp"
+#include "kernels.cuh"  // kMaxKsplit
 #include "kv_layout.h"  // kKvPlanes
 
 using namespace cute;
@@ -19,8 +20,7 @@ constexpr int TQ = 64;   // query rows per CTA (4 warps x 16)
 constexpr int TK = 16;   // key tile == page size
 constexpr int G = 4;     // GQA group = n_heads/n_kv (asserted)
 constexpr int DPL = 4;   // head_dim/32: dims held per lane (decode)
-constexpr int NW = 4;    // warps per decode CTA splitting the key range
-constexpr int MAX_KSPLIT = 16;  // max grid.z KV-splits (decode)
+constexpr int NW = 4;    // warps per decode CTA splitting the key range (kMaxKsplit from kernels.cuh)
 
 // Reshape an m16n8 accumulator fragment (MMA=(2,2), MMA_M, MMA_N) into a
 // (row, col) view per thread, so the online softmax can index rows directly
@@ -279,22 +279,15 @@ void LaunchAttnDecodeCute(const __nv_bfloat16* q, int q_stride,
                           int n_heads, int n_kv, int head_dim, const int* pos,
                           const int* qstart, const int* decode_rids, int n_decode,
                           const int* bt, int max_blocks, int block_size,
-                          float scale, int max_decode, cudaStream_t s) {
+                          float scale, float* pm, float* pl, float* pa,
+                          cudaStream_t s) {
   if (n_decode <= 0) return;
   assert(head_dim == HD && n_heads / n_kv == G && block_size == TK);
   int ksplit = 128 / n_decode;
   if (ksplit < 1) ksplit = 1;
-  if (ksplit > MAX_KSPLIT) ksplit = MAX_KSPLIT;
+  if (ksplit > kMaxKsplit) ksplit = kMaxKsplit;
 
-  // Persistent partials, reused across layers/steps; sized once to the worst
-  // case (max_decode is fixed for the process), matching the hand kernel.
-  static float *pm = nullptr, *pl = nullptr, *pa = nullptr;
-  if (!pm) {
-    size_t nent = static_cast<size_t>(max_decode) * 64 /*heads guard*/ * MAX_KSPLIT;
-    cudaMalloc(&pm, nent * sizeof(float));
-    cudaMalloc(&pl, nent * sizeof(float));
-    cudaMalloc(&pa, nent * HD * sizeof(float));
-  }
+  // pm/pl/pa are caller-owned (preallocated to DecodePartialFloats()).
   dim3 g1(n_kv, n_decode, ksplit);
   CuteDecodeSplitKernel<<<g1, NW * 32, 0, s>>>(
       reinterpret_cast<const cbf16*>(q), q_stride,

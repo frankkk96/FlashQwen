@@ -95,16 +95,25 @@ void LaunchAttnPrefill(const bf16* q, int q_stride, const bf16* cache_kv,
                        int max_blocks, int block_size, float scale,
                        cudaStream_t s);
 
+// Max grid.z KV-splits for the decode path. The split partials pm/pl/pa are
+// owned/preallocated by the caller (ModelRuntime), sized DecodePartialFloats():
+// pm/pl one float per (decode-slot, head, split); pa adds head_dim.
+constexpr int kMaxKsplit = 16;
+inline size_t DecodePartialFloats(int max_decode) {
+  return static_cast<size_t>(max_decode) * 64 /*heads guard*/ * kMaxKsplit;
+}
+
 // Decode (q_len==1): FlashDecoding. One block per (head, decode-request); warps
 // split the KV range and online-softmax their slices, reading K/V straight from
 // the cache (a single query has no reuse, so staging would only add traffic),
-// then an in-block combine merges the per-warp partials.
+// then an in-block combine merges the per-warp partials. pm/pl/pa are caller-
+// owned scratch (see DecodePartialFloats); pa holds head_dim floats per entry.
 void LaunchAttnDecode(const bf16* q, int q_stride, const bf16* cache_kv,
                       bf16* out, int n_heads, int n_kv, int head_dim,
                       const int* pos, const int* qstart, const int* decode_rids,
                       int n_decode, const int* bt, int max_blocks,
-                      int block_size, float scale, int max_decode,
-                      cudaStream_t s);
+                      int block_size, float scale, float* pm, float* pl,
+                      float* pa, cudaStream_t s);
 
 // Gather S rows from x[*, H] into out[S, H]: out[i] = x[rows[i]] (BF16). Pulls
 // the per-request last-token rows out of the flattened batch before the final

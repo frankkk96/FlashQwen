@@ -122,6 +122,10 @@ ModelRuntime::ModelRuntime(const ModelSpec& spec, int max_ctx, int slots,
   d_hmlp_ = DeviceBuffer<bf16>(rows * I);
   d_xg_ = DeviceBuffer<bf16>(static_cast<size_t>(slots_) * H);
   d_logits_ = DeviceBuffer<float>(static_cast<size_t>(slots_) * V);
+  size_t dec_ent = DecodePartialFloats(slots_);  // decode-attention split partials
+  d_dec_pm_ = DeviceBuffer<float>(dec_ent);
+  d_dec_pl_ = DeviceBuffer<float>(dec_ent);
+  d_dec_pa_ = DeviceBuffer<float>(dec_ent * spec_.head_dim);
   d_ids_ = DeviceBuffer<int>(max_rows_);
   d_pos_ = DeviceBuffer<int>(max_rows_);
   d_req_ = DeviceBuffer<int>(max_rows_);
@@ -199,7 +203,8 @@ void ModelRuntime::RunLayers(const ForwardInput& in) {
     auto decode = kCuteAttn ? LaunchAttnDecodeCute : LaunchAttnDecode;
     decode(d_qkv_.Get(), QKV, store_->KV(l), d_attn_.Get(), nH, nKV, hd,
            d_pos_.Get(), d_qstart_.Get(), d_decode_rids_.Get(), n_decode_,
-           d_bt_.Get(), bt_stride_, blk, scale, slots_, s);
+           d_bt_.Get(), bt_stride_, blk, scale, d_dec_pm_.Get(), d_dec_pl_.Get(),
+           d_dec_pa_.Get(), s);
     auto prefill = kCuteAttn ? LaunchAttnPrefillCute : LaunchAttnPrefill;
     prefill(d_qkv_.Get(), QKV, store_->KV(l), d_attn_.Get(), nH, nKV, hd,
             d_pos_.Get(), d_qstart_.Get(), d_qlen_.Get(), d_prefill_rids_.Get(),

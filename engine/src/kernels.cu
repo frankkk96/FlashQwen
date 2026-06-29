@@ -306,28 +306,18 @@ void LaunchAttnDecode(const bf16* q, int q_stride, const bf16* cache_kv,
                       bf16* out, int n_heads, int n_kv, int head_dim,
                       const int* pos, const int* qstart, const int* decode_rids,
                       int n_decode, const int* bt, int max_blocks,
-                      int block_size, float scale, int max_decode,
-                      cudaStream_t s) {
+                      int block_size, float scale, float* pm, float* pl,
+                      float* pa, cudaStream_t s) {
   if (n_decode <= 0) return;
   assert(head_dim == 128 && n_heads / n_kv == 4);  // Qwen3-8B: DPL=4, G=4
 
   // Split the KV range over grid.z so n_kv (< n_heads) blocks still saturate
-  // the GPU; a second kernel combines the per-split partials.
-  constexpr int MAX_KSPLIT = 16;
+  // the GPU; a second kernel combines the per-split partials (pm/pl/pa are
+  // caller-owned, preallocated to DecodePartialFloats()).
   int ksplit = 128 / (n_decode > 0 ? n_decode : 1);
   if (ksplit < 1) ksplit = 1;
-  if (ksplit > MAX_KSPLIT) ksplit = MAX_KSPLIT;
+  if (ksplit > kMaxKsplit) ksplit = kMaxKsplit;
 
-  // Persistent partials, reused across layers/steps; sized on first call to the
-  // worst case (max_decode is fixed for the process, so this never re-grows).
-  static float *pm = nullptr, *pl = nullptr, *pa = nullptr;
-  if (!pm) {
-    size_t nent =
-        static_cast<size_t>(max_decode) * 64 /*heads guard*/ * MAX_KSPLIT;
-    cudaMalloc(&pm, nent * sizeof(float));
-    cudaMalloc(&pl, nent * sizeof(float));
-    cudaMalloc(&pa, nent * 128 * sizeof(float));
-  }
   dim3 g1(n_kv, n_decode, ksplit);
   AttnDecodeGqaKernel<<<g1, NW * 32, 0, s>>>(
       q, q_stride, cache_kv, pm, pl, pa, n_heads, n_kv, head_dim, pos, qstart,

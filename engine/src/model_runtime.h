@@ -138,6 +138,9 @@ class ModelRuntime {
   DeviceBuffer<bf16> d_x_, d_xb_, d_xb2_, d_qkv_, d_attn_, d_gateup_, d_hmlp_;
   DeviceBuffer<bf16> d_xg_;
   DeviceBuffer<float> d_logits_;
+  // FlashDecoding split partials (m, l, acc), preallocated once to the
+  // worst-case decode batch; the decode attention launchers write/read them.
+  DeviceBuffer<float> d_dec_pm_, d_dec_pl_, d_dec_pa_;
   DeviceBuffer<int> d_ids_, d_pos_, d_req_;
   DeviceBuffer<int> d_qstart_, d_qlen_;
   DeviceBuffer<int> d_decode_rids_, d_prefill_rids_;
