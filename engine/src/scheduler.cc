@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdlib>
 #include <numeric>
 #include <string>
 
@@ -9,7 +10,10 @@
 
 Scheduler::Scheduler(ModelRuntime& model, BlockAllocator& alloc,
                      const SchedulerConfig& cfg)
-    : model_(model), alloc_(alloc), cfg_(cfg) {}
+    : model_(model), alloc_(alloc), cfg_(cfg) {
+  const char* e = std::getenv("FQ_ASYNC_SCHED");
+  async_on_ = e && e[0] == '1';
+}
 
 namespace {
 uint64_t HashBlock(uint64_t parent, const Request& r, int start, int n) {
@@ -113,6 +117,14 @@ bool Scheduler::Grow(Request* r, int upto) {
 }
 
 void Scheduler::Step() {
+  if (async_on_)
+    StepAsync();
+  else
+    StepSync();
+}
+
+// Drop cancelled requests, then admit waiting -> running up to the slot cap.
+void Scheduler::AdmitAndDrop() {
   auto drop_cancelled = [this](auto& queue) {
     for (auto it = queue.begin(); it != queue.end();) {
       if ((*it)->Sink() && (*it)->Sink()->Cancelled()) {
@@ -131,9 +143,14 @@ void Scheduler::Step() {
     running_.push_back(std::move(waiting_.front()));
     waiting_.pop_front();
   }
-  CurrentBatch batch;
+}
+
+// Pack running requests under the token budget into one merged forward (decodes
+// outrank prefill chunks). Returns false (and leaves batch empty) if nothing
+// runs. Grows block tables on demand; a failed Grow preempts and restarts.
+bool Scheduler::BuildBatch(CurrentBatch& batch, int& step_prefill,
+                           int& step_decode) {
   std::vector<int> order;
-  int step_prefill = 0, step_decode = 0;
   for (bool restart = true; restart;) {
     restart = false;
     batch.Clear();
@@ -158,7 +175,14 @@ void Scheduler::Step() {
       budget -= n;
     }
   }
-  if (batch.Empty()) return;
+  return !batch.Empty();
+}
+
+void Scheduler::StepSync() {
+  AdmitAndDrop();
+  CurrentBatch batch;
+  int step_prefill = 0, step_decode = 0;
+  if (!BuildBatch(batch, step_prefill, step_decode)) return;
   stat_steps_++;
   stat_prefill_rows_ += step_prefill;
   stat_decode_rows_ += step_decode;
@@ -169,9 +193,94 @@ void Scheduler::Step() {
   model_.Forward(batch.input, batch.sampled);
   batch.Apply();
   if (cfg_.use_prefix_cache)
-    for (Request* r : batch.requests)
-      CacheFilled(r);
+    for (Request* r : batch.requests) CacheFilled(r);
   for (Request* r : batch.finished) Retire(r);
+}
+
+// Wait on the in-flight async batch, accept its sampled tokens (skipping
+// requests an earlier step already finished — their token is wasted), and move
+// newly-finished requests to retiring_ (kept alive + KV held until the next
+// drain, since the just-launched following batch may still read their KV).
+void Scheduler::ProcessPending() {
+  model_.WaitForward(pending_ticket_, pending_batch_.sampled);
+  CurrentBatch& b = pending_batch_;
+  int s = 0;
+  for (Request* r : b.requests) {
+    if (!r->Done()) {
+      if (r->Remaining() == 0 && r->AcceptSampled(b.sampled[s]))
+        b.finished.push_back(r);
+      if (cfg_.use_prefix_cache) CacheFilled(r);
+    }
+    ++s;
+  }
+  for (Request* r : b.finished)
+    for (auto it = running_.begin(); it != running_.end(); ++it)
+      if (it->get() == r) {
+        retiring_.push_back(std::move(*it));
+        running_.erase(it);
+        break;
+      }
+}
+
+// Single-step async: keep one forward in flight (pending_batch_) and process the
+// previous one's output while it runs. The pipeline only continues across
+// pure-decode steps whose request set is unchanged (so the previous step's
+// GPU-resident sampled tokens map 1:1 to this step's rows and are fed back via
+// embed feedback). Any set change (finish / admit / a prefill step) drains the
+// pipeline and falls back to a synchronous step.
+void Scheduler::StepAsync() {
+  if (!pending_valid_) AdmitAndDrop();
+  CurrentBatch cand;
+  int pf = 0, dec = 0;
+  bool built = BuildBatch(cand, pf, dec);
+
+  if (pending_valid_ && built && pf == 0 &&
+      cand.requests == pending_batch_.requests) {
+    int t = model_.ForwardAsync(cand.input, /*feedback=*/true);
+    for (Request* r : cand.requests) r->Advance();  // positions for next build
+    ProcessPending();
+    stat_steps_++;
+    stat_decode_rows_ += dec;
+    stat_fwd_rows_ += dec;
+    pending_batch_ = std::move(cand);
+    pending_ticket_ = t;
+    pending_valid_ = true;
+    return;
+  }
+
+  // Drain the in-flight batch, then free the requests retired by it (their
+  // KV-reading batch has now completed).
+  if (pending_valid_) {
+    ProcessPending();
+    pending_valid_ = false;
+    for (auto& up : retiring_) Release(up.get());
+    retiring_.clear();
+  }
+  AdmitAndDrop();
+  CurrentBatch b;
+  if (!BuildBatch(b, pf, dec)) return;
+  stat_steps_++;
+  stat_prefill_rows_ += pf;
+  stat_decode_rows_ += dec;
+  stat_fwd_rows_ += pf + dec;
+  int used = alloc_.NumBlocks() - alloc_.NumFree();
+  if (used > stat_peak_used_) stat_peak_used_ = used;
+  if (stat_steps_ % 200 == 0) LogKvstat();
+  if (pf == 0) {
+    // Prime the pipeline: a pure-decode step whose input tokens are still
+    // CPU-known (output_ is current after the drain), so no feedback yet.
+    int t = model_.ForwardAsync(b.input, /*feedback=*/false);
+    for (Request* r : b.requests) r->Advance();
+    pending_batch_ = std::move(b);
+    pending_ticket_ = t;
+    pending_valid_ = true;
+    return;
+  }
+  model_.Forward(b.input, b.sampled);
+  b.Apply();
+  if (cfg_.use_prefix_cache)
+    for (Request* r : b.requests) CacheFilled(r);
+  for (Request* r : b.finished) Retire(r);
 }
 
 void Scheduler::LogKvstat() {

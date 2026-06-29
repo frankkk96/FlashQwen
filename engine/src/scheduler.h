@@ -73,10 +73,13 @@ class Request {
     num_new_ = n;
   }
 
+  bool Done() const { return finished_; }
+
   bool AcceptSampled(int tok) {
     output_.push_back(tok);
     if (sink_) sink_->Token(tok);
     if (!IsFinished()) return false;
+    finished_ = true;
     if (sink_) {
       bool stopped = HitStopToken();
       int comp = Generated() - (stopped ? 1 : 0);
@@ -109,6 +112,7 @@ class Request {
   int num_new_ = 0;
   int cached_blocks_ = 0;
   uint64_t last_hash_ = 0;
+  bool finished_ = false;
 };
 
 // One scheduling step's batch: the merged forward input plus pointers to the
@@ -170,9 +174,16 @@ class Scheduler {
   void Run();
 
  private:
-  bool Busy() const { return !waiting_.empty() || !running_.empty(); }
+  bool Busy() const {
+    return !waiting_.empty() || !running_.empty() || pending_valid_;
+  }
 
   void Step();
+  void StepSync();
+  void StepAsync();
+  void AdmitAndDrop();
+  bool BuildBatch(CurrentBatch& batch, int& step_prefill, int& step_decode);
+  void ProcessPending();  // wait + accept-sample + retire the in-flight async batch
   int ChunkSize(const Request* r, int budget) const;
   bool Grow(Request* r, int upto_tokens);
   void AcquirePrefix(Request* r);
@@ -204,4 +215,14 @@ class Scheduler {
 
   std::deque<std::unique_ptr<Request>> waiting_;
   std::vector<std::unique_ptr<Request>> running_;
+
+  // Single-step async scheduling (FQ_ASYNC_SCHED): one forward stays in flight
+  // (pending_batch_) while the CPU processes the previous one. retiring_ keeps
+  // finished requests alive until the in-flight batch that still references
+  // them is applied.
+  bool async_on_ = false;
+  bool pending_valid_ = false;
+  int pending_ticket_ = 0;
+  CurrentBatch pending_batch_;
+  std::vector<std::unique_ptr<Request>> retiring_;
 };

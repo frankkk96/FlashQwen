@@ -102,6 +102,16 @@ class ModelRuntime {
 
   void Forward(const ForwardInput& in, std::vector<int>& out_tokens);
 
+  // Async path for single-step async scheduling (FQ_ASYNC_SCHED). ForwardAsync
+  // launches the forward WITHOUT syncing and returns a ticket; the sampled
+  // tokens are D2H'd to a pinned ping-pong buffer. WaitForward(ticket) syncs on
+  // that launch and fills out_tokens. `feedback` makes the embedding read the
+  // previous step's sampled tokens straight from the GPU (d_arg_) instead of
+  // host-provided ids — so the next step can be built+launched before the
+  // previous step's tokens come back to the CPU.
+  int ForwardAsync(const ForwardInput& in, bool feedback);
+  void WaitForward(int ticket, std::vector<int>& out_tokens);
+
  private:
   // Fused weights (BF16, HF layout [OUT, IN]): d_qkv = [q|k|v] and d_gateup =
   // [gate|up] stacked on OUT; d_o_proj / d_down stay separate.
@@ -116,7 +126,9 @@ class ModelRuntime {
   void PrecomputeRope();
   void RunLayers(const ForwardInput& in);      // dispatcher (eager or CUDA graph)
   void RunLayersBody(const ForwardInput& in);  // the actual layer-stack launches
-  void RunHeadAndSample(const ForwardInput& in, std::vector<int>& out_tokens);
+  // Gather sample rows, lm_head, sample; D2H the S tokens to host_out (async,
+  // no sync). Returns S.
+  int RunHeadAndSample(const ForwardInput& in, int* host_out);
   void UploadInputs(const ForwardInput& in);
   void GroupRequests(const ForwardInput& in);
 
@@ -162,4 +174,12 @@ class ModelRuntime {
   // CUDA-graph capture of the pure-decode layer stack (FQ_DECODE_GRAPH).
   cudaGraphExec_t layers_graph_ = nullptr;
   int graph_T_ = -1, graph_ndec_ = -1;
+  // Single-step async scheduling (FQ_ASYNC_SCHED): ping-pong events + pinned
+  // token buffers so two forwards can be in flight; embed_feedback_ routes the
+  // embedding to read d_arg_ (the previous sample) instead of d_ids_.
+  bool embed_feedback_ = false;
+  cudaEvent_t async_ev_[2] = {nullptr, nullptr};
+  int* async_pin_[2] = {nullptr, nullptr};
+  int async_S_[2] = {0, 0};
+  int async_parity_ = 0;
 };

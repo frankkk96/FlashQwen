@@ -156,6 +156,10 @@ ModelRuntime::ModelRuntime(const ModelSpec& spec, int max_ctx, int slots,
   // CUDA-graph capture (FQ_DECODE_GRAPH).
   CUDA_CHECK(cudaMalloc(&cublas_ws_, kCublasWsBytes));
   CUBLAS_CHECK(cublasSetWorkspace(cublas_, cublas_ws_, kCublasWsBytes));
+  for (int i = 0; i < 2; ++i) {
+    CUDA_CHECK(cudaEventCreate(&async_ev_[i]));
+    CUDA_CHECK(cudaMallocHost(&async_pin_[i], slots_ * sizeof(int)));
+  }
 
   size_t freeb, totalb;
   CUDA_CHECK(cudaMemGetInfo(&freeb, &totalb));
@@ -212,7 +216,10 @@ void ModelRuntime::RunLayersBody(const ForwardInput& in) {
   cudaStream_t s = stream_;
   int blk = store_->BlockSize();
 
-  LaunchEmbed(d_ids_.Get(), d_embed_.Get(), d_x_.Get(), T, H, s);
+  // Async feedback: embed the previous step's sampled tokens straight from the
+  // GPU (d_arg_, written by that step's sampler) instead of host-supplied ids.
+  const int* ids = embed_feedback_ ? d_arg_.Get() : d_ids_.Get();
+  LaunchEmbed(ids, d_embed_.Get(), d_x_.Get(), T, H, s);
 
   for (int l = 0; l < c.num_layers; ++l) {
     Layer& L = layers_[l];
@@ -268,12 +275,15 @@ void ModelRuntime::RunLayersBody(const ForwardInput& in) {
 // d_bt_; bt_stride_ is the padded row length the kernels index with.
 void ModelRuntime::UploadInputs(const ForwardInput& in) {
   int T = in.NumRows();
-  CUDA_CHECK(cudaMemcpy(d_ids_.Get(), in.tokens.data(), T * sizeof(int),
-                        cudaMemcpyHostToDevice));
-  CUDA_CHECK(cudaMemcpy(d_pos_.Get(), in.positions.data(), T * sizeof(int),
-                        cudaMemcpyHostToDevice));
-  CUDA_CHECK(cudaMemcpy(d_req_.Get(), in.req_index.data(), T * sizeof(int),
-                        cudaMemcpyHostToDevice));
+  // Async on stream_ (not blocking default-stream cudaMemcpy, which would
+  // serialize with an in-flight forward and defeat async scheduling). Pageable
+  // H2D stages synchronously, so the host source is free to reuse on return.
+  CUDA_CHECK(cudaMemcpyAsync(d_ids_.Get(), in.tokens.data(), T * sizeof(int),
+                             cudaMemcpyHostToDevice, stream_));
+  CUDA_CHECK(cudaMemcpyAsync(d_pos_.Get(), in.positions.data(), T * sizeof(int),
+                             cudaMemcpyHostToDevice, stream_));
+  CUDA_CHECK(cudaMemcpyAsync(d_req_.Get(), in.req_index.data(), T * sizeof(int),
+                             cudaMemcpyHostToDevice, stream_));
 
   const auto& bts = in.block_tables;
   int R = static_cast<int>(bts.size());
@@ -285,9 +295,9 @@ void ModelRuntime::UploadInputs(const ForwardInput& in) {
     for (int g = 0; g < mb; ++g)
       row[g] = g < static_cast<int>(bts[r].size()) ? bts[r][g] : 0;
   }
-  CUDA_CHECK(cudaMemcpy(d_bt_.Get(), h_bt_.data(),
-                        static_cast<size_t>(R) * mb * sizeof(int),
-                        cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpyAsync(d_bt_.Get(), h_bt_.data(),
+                             static_cast<size_t>(R) * mb * sizeof(int),
+                             cudaMemcpyHostToDevice, stream_));
 }
 
 // Per-request attention grouping over the batch. Rows are contiguous and
@@ -303,10 +313,10 @@ void ModelRuntime::GroupRequests(const ForwardInput& in) {
     h_qstart_[r] = acc;
     acc += h_qlen_[r];
   }
-  CUDA_CHECK(cudaMemcpy(d_qstart_.Get(), h_qstart_.data(), R * sizeof(int),
-                        cudaMemcpyHostToDevice));
-  CUDA_CHECK(cudaMemcpy(d_qlen_.Get(), h_qlen_.data(), R * sizeof(int),
-                        cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpyAsync(d_qstart_.Get(), h_qstart_.data(), R * sizeof(int),
+                             cudaMemcpyHostToDevice, stream_));
+  CUDA_CHECK(cudaMemcpyAsync(d_qlen_.Get(), h_qlen_.data(), R * sizeof(int),
+                             cudaMemcpyHostToDevice, stream_));
 
   n_decode_ = n_prefill_ = 0;
   prefill_max_qlen_ = 1;
@@ -319,11 +329,13 @@ void ModelRuntime::GroupRequests(const ForwardInput& in) {
     }
   }
   if (n_decode_)
-    CUDA_CHECK(cudaMemcpy(d_decode_rids_.Get(), h_decode_rids_.data(),
-                          n_decode_ * sizeof(int), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpyAsync(d_decode_rids_.Get(), h_decode_rids_.data(),
+                               n_decode_ * sizeof(int), cudaMemcpyHostToDevice,
+                               stream_));
   if (n_prefill_)
-    CUDA_CHECK(cudaMemcpy(d_prefill_rids_.Get(), h_prefill_rids_.data(),
-                          n_prefill_ * sizeof(int), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpyAsync(d_prefill_rids_.Get(), h_prefill_rids_.data(),
+                               n_prefill_ * sizeof(int), cudaMemcpyHostToDevice,
+                               stream_));
 }
 
 // Forward: H2D inputs, unified layer stack, then gather only the per-request
@@ -334,21 +346,43 @@ void ModelRuntime::Forward(const ForwardInput& in,
   UploadInputs(in);
   GroupRequests(in);
   RunLayers(in);
-  RunHeadAndSample(in, out_tokens);
+  out_tokens.resize(in.logits_rows.size());
+  RunHeadAndSample(in, out_tokens.data());
   CUDA_CHECK(cudaStreamSynchronize(stream_));
+}
+
+// Launch a forward without syncing; sampled tokens land in pinned buffer
+// async_pin_[ticket]. WaitForward(ticket) later syncs and reads them. With
+// feedback=true the embedding reads the previous step's tokens from d_arg_, so
+// the caller can build+launch this step before the previous tokens reach the
+// CPU (single-step async scheduling).
+int ModelRuntime::ForwardAsync(const ForwardInput& in, bool feedback) {
+  int buf = async_parity_;
+  async_parity_ ^= 1;
+  embed_feedback_ = feedback;
+  UploadInputs(in);
+  GroupRequests(in);
+  RunLayers(in);
+  async_S_[buf] = RunHeadAndSample(in, async_pin_[buf]);
+  CUDA_CHECK(cudaEventRecord(async_ev_[buf], stream_));
+  embed_feedback_ = false;
+  return buf;
+}
+
+void ModelRuntime::WaitForward(int ticket, std::vector<int>& out_tokens) {
+  CUDA_CHECK(cudaEventSynchronize(async_ev_[ticket]));
+  out_tokens.assign(async_pin_[ticket], async_pin_[ticket] + async_S_[ticket]);
 }
 
 // Gather only the per-request sampling rows, run final norm + lm_head on those
 // -> d_logits_ [S, vocab], then sample one token per row into out_tokens[S].
-void ModelRuntime::RunHeadAndSample(const ForwardInput& in,
-                                    std::vector<int>& out_tokens) {
+int ModelRuntime::RunHeadAndSample(const ForwardInput& in, int* host_out) {
   int S = static_cast<int>(in.logits_rows.size());
   int H = spec_.hidden_size, V = spec_.vocab_size;
-  out_tokens.resize(S);
-  if (S == 0) return;
+  if (S == 0) return 0;
 
-  CUDA_CHECK(cudaMemcpy(d_lrows_.Get(), in.logits_rows.data(), S * sizeof(int),
-                        cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpyAsync(d_lrows_.Get(), in.logits_rows.data(),
+                             S * sizeof(int), cudaMemcpyHostToDevice, stream_));
   LaunchGatherRows(d_x_.Get(), d_lrows_.Get(), d_xg_.Get(), S, H, stream_);
   LaunchRmsnorm(d_xg_.Get(), d_fnorm_.Get(), d_xb_.Get(), S, H, spec_.rms_eps,
                 stream_);
@@ -370,13 +404,18 @@ void ModelRuntime::RunHeadAndSample(const ForwardInput& in,
                              cudaMemcpyHostToDevice, stream_));
   LaunchSampleBatch(d_logits_.Get(), S, spec_.vocab_size, d_invT_.Get(),
                     d_topp_.Get(), d_u_.Get(), d_arg_.Get(), stream_);
-  CUDA_CHECK(cudaMemcpyAsync(out_tokens.data(), d_arg_.Get(), S * sizeof(int),
+  CUDA_CHECK(cudaMemcpyAsync(host_out, d_arg_.Get(), S * sizeof(int),
                              cudaMemcpyDeviceToHost, stream_));
+  return S;
 }
 
 // Each DeviceBuffer member frees its own device memory; only the cuBLAS/stream
 // handles, which are not plain allocations, need explicit teardown.
 ModelRuntime::~ModelRuntime() {
+  for (int i = 0; i < 2; ++i) {
+    if (async_ev_[i]) cudaEventDestroy(async_ev_[i]);
+    if (async_pin_[i]) cudaFreeHost(async_pin_[i]);
+  }
   if (layers_graph_) cudaGraphExecDestroy(layers_graph_);
   if (cublas_ws_) cudaFree(cublas_ws_);
   if (cublas_) cublasDestroy(cublas_);
