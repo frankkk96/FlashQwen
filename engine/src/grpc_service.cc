@@ -101,8 +101,13 @@ int RunEngine(const Args& a, const std::string& model_id) {
       return 1;
     }
     LOG_INFO("[engine] loading model %s ...", model_id.c_str());
+    // Weights + activation scratch FIRST, then size the KV pool from the VRAM
+    // that's actually left (KvStore takes gpu_mem_fraction of the *remaining*
+    // free memory). Building the pool first would grab the whole fraction
+    // before the 16GB of weights are uploaded and OOM at high fractions.
+    ModelRuntime model(spec, a.max_ctx, a.slots, a.token_budget, a.seed);
     KvStore store(spec, a.max_ctx, a.gpu_mem_fraction);
-    ModelRuntime model(spec, store, a.max_ctx, a.slots, a.token_budget, a.seed);
+    model.AttachKvStore(store);
 
     SchedulerConfig scfg{
         a.slots,

@@ -75,10 +75,9 @@ void ModelRuntime::PrecomputeRope() {
 // allocate activation + sampling scratch. Scratch rows are sized to
 // token_budget (+16 slack for a prefill kernel's last-tile over-read), NOT
 // max_ctx: sizing to max_ctx over-allocates ~4x and starves the KV pool.
-ModelRuntime::ModelRuntime(const ModelSpec& spec, const KvStore& store,
-                           int max_ctx, int slots, int token_budget,
-                           unsigned seed)
-    : spec_(spec), rng_(seed), store_(&store) {
+ModelRuntime::ModelRuntime(const ModelSpec& spec, int max_ctx, int slots,
+                           int token_budget, unsigned seed)
+    : spec_(spec), rng_(seed) {
   max_ctx_ = max_ctx;
   slots_ = slots;
   max_rows_ = std::max(1, token_budget) + 16;

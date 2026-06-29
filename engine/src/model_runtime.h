@@ -89,9 +89,16 @@ struct ForwardInput {
 // out_tokens[logits_rows.size()].
 class ModelRuntime {
  public:
-  ModelRuntime(const ModelSpec& spec, const KvStore& store, int max_ctx,
-               int slots, int token_budget, unsigned seed);
+  // Loads weights + activation scratch. Does NOT take the KvStore: the KV pool
+  // is sized from the VRAM left AFTER this constructor runs, so it must be
+  // built afterwards and wired in via AttachKvStore() before the first Forward.
+  ModelRuntime(const ModelSpec& spec, int max_ctx, int slots, int token_budget,
+               unsigned seed);
   ~ModelRuntime();
+
+  // Attach the KV pool (built after this runtime so it gets the real leftover
+  // VRAM). Must be called before Forward().
+  void AttachKvStore(const KvStore& store) { store_ = &store; }
 
   void Forward(const ForwardInput& in, std::vector<int>& out_tokens);
 
