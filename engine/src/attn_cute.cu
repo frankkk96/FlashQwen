@@ -21,6 +21,17 @@ constexpr int G = 4;     // GQA group = n_heads/n_kv (asserted)
 constexpr int DPL = 4;   // head_dim/32: dims held per lane (decode)
 constexpr int NW = 4;    // warps per decode CTA splitting the key range
 constexpr int MAX_KSPLIT = 16;  // max grid.z KV-splits (decode)
+
+// Reshape an m16n8 accumulator fragment (MMA=(2,2), MMA_M, MMA_N) into a
+// (row, col) view per thread, so the online softmax can index rows directly
+// (the FlashAttention helper).
+template <typename Layout>
+__device__ __forceinline__ auto AccRowcol(Layout l) {
+  using namespace cute;
+  auto d = logical_divide(l, Shape<_2>{});  // ((2,2), MMA_M, MMA_N)
+  return make_layout(make_layout(get<0, 1>(d), get<1>(d)),
+                     make_layout(get<0, 0>(d), get<2>(d)));
+}
 }  // namespace
 
 // One CTA per (q-tile of TQ rows, head h, request r). 128 threads = 4 warps.
@@ -48,18 +59,15 @@ static __global__ void CutePrefillKernel(const cbf16* __restrict__ q, int q_stri
   // per-CTA smem ~16KB (vs 31KB if Q stayed resident) for occupancy parity
   // with the hand-written kernel.
   extern __shared__ char smem[];
-  cbf16* sK = reinterpret_cast<cbf16*>(smem);          // [TK*HD]  [0,4K)
-  cbf16* sV = sK + TK * HD;                             // [TK*HD]  [4K,8K)
-  float* sS = reinterpret_cast<float*>(sV + TK * HD);  // [TQ*TK]  [8K,12K)
-  cbf16* sP = reinterpret_cast<cbf16*>(sS + TQ * TK);  // [TQ*TK]  [12K,14K)
-  cbf16* sQ = reinterpret_cast<cbf16*>(smem);          // [TQ*HD] aliases sK..sP
-  __shared__ float sM[TQ], sL[TQ], sCorr[TQ];
+  cbf16* sK = reinterpret_cast<cbf16*>(smem);  // [TK*HD]  [0,4K)
+  cbf16* sV = sK + TK * HD;                     // [TK*HD]  [4K,8K)
+  cbf16* sP = sV + TK * HD;                     // [TQ*TK]  [8K,10K)
+  cbf16* sQ = reinterpret_cast<cbf16*>(smem);   // [TQ*HD] aliases sK/sV/sP
 
   for (int i = tid; i < TQ * HD; i += blockDim.x) {
     int row = i / HD, col = i % HD, grow = q0 + row;
     sQ[i] = grow < ql ? q[(qs + grow) * q_stride + h * HD + col] : cbf16(0.f);
   }
-  for (int row = tid; row < TQ; row += blockDim.x) { sM[row] = -1e30f; sL[row] = 0.f; }
   __syncthreads();
 
   TiledMMA mmaQK = make_tiled_mma(SM80_16x8x16_F32BF16BF16F32_TN{}, Layout<Shape<_4, _1, _1>>{});
@@ -69,13 +77,12 @@ static __global__ void CutePrefillKernel(const cbf16* __restrict__ q, int q_stri
 
   Tensor sQt = make_tensor(make_smem_ptr(sQ), make_layout(Shape<Int<TQ>, Int<HD>>{}, LayoutRight{}));
   Tensor sKt = make_tensor(make_smem_ptr(sK), make_layout(Shape<Int<TK>, Int<HD>>{}, LayoutRight{}));
-  Tensor sSt = make_tensor(make_smem_ptr(sS), make_layout(Shape<Int<TQ>, Int<TK>>{}, LayoutRight{}));
   Tensor sPt = make_tensor(make_smem_ptr(sP), make_layout(Shape<Int<TQ>, Int<TK>>{}, LayoutRight{}));
   // V^T view [HD, TK]: element (hd,key) = sV[key*HD + hd] -> stride (1, HD).
   Tensor sVt = make_tensor(make_smem_ptr(sV), make_layout(Shape<Int<HD>, Int<TK>>{}, Stride<_1, Int<HD>>{}));
 
   // Q -> registers ONCE (A-operand), reused across all key tiles; then recycle
-  // the smem that held Q for the K/V/S/P tiles.
+  // the smem that held Q for the K/V/P tiles.
   Tensor tSrQ = thrQK.partition_fragment_A(sQt);
   copy(thrQK.partition_A(sQt), tSrQ);
   __syncthreads();
@@ -83,6 +90,15 @@ static __global__ void CutePrefillKernel(const cbf16* __restrict__ q, int q_stri
   Tensor tOrO = partition_fragment_C(mmaPV, Shape<Int<TQ>, Int<HD>>{});
   clear(tOrO);
   Tensor tOcO = thrPV.partition_C(make_identity_tensor(Shape<Int<TQ>, Int<HD>>{}));
+  // (row,col) views for register-resident online softmax: each thread owns NROW
+  // rows; rm/rl track the running max/denominator for those rows.
+  Tensor O_rc = make_tensor(tOrO.data(), AccRowcol(tOrO.layout()));
+  Tensor cO_rc = make_tensor(tOcO.data(), AccRowcol(tOcO.layout()));
+  Tensor tScS = thrQK.partition_C(make_identity_tensor(Shape<Int<TQ>, Int<TK>>{}));
+  Tensor cS_rc = make_tensor(tScS.data(), AccRowcol(tScS.layout()));
+  constexpr int NROW = 2, NSC = decltype(size<1>(cS_rc))::value, NOC = decltype(size<1>(O_rc))::value;
+  float rm[NROW], rl[NROW];
+  for (int r = 0; r < NROW; ++r) { rm[r] = -1e30f; rl[r] = 0.f; }
 
   int qlast = min(q0 + TQ - 1, ql - 1);
   int ntiles = pos[qs + qlast] / TK + 1;
@@ -102,34 +118,31 @@ static __global__ void CutePrefillKernel(const cbf16* __restrict__ q, int q_stri
     clear(tSrS);
     copy(thrQK.partition_B(sKt), tSrK);
     gemm(mmaQK, tSrQ, tSrK, tSrS);
-    copy(tSrS, thrQK.partition_C(sSt));
-    __syncthreads();
 
-    for (int row = tid; row < TQ; row += blockDim.x) {
-      int grow = q0 + row;
+    // Register-resident online softmax on the distributed S accumulator. Each
+    // thread owns NROW rows (NSC of the TK key cols each); the other key cols of
+    // a row live in the other 3 threads of the quad (lane%4), reduced by shfl.
+    Tensor S_rc = make_tensor(tSrS.data(), AccRowcol(tSrS.layout()));
+    for (int r = 0; r < NROW; ++r) {
+      int row = get<0>(cS_rc(r, 0)), grow = q0 + row;
       int qp = grow < ql ? pos[qs + grow] : -1;
-      float tmax = -1e30f;
-      for (int c = 0; c < TK; ++c) {
-        int kpos = kt * TK + c;
-        float v = (kpos <= qp) ? sS[row * TK + c] * scale : -1e30f;
-        sS[row * TK + c] = v;
-        tmax = fmaxf(tmax, v);
+      float rmax = -1e30f;
+      for (int c = 0; c < NSC; ++c) {
+        int kpos = kt * TK + get<1>(cS_rc(r, c));
+        float v = (kpos <= qp) ? S_rc(r, c) * scale : -1e30f;
+        S_rc(r, c) = v; rmax = fmaxf(rmax, v);
       }
-      float nm = fmaxf(sM[row], tmax);
-      float corr = __expf(sM[row] - nm);
-      float tsum = 0.f;
-      for (int c = 0; c < TK; ++c) {
-        float p = __expf(sS[row * TK + c] - nm);
-        sP[row * TK + c] = cbf16(p);
-        tsum += p;
-      }
-      sL[row] = sL[row] * corr + tsum;
-      sM[row] = nm;
-      sCorr[row] = corr;
+      rmax = fmaxf(rmax, __shfl_xor_sync(0xffffffff, rmax, 1));
+      rmax = fmaxf(rmax, __shfl_xor_sync(0xffffffff, rmax, 2));
+      float nm = fmaxf(rm[r], rmax), corr = __expf(rm[r] - nm), rsum = 0.f;
+      for (int c = 0; c < NSC; ++c) { float p = __expf(S_rc(r, c) - nm); S_rc(r, c) = p; rsum += p; }
+      rsum += __shfl_xor_sync(0xffffffff, rsum, 1);
+      rsum += __shfl_xor_sync(0xffffffff, rsum, 2);
+      rl[r] = rl[r] * corr + rsum; rm[r] = nm;
+      for (int c = 0; c < NOC; ++c) O_rc(r, c) *= corr;  // rescale running O
+      for (int c = 0; c < NSC; ++c) sP[row * TK + get<1>(cS_rc(r, c))] = cbf16(S_rc(r, c));
     }
     __syncthreads();
-
-    for (int i = 0; i < size(tOrO); ++i) tOrO(i) *= sCorr[get<0>(tOcO(i))];
 
     Tensor tOrP = thrPV.partition_fragment_A(sPt);
     Tensor tOrV = thrPV.partition_fragment_B(sVt);
@@ -139,12 +152,11 @@ static __global__ void CutePrefillKernel(const cbf16* __restrict__ q, int q_stri
     __syncthreads();
   }
 
-  for (int i = 0; i < size(tOrO); ++i) {
-    int row = get<0>(tOcO(i)), col = get<1>(tOcO(i)), grow = q0 + row;
-    if (grow < ql) {
-      float l = sL[row];
-      out[((qs + grow) * n_heads + h) * HD + col] =
-          cbf16(tOrO(i) * (l > 0.f ? 1.f / l : 0.f));
+  for (int r = 0; r < NROW; ++r) {
+    float inv = rl[r] > 0 ? 1.f / rl[r] : 0.f;
+    for (int c = 0; c < NOC; ++c) {
+      int row = get<0>(cO_rc(r, c)), col = get<1>(cO_rc(r, c)), grow = q0 + row;
+      if (grow < ql) out[((qs + grow) * n_heads + h) * HD + col] = cbf16(O_rc(r, c) * inv);
     }
   }
 }
