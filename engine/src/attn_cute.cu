@@ -20,6 +20,7 @@ constexpr int TK = 16;   // key tile == page size
 constexpr int G = 4;     // GQA group = n_heads/n_kv (asserted)
 constexpr int DPL = 4;   // head_dim/32: dims held per lane (decode)
 constexpr int NW = 4;    // warps per decode CTA splitting the key range
+constexpr int MAX_KSPLIT = 16;  // max grid.z KV-splits (decode)
 }  // namespace
 
 // One CTA per (q-tile of TQ rows, head h, request r). 128 threads = 4 warps.
@@ -168,13 +169,16 @@ void LaunchAttnPrefillCute(const __nv_bfloat16* q, int q_stride,
 // warps split the key range, each runs a partial online softmax, then an in-CTA
 // combine. q_len=1 has no MMA to use, so CuTe wraps the paged K/V tensor views
 // and the compute is warp-shuffle gemv. The G query heads of a group reuse each
-// K/V load. No grid.z split: at decode concurrency n_kv*n_decode CTAs saturate.
-static __global__ void CuteDecodeKernel(
+// K/V load. grid.z = ksplit splits the key range FlashDecoding-style so n_kv
+// (< n_heads) blocks still saturate the GPU; CuteDecodeCombine merges the
+// per-split partials written to pm/pl/pa, indexed [(di*n_heads+h)*ksplit + sp].
+static __global__ void CuteDecodeSplitKernel(
     const cbf16* __restrict__ q, int q_stride, const cbf16* __restrict__ cache_kv,
-    cbf16* __restrict__ out, int n_heads, int n_kv, const int* __restrict__ pos,
+    float* __restrict__ pm, float* __restrict__ pl, float* __restrict__ pa,
+    int n_heads, int n_kv, const int* __restrict__ pos,
     const int* __restrict__ qstart, const int* __restrict__ decode_rids,
-    const int* __restrict__ bt, int max_blocks, float scale) {
-  int kvh = blockIdx.x, di = blockIdx.y;
+    const int* __restrict__ bt, int max_blocks, float scale, int ksplit) {
+  int kvh = blockIdx.x, di = blockIdx.y, sp = blockIdx.z;
   int w = threadIdx.x >> 5, lane = threadIdx.x & 31;
   int r = decode_rids[di], flat = qstart[r], qpos = pos[flat];
   int kv_dim = n_kv * HD;
@@ -191,7 +195,7 @@ static __global__ void CuteDecodeKernel(
   for (int g = 0; g < G; ++g) { m[g] = -1e30f; l[g] = 0.f;
     for (int i = 0; i < DPL; ++i) acc[g][i] = 0.f; }
 
-  for (int kpos = w; kpos <= qpos; kpos += NW) {
+  for (int kpos = sp * NW + w; kpos <= qpos; kpos += NW * ksplit) {
     int64_t base = static_cast<int64_t>(btr[kpos / TK]) * kKvPlanes * plane +
                    static_cast<int64_t>(kpos % TK) * kv_dim +
                    static_cast<int64_t>(kvh) * HD;
@@ -220,11 +224,28 @@ static __global__ void CuteDecodeKernel(
       float gl = 0.f, gacc[DPL]; for (int i = 0; i < DPL; ++i) gacc[i] = 0.f;
       for (int t = 0; t < NW; ++t) { float c = __expf(sm[g][t] - gm); gl += sl[g][t] * c;
         for (int i = 0; i < DPL; ++i) gacc[i] += sa[g][t][lane + i * 32] * c; }
-      float inv = gl > 0 ? 1.f / gl : 0.f;
-      cbf16* o = out + (static_cast<int64_t>(flat) * n_heads + (kvh * G + g)) * HD;
-      for (int i = 0; i < DPL; ++i) o[lane + i * 32] = cbf16(gacc[i] * inv);
+      int h = kvh * G + g;
+      int64_t idx = (static_cast<int64_t>(di) * n_heads + h) * ksplit + sp;
+      if (lane == 0) { pm[idx] = gm; pl[idx] = gl; }
+      for (int i = 0; i < DPL; ++i) pa[idx * HD + lane + i * 32] = gacc[i];
     }
   }
+}
+
+// Combine the ksplit partials of each (head, request) -> the final output row.
+static __global__ void CuteDecodeCombineKernel(
+    const float* __restrict__ pm, const float* __restrict__ pl,
+    const float* __restrict__ pa, cbf16* __restrict__ out, int n_heads,
+    const int* __restrict__ qstart, const int* __restrict__ decode_rids, int ksplit) {
+  int h = blockIdx.x, di = blockIdx.y, d = threadIdx.x;
+  int r = decode_rids[di], flat = qstart[r];
+  int64_t base = (static_cast<int64_t>(di) * n_heads + h) * ksplit;
+  float gm = -1e30f; for (int s = 0; s < ksplit; ++s) gm = fmaxf(gm, pm[base + s]);
+  float gl = 0.f, gacc = 0.f;
+  for (int s = 0; s < ksplit; ++s) { float c = __expf(pm[base + s] - gm);
+    gl += pl[base + s] * c; gacc += pa[(base + s) * HD + d] * c; }
+  float inv = gl > 0 ? 1.f / gl : 0.f;
+  out[(static_cast<int64_t>(flat) * n_heads + h) * HD + d] = cbf16(gacc * inv);
 }
 
 void LaunchAttnDecodeCute(const __nv_bfloat16* q, int q_stride,
@@ -235,9 +256,25 @@ void LaunchAttnDecodeCute(const __nv_bfloat16* q, int q_stride,
                           float scale, int max_decode, cudaStream_t s) {
   if (n_decode <= 0) return;
   assert(head_dim == HD && n_heads / n_kv == G && block_size == TK);
-  dim3 grid(n_kv, n_decode);
-  CuteDecodeKernel<<<grid, NW * 32, 0, s>>>(
+  int ksplit = 128 / n_decode;
+  if (ksplit < 1) ksplit = 1;
+  if (ksplit > MAX_KSPLIT) ksplit = MAX_KSPLIT;
+
+  // Persistent partials, reused across layers/steps; sized once to the worst
+  // case (max_decode is fixed for the process), matching the hand kernel.
+  static float *pm = nullptr, *pl = nullptr, *pa = nullptr;
+  if (!pm) {
+    size_t nent = static_cast<size_t>(max_decode) * 64 /*heads guard*/ * MAX_KSPLIT;
+    cudaMalloc(&pm, nent * sizeof(float));
+    cudaMalloc(&pl, nent * sizeof(float));
+    cudaMalloc(&pa, nent * HD * sizeof(float));
+  }
+  dim3 g1(n_kv, n_decode, ksplit);
+  CuteDecodeSplitKernel<<<g1, NW * 32, 0, s>>>(
       reinterpret_cast<const cbf16*>(q), q_stride,
-      reinterpret_cast<const cbf16*>(cache_kv), reinterpret_cast<cbf16*>(out),
-      n_heads, n_kv, pos, qstart, decode_rids, bt, max_blocks, scale);
+      reinterpret_cast<const cbf16*>(cache_kv), pm, pl, pa, n_heads, n_kv, pos,
+      qstart, decode_rids, bt, max_blocks, scale, ksplit);
+  dim3 g2(n_heads, n_decode);
+  CuteDecodeCombineKernel<<<g2, HD, 0, s>>>(
+      pm, pl, pa, reinterpret_cast<cbf16*>(out), n_heads, qstart, decode_rids, ksplit);
 }
