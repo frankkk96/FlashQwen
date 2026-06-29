@@ -195,6 +195,9 @@ void LaunchAttnPrefillCute(const __nv_bfloat16* q, int q_stride,
 // K/V load. grid.z = ksplit splits the key range FlashDecoding-style so n_kv
 // (< n_heads) blocks still saturate the GPU; CuteDecodeCombine merges the
 // per-split partials written to pm/pl/pa, indexed [(di*n_heads+h)*ksplit + sp].
+// No __launch_bounds__ here: decode is already 6 CTAs/SM (50% occ) at its
+// natural 76 regs and at decode concurrency there are plenty of blocks, so
+// capping regs to force 8/SM only cut per-thread ILP and raised TPOT (measured).
 static __global__ void CuteDecodeSplitKernel(
     const cbf16* __restrict__ q, int q_stride, const cbf16* __restrict__ cache_kv,
     float* __restrict__ pm, float* __restrict__ pl, float* __restrict__ pa,
