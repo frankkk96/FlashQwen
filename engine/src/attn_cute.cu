@@ -64,9 +64,13 @@ static __global__ void CutePrefillKernel(const cbf16* __restrict__ q, int q_stri
   cbf16* sP = sV + TK * HD;                     // [TQ*TK]  [8K,10K)
   cbf16* sQ = reinterpret_cast<cbf16*>(smem);   // [TQ*HD] aliases sK/sV/sP
 
-  for (int i = tid; i < TQ * HD; i += blockDim.x) {
-    int row = i / HD, col = i % HD, grow = q0 + row;
-    sQ[i] = grow < ql ? q[(qs + grow) * q_stride + h * HD + col] : cbf16(0.f);
+  // Vectorized (128-bit) Q load; HD is a multiple of 8 so each thread moves 8
+  // contiguous head-dim elements per int4.
+  const int4 z4 = {0, 0, 0, 0};
+  for (int c = tid; c < TQ * HD / 8; c += blockDim.x) {
+    int row = c / (HD / 8), hd8 = (c % (HD / 8)) * 8, grow = q0 + row;
+    *reinterpret_cast<int4*>(&sQ[row * HD + hd8]) =
+        grow < ql ? *reinterpret_cast<const int4*>(&q[(qs + grow) * q_stride + h * HD + hd8]) : z4;
   }
   __syncthreads();
 
@@ -106,10 +110,12 @@ static __global__ void CutePrefillKernel(const cbf16* __restrict__ q, int q_stri
   for (int kt = 0; kt < ntiles; ++kt) {
     int64_t kvbase = static_cast<int64_t>(btr[kt]) * kKvPlanes * plane +
                      static_cast<int64_t>(kvh) * HD;
-    for (int i = tid; i < TK * HD; i += blockDim.x) {
-      int key = i / HD, col = i % HD;
-      sK[i] = cache_kv[kvbase + static_cast<int64_t>(key) * kv_dim + col];
-      sV[i] = cache_kv[kvbase + plane + static_cast<int64_t>(key) * kv_dim + col];
+    for (int c = tid; c < TK * HD / 8; c += blockDim.x) {
+      int key = c / (HD / 8), hd8 = (c % (HD / 8)) * 8;
+      *reinterpret_cast<int4*>(&sK[key * HD + hd8]) = *reinterpret_cast<const int4*>(
+          &cache_kv[kvbase + static_cast<int64_t>(key) * kv_dim + hd8]);
+      *reinterpret_cast<int4*>(&sV[key * HD + hd8]) = *reinterpret_cast<const int4*>(
+          &cache_kv[kvbase + plane + static_cast<int64_t>(key) * kv_dim + hd8]);
     }
     __syncthreads();
 
