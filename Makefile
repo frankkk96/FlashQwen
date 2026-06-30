@@ -11,16 +11,12 @@ MODEL      ?= ./models/qwen3-8b
 ENGINE_BIN := internal/supervisor/bin/flashqwen-engine
 GOBIN      := $(shell go env GOPATH)/bin
 
-.PHONY: all go embed engine proto test run bench clean
+.PHONY: all go embed engine proto test run clean
 
 all: go
 
 go: embed
 	go build -o flashqwen ./cmd/flashqwen
-
-# fqbench: serving benchmark client (vllm-bench-serve-compatible metrics; no Python/vllm needed)
-bench:
-	go build -o fqbench ./cmd/fqbench
 
 embed: engine
 	@mkdir -p $(dir $(ENGINE_BIN))
@@ -44,4 +40,4 @@ run: go
 	./flashqwen serve --model $(MODEL)
 
 clean:
-	rm -rf engine/build flashqwen fqbench $(ENGINE_BIN)
+	rm -rf engine/build flashqwen $(ENGINE_BIN)

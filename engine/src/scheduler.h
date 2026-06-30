@@ -15,6 +15,8 @@
 #include "output_sink.h"
 #include "sampler.h"
 
+namespace fq {
+
 // A single generation request. Inputs are set once at construction and
 // read-only after; generation state (KV residency, computed cursor, output)
 // mutates only through these methods, so no external code can break an
@@ -49,15 +51,11 @@ class Request {
   uint64_t LastHash() const { return last_hash_; }
   void SetLastHash(uint64_t h) { last_hash_ = h; }
 
-  // Adopt a cache-reused prefix: nb leading blocks (already spliced into the
-  // block table) cover nb*bsz resident tokens, so skip recomputing them.
   void AdoptPrefix(int nb, int bsz, uint64_t last) {
     computed_ = nb * bsz;
     cached_blocks_ = nb;
     last_hash_ = last;
   }
-  // Preempted: block table already freed, so recompute KV from scratch on
-  // resume and drop the prefix-cache cursor.
   void ResetForRecompute() {
     computed_ = 0;
     cached_blocks_ = 0;
@@ -137,8 +135,6 @@ struct CurrentBatch {
     requests.push_back(r);
   }
 
-  // Apply one forward's results: advance every cursor, then accept + stream the
-  // sampled token for requests at their frontier, collecting finished ones.
   void Apply() {
     for (Request* r : requests) r->Advance();
     int s = 0;
@@ -174,51 +170,27 @@ class Scheduler {
   void Run();
 
  private:
-  bool Busy() const {
-    return !waiting_.empty() || !running_.empty() || pending_valid_;
-  }
+  bool Busy() const { return !waiting_.empty() || !running_.empty(); }
 
   void Step();
-  void AdmitAndDrop();
-  bool BuildBatch(CurrentBatch& batch, int& step_prefill, int& step_decode);
-  void ProcessPending();  // wait + accept-sample + retire the in-flight async batch
-  int ChunkSize(const Request* r, int budget) const;
+  void Refill();
+  bool BuildBatch(CurrentBatch& batch);
   bool Grow(Request* r, int upto_tokens);
   void AcquirePrefix(Request* r);
-  void CacheFilled(Request* r);
+  void CacheBlocks(Request* r);
   void Release(Request* r);
   void Retire(Request* r);
-  void LogKvstat();
-
-  // Cumulative instrumentation counters (single-threaded engine thread).
-  int64_t stat_steps_ = 0;
-  int64_t stat_fwd_rows_ = 0;
-  int64_t stat_prefill_rows_ = 0;
-  int64_t stat_decode_rows_ = 0;
-  int64_t stat_preempt_ = 0;
-  int64_t stat_recomp_tok_ = 0;
-  int64_t stat_cache_hit_tok_ = 0;
-  int64_t stat_prompt_tok_ = 0;
-  int stat_peak_used_ = 0;
 
   ModelRuntime& model_;
   BlockAllocator& alloc_;
   const SchedulerConfig cfg_;
 
-  // Cross-thread handoff: handler threads push to inbound_ via Submit(); Run()
-  // drains it.
   std::mutex inbound_mu_;
   std::condition_variable inbound_cv_;
   std::deque<std::unique_ptr<Request>> inbound_;
 
   std::deque<std::unique_ptr<Request>> waiting_;
   std::vector<std::unique_ptr<Request>> running_;
-
-  // Single-step async scheduling: one forward stays in flight (pending_batch_)
-  // while the CPU processes the previous one. retiring_ keeps finished requests
-  // alive until the in-flight batch that still references them is applied.
-  bool pending_valid_ = false;
-  int pending_ticket_ = 0;
-  CurrentBatch pending_batch_;
-  std::vector<std::unique_ptr<Request>> retiring_;
 };
+
+}

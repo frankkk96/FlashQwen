@@ -1,5 +1,3 @@
-// Minimal leveled stderr logger (no deps). Format: "HH:MM:SS [LEVEL] msg\n",
-// printf-style. Use LOG_INFO / LOG_WARN / LOG_ERROR.
 #pragma once
 #include <cstdarg>
 #include <cstdio>

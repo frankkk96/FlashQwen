@@ -2,6 +2,8 @@
 
 #include "CLI11.hpp"
 
+namespace fq {
+
 int ParseArgs(int argc, char** argv, Args& out) {
   CLI::App app{
       "flashqwen-engine — token-level C++/CUDA inference engine for Qwen3-8B. "
@@ -51,4 +53,6 @@ int ParseArgs(int argc, char** argv, Args& out) {
     return app.exit(e);
   }
   return -1;
+}
+
 }

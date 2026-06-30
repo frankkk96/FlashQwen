@@ -4,10 +4,11 @@
 
 #include <vector>
 
-#include "kv_layout.h"  // kKvBlock
+#include "cuda_helpers.h"
+#include "kv_layout.h"
 #include "model_spec.h"
 
-using bf16 = __nv_bfloat16;
+namespace fq {
 
 // Model-aware paged KV cache for this engine's single attention layout. Owns
 // one combined per-layer device tensor [NumBlocks, 2, kKvBlock, kv_dim] BF16
@@ -22,22 +23,21 @@ using bf16 = __nv_bfloat16;
 class KvStore {
  public:
   KvStore(const ModelSpec& spec, int max_ctx, float gpu_mem_fraction);
-  ~KvStore();
   KvStore(const KvStore&) = delete;
   KvStore& operator=(const KvStore&) = delete;
 
-  // Append token m's freshly-projected K and V (read from the fused qkv row at
-  // the model's QD/KVD offsets) into `layer`'s pool, at block-table row
-  // bt_row[m] (stride bt_stride), logical position pos[m]. M tokens total.
   void StoreKV(int layer, const bf16* qkv, const int* bt, int bt_stride,
-               const int* bt_row, const int* pos, int M, cudaStream_t s) const;
+               const int* bt_row, const int* pos, int M,
+               cudaStream_t stream) const;
 
-  bf16* KV(int layer) const { return d_kv_[layer]; }
+  bf16* KV(int layer) const { return kv_[layer].D(); }
   int BlockSize() const { return kKvBlock; }
   int NumBlocks() const { return num_blocks_; }
 
  private:
   ModelSpec spec_;
   int num_blocks_ = 0;
-  std::vector<bf16*> d_kv_;
+  std::vector<DeviceBuffer<bf16>> kv_;
 };
+
+}

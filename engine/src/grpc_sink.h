@@ -10,7 +10,8 @@
 #include "errors.h"
 #include "output_sink.h"
 
-// Engine domain error -> proto wire code (the single mapping spot).
+namespace fq {
+
 inline flashqwen::ErrorCode ToProto(EngineErrc e) {
   switch (e) {
     case EngineErrc::kOverCapacity:
@@ -94,3 +95,5 @@ struct GrpcSink : OutputSink {
     return cancel.load(std::memory_order_relaxed);
   }
 };
+
+}

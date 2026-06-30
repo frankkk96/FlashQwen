@@ -1,6 +1,8 @@
 #pragma once
 #include <string>
 
+namespace fq {
+
 // CLI args (serve mode only), passed to ModelRuntime / SchedulerConfig in
 // RunEngine, where model-arch support is also checked via ModelSpec.
 struct Args {
@@ -16,5 +18,6 @@ struct Args {
   bool use_prefix_cache = true;
 };
 
-// argv -> out. Returns <0 to keep running, else an exit code (--help / error).
 int ParseArgs(int argc, char** argv, Args& out);
+
+}

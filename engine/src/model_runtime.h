@@ -5,46 +5,27 @@
 #include <string>
 #include <vector>
 
+#include "cuda_helpers.h"
 #include "kernels.cuh"
 #include "kv_store.h"
 #include "model_spec.h"
 #include "safetensors.h"
 #include "sampler.h"
 
-// Owning RAII handle for a cudaMalloc'd device buffer. Move-only; frees on
-// destruction (so every buffer has exactly one owner — no central free list).
-// The type marks the memory as device-resident and there is no operator*, so it
-// can't be dereferenced on the host; pass Get() to kernels / cuda APIs.
-template <class T>
-class DeviceBuffer {
- public:
-  DeviceBuffer() = default;
-  explicit DeviceBuffer(size_t n) {
-    void* p = nullptr;
-    CUDA_CHECK(cudaMalloc(&p, n * sizeof(T)));
-    p_ = static_cast<T*>(p);
-  }
-  ~DeviceBuffer() { Free(); }
-  DeviceBuffer(DeviceBuffer&& o) noexcept : p_(o.p_) { o.p_ = nullptr; }
-  DeviceBuffer& operator=(DeviceBuffer&& o) noexcept {
-    if (this != &o) {
-      Free();
-      p_ = o.p_;
-      o.p_ = nullptr;
-    }
-    return *this;
-  }
-  DeviceBuffer(const DeviceBuffer&) = delete;
-  DeviceBuffer& operator=(const DeviceBuffer&) = delete;
+namespace fq {
 
-  T* Get() const { return p_; }  // raw device pointer for kernels / cuda APIs
+// Precomputed, layer-independent RoPE cos/sin tables [max_ctx, head_dim/2]
+// (FP32, device-resident): angle(pos,i) = pos * theta^(-2i/head_dim). Owns just
+// the tables; the rotation itself is applied by the fused head-norm+RoPE kernel
+// that reads Cos()/Sin().
+class RopeTables {
+ public:
+  void Build(const ModelSpec& spec, int max_ctx);
+  const float* Cos() const { return cos_.D(); }
+  const float* Sin() const { return sin_.D(); }
 
  private:
-  void Free() {
-    if (p_) cudaFree(p_);
-    p_ = nullptr;
-  }
-  T* p_ = nullptr;
+  DeviceBuffer<float> cos_, sin_;
 };
 
 // One merged forward's inputs: a flattened mixed batch (prefill chunks +
@@ -81,6 +62,144 @@ struct ForwardInput {
   }
 };
 
+// Fused weights for one decoder layer (BF16, HF layout [OUT, IN]): qkv =
+// [q|k|v] and gateup = [gate|up] stacked on OUT; o_proj / down stay
+// separate.
+struct Layer {
+  DeviceBuffer<bf16> qkv, o_proj, gateup, down;
+  DeviceBuffer<float> in_norm, post_norm, q_norm, k_norm;
+};
+
+// All GPU-resident model weights: token embedding, final norm, LM head,
+// precomputed RoPE tables, and the per-layer fused projections. The constructor
+// reads them from spec.dir (st_) and uploads each to the GPU.
+struct ModelWeights {
+  DeviceBuffer<bf16> embed;
+  DeviceBuffer<float> fnorm;
+  DeviceBuffer<bf16> lm_head;
+  RopeTables rope;
+  std::vector<Layer> layers;
+
+  ModelWeights() = default;
+  ModelWeights(const ModelSpec& spec, int max_ctx);
+};
+
+// A device buffer paired with a host-side staging vector of the same length, so
+// the two halves can't drift apart. Fill the host side (operator[] / H()), then
+// Flush(stream, n) the first n elements to the device. Only StepContext uses it,
+// passing its own stream; n is the step's live prefix (≤ capacity), so the stale
+// tail isn't copied.
+template <class T>
+class StagedBuffer {
+ public:
+  StagedBuffer() = default;
+  explicit StagedBuffer(size_t n) : d_(n), h_(n) {}
+  T* H() { return h_.data(); }
+  T* D() const { return d_.D(); }
+  T& operator[](size_t i) { return h_[i]; }
+  const T& operator[](size_t i) const { return h_[i]; }
+  void Flush(cudaStream_t stream, size_t n) {
+    CUDA_CHECK(cudaMemcpyAsync(d_.D(), h_.data(), n * sizeof(T),
+                               cudaMemcpyHostToDevice, stream));
+  }
+
+ private:
+  DeviceBuffer<T> d_;
+  std::vector<T> h_;
+};
+
+// The per-forward batch context: everything describing what this step runs,
+// computed on the host and pushed to the GPU each forward. ids/pos/req and the
+// sampling rows (lrows) come straight from the ForwardInput; qstart/qlen and the
+// decode/prefill request-id lists and packed block tables (bt) are derived;
+// invT/topp/u are the per-row sampling params. The methods fill each group from
+// a ForwardInput and flush it to the device on the caller's stream. The ints describe
+// the buffers (bt_stride = bt's row stride, n_decode = decode_rids' valid
+// length, ...). The constructor sizes everything to the worst case once.
+struct StepContext {
+  DeviceBuffer<int> ids, pos, req;
+  DeviceBuffer<int> lrows;
+  StagedBuffer<int> qstart, qlen;
+  StagedBuffer<int> decode_rids, prefill_rids;
+  StagedBuffer<int> bt;
+  StagedBuffer<float> invT, topp, u;
+
+  int max_blocks = 0;
+  int bt_stride = 0;
+  int n_rows = 0, n_sample = 0;
+  int n_decode = 0, n_prefill = 0, prefill_max_qlen = 1;
+
+  StepContext() = default;
+  StepContext(int max_rows, int slots, int max_ctx);
+  void PrepareInputs(const ForwardInput& in, std::mt19937& rng,
+                     cudaStream_t stream);
+};
+
+// Per-forward compute scratch: activation buffers + lm_head logits + the decode
+// attention split partials + the sampler's device-side output (sampled). Pure
+// kernel-written working memory, sized to the worst-case batch (max_rows query
+// rows, slots concurrent requests) once.
+struct RuntimeBuffers {
+  DeviceBuffer<bf16> x, xb, xb2, qkv, attn, gateup, hmlp;
+  DeviceBuffer<bf16> xg;
+  DeviceBuffer<float> logits;
+  DeviceBuffer<float> dec_pm, dec_pl, dec_pa;
+  DeviceBuffer<int> sampled;
+
+  RuntimeBuffers() = default;
+  RuntimeBuffers(const ModelSpec& spec, int max_rows, int slots);
+};
+
+// A small LRU cache of capture-once / replay CUDA graphs, keyed on a (k0, k1)
+// shape. Run() replays the cached graph for the current shape if present;
+// otherwise it captures `body`'s kernel launches into a fresh graph and launches
+// that. Keeping up to kMaxEntries graphs avoids re-capturing every step when the
+// shape (the decode batch size) churns as requests finish/admit — a single
+// cached graph would thrash there (measured: 376 recaptures vs 38 under a
+// not-full load). Frees all executable graphs on destruction.
+class GraphCache {
+ public:
+  GraphCache() = default;
+  ~GraphCache() {
+    for (auto& e : entries_) cudaGraphExecDestroy(e.exec);
+  }
+  GraphCache(const GraphCache&) = delete;
+  GraphCache& operator=(const GraphCache&) = delete;
+
+  template <class F>
+  void Run(cudaStream_t stream, int k0, int k1, F&& body) {
+    for (auto it = entries_.begin(); it != entries_.end(); ++it)
+      if (it->k0 == k0 && it->k1 == k1) {
+        Entry hit = *it;
+        entries_.erase(it);
+        entries_.insert(entries_.begin(), hit);
+        CUDA_CHECK(cudaGraphLaunch(hit.exec, stream));
+        return;
+      }
+    CUDA_CHECK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal));
+    body();
+    cudaGraph_t g;
+    CUDA_CHECK(cudaStreamEndCapture(stream, &g));
+    cudaGraphExec_t exec = nullptr;
+    CUDA_CHECK(cudaGraphInstantiate(&exec, g, 0));
+    CUDA_CHECK(cudaGraphDestroy(g));
+    while (entries_.size() >= kMaxEntries) {
+      cudaGraphExecDestroy(entries_.back().exec);
+      entries_.pop_back();
+    }
+    entries_.insert(entries_.begin(), Entry{k0, k1, exec});
+    CUDA_CHECK(cudaGraphLaunch(exec, stream));
+  }
+
+ private:
+  struct Entry {
+    int k0, k1;
+    cudaGraphExec_t exec;
+  };
+  static constexpr size_t kMaxEntries = 64;
+  std::vector<Entry> entries_;
+};
+
 // Qwen3 dense decoder GPU executor (the compute half; dims/arch live in
 // ModelSpec). Loads weights + activation scratch from spec.dir and borrows the
 // paged KV store (non-owning) for the lifetime of the run. Forward() runs
@@ -89,97 +208,36 @@ struct ForwardInput {
 // out_tokens[logits_rows.size()].
 class ModelRuntime {
  public:
-  // Loads weights + activation scratch. Does NOT take the KvStore: the KV pool
-  // is sized from the VRAM left AFTER this constructor runs, so it must be
-  // built afterwards and wired in via AttachKvStore() before the first Forward.
   ModelRuntime(const ModelSpec& spec, int max_ctx, int slots, int token_budget,
                unsigned seed);
   ~ModelRuntime();
 
-  // Attach the KV pool (built after this runtime so it gets the real leftover
-  // VRAM). Must be called before Forward().
   void AttachKvStore(const KvStore& store) { store_ = &store; }
 
   void Forward(const ForwardInput& in, std::vector<int>& out_tokens);
 
-  // Async path for single-step async scheduling (FQ_ASYNC_SCHED). ForwardAsync
-  // launches the forward WITHOUT syncing and returns a ticket; the sampled
-  // tokens are D2H'd to a pinned ping-pong buffer. WaitForward(ticket) syncs on
-  // that launch and fills out_tokens. `feedback` makes the embedding read the
-  // previous step's sampled tokens straight from the GPU (d_arg_) instead of
-  // host-provided ids — so the next step can be built+launched before the
-  // previous step's tokens come back to the CPU.
-  int ForwardAsync(const ForwardInput& in, bool feedback);
-  void WaitForward(int ticket, std::vector<int>& out_tokens);
-
  private:
-  // Fused weights (BF16, HF layout [OUT, IN]): d_qkv = [q|k|v] and d_gateup =
-  // [gate|up] stacked on OUT; d_o_proj / d_down stay separate.
-  struct Layer {
-    DeviceBuffer<bf16> d_qkv, d_o_proj, d_gateup, d_down;
-    DeviceBuffer<float> d_in_norm, d_post_norm, d_q_norm, d_k_norm;
-  };
-
-  DeviceBuffer<bf16> UploadBf16(const std::string& name);
-  DeviceBuffer<bf16> UploadBf16s(const std::vector<std::string>& names);
-  DeviceBuffer<float> UploadFp32(const std::string& name);
-  void PrecomputeRope();
-  void RunLayers(const ForwardInput& in);      // dispatcher (eager or CUDA graph)
-  void RunLayersBody(const ForwardInput& in);  // the actual layer-stack launches
-  // Gather sample rows, lm_head, sample; D2H the S tokens to host_out (async,
-  // no sync). Returns S.
-  int RunHeadAndSample(const ForwardInput& in, int* host_out);
-  void UploadInputs(const ForwardInput& in);
-  void GroupRequests(const ForwardInput& in);
+  void RunLayers();
+  void RunLayersBody();
+  void RunHeadAndSample(std::vector<int>& out);
+  void InitCudaResources();
 
   ModelSpec spec_;
-  SafeTensors st_;
   int max_ctx_ = 0;
   int slots_ = 0;
   int max_rows_ = 0;
-  int max_blocks_ = 0;
-  int bt_stride_ = 0;
   const KvStore* store_ = nullptr;
 
-  DeviceBuffer<bf16> d_embed_;
-  DeviceBuffer<float> d_fnorm_;
-  DeviceBuffer<bf16> d_lm_head_;
-  DeviceBuffer<float> d_cos_tab_, d_sin_tab_;  // precomputed RoPE tables
-  std::vector<Layer> layers_;
-
-  // Activation scratch (BF16, max_rows_ rows); sampling buffers (slots_).
-  DeviceBuffer<bf16> d_x_, d_xb_, d_xb2_, d_qkv_, d_attn_, d_gateup_, d_hmlp_;
-  DeviceBuffer<bf16> d_xg_;
-  DeviceBuffer<float> d_logits_;
-  // FlashDecoding split partials (m, l, acc), preallocated once to the
-  // worst-case decode batch; the decode attention launchers write/read them.
-  DeviceBuffer<float> d_dec_pm_, d_dec_pl_, d_dec_pa_;
-  DeviceBuffer<int> d_ids_, d_pos_, d_req_;
-  DeviceBuffer<int> d_qstart_, d_qlen_;
-  DeviceBuffer<int> d_decode_rids_, d_prefill_rids_;
-  int n_decode_ = 0, n_prefill_ = 0, prefill_max_qlen_ = 1;
-  DeviceBuffer<int> d_bt_;
-  DeviceBuffer<int> d_lrows_, d_arg_;
-  DeviceBuffer<float> d_invT_, d_topp_, d_u_;
-  std::vector<int> h_bt_;
-  std::vector<int> h_qstart_, h_qlen_;
-  std::vector<int> h_decode_rids_, h_prefill_rids_;
-  std::vector<float> h_invT_, h_topp_, h_u_;
+  ModelWeights weights_;
+  RuntimeBuffers buf_;
+  StepContext ctx_;
   std::mt19937 rng_;
 
   cudaStream_t stream_ = nullptr;
   cublasHandle_t cublas_ = nullptr;
-  static constexpr size_t kCublasWsBytes = 32 << 20;  // user cuBLAS workspace
-  void* cublas_ws_ = nullptr;
-  // CUDA-graph capture of the pure-decode layer stack (FQ_DECODE_GRAPH).
-  cudaGraphExec_t layers_graph_ = nullptr;
-  int graph_T_ = -1, graph_ndec_ = -1;
-  // Single-step async scheduling (FQ_ASYNC_SCHED): ping-pong events + pinned
-  // token buffers so two forwards can be in flight; embed_feedback_ routes the
-  // embedding to read d_arg_ (the previous sample) instead of d_ids_.
-  bool embed_feedback_ = false;
-  cudaEvent_t async_ev_[2] = {nullptr, nullptr};
-  int* async_pin_[2] = {nullptr, nullptr};
-  int async_S_[2] = {0, 0};
-  int async_parity_ = 0;
+  static constexpr size_t kCublasWsBytes = 32 << 20;
+  DeviceBuffer<std::byte> cublas_ws_;
+  GraphCache layers_graph_;
 };
+
+}

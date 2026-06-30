@@ -4,7 +4,9 @@
 #include <unordered_map>
 #include <vector>
 
-#include "kv_layout.h"  // kKvBlock
+#include "kv_layout.h"
+
+namespace fq {
 
 // Bookkeeping half of the paged KV cache: a refcounted, vLLM-style free list
 // with prefix-cache support over block ids [0, NumBlocks). Owns NO device
@@ -97,3 +99,5 @@ class BlockAllocator {
   std::vector<std::list<int>::iterator> pos_;
   int num_blocks_ = 0;
 };
+
+}

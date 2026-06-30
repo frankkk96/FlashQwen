@@ -4,12 +4,14 @@
 #include <unordered_map>
 #include <vector>
 
+namespace fq {
+
 // A view into an mmapped safetensors shard (points straight into the mapping).
 struct TensorView {
   const uint8_t* data = nullptr;
   size_t nbytes = 0;
   std::vector<int64_t> shape;
-  std::string dtype;  // e.g. "BF16", "F32"
+  std::string dtype;
   int64_t Numel() const {
     int64_t n = 1;
     for (auto s : shape) n *= s;
@@ -31,3 +33,5 @@ class SafeTensors {
   std::unordered_map<std::string, TensorView> tensors_;
   std::vector<std::pair<void*, size_t>> mappings_;
 };
+
+}

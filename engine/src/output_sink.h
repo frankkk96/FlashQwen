@@ -3,6 +3,8 @@
 
 #include "errors.h"
 
+namespace fq {
+
 // Per-request output channel. The scheduler streams tokens and the terminal
 // Done/Error straight to the request's sink (gRPC implements the wire format),
 // and polls Cancelled(), which the transport sets on client disconnect. Request
@@ -15,3 +17,5 @@ struct OutputSink {
   virtual void Error(EngineErrc code, const std::string& msg) = 0;
   virtual bool Cancelled() const = 0;
 };
+
+}

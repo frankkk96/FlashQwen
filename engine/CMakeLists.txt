@@ -69,6 +69,7 @@ add_executable(flashqwen-engine
   src/scheduler.cc
   src/grpc_service.cc
   src/safetensors.cc
+  src/model_spec.cc
   src/kernels.cu
   src/kv_store.cu
   src/model_runtime.cu

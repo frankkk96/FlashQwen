@@ -13,6 +13,8 @@
 
 #include "rapidjson/document.h"
 
+namespace fq {
+
 const TensorView& SafeTensors::Get(const std::string& name) const {
   auto it = tensors_.find(name);
   if (it == tensors_.end())
@@ -50,14 +52,14 @@ void SafeTensors::MapShard(const std::string& path) {
     std::string name = kv.name.GetString();
     if (name == "__metadata__") continue;
     const auto& meta = kv.value;
-    TensorView tv;
-    tv.dtype = meta["dtype"].GetString();
-    for (auto& s : meta["shape"].GetArray()) tv.shape.push_back(s.GetInt64());
+    TensorView tensor;
+    tensor.dtype = meta["dtype"].GetString();
+    for (auto& d : meta["shape"].GetArray()) tensor.shape.push_back(d.GetInt64());
     int64_t begin = meta["data_offsets"][0].GetInt64();
     int64_t end = meta["data_offsets"][1].GetInt64();
-    tv.data = data_begin + begin;
-    tv.nbytes = static_cast<size_t>(end - begin);
-    tensors_[name] = tv;
+    tensor.data = data_begin + begin;
+    tensor.nbytes = static_cast<size_t>(end - begin);
+    tensors_[name] = tensor;
   }
 }
 
@@ -84,4 +86,6 @@ void SafeTensors::LoadDir(const std::string& dir) {
     path += shard;
     MapShard(path);
   }
+}
+
 }

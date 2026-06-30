@@ -1,44 +1,32 @@
-// CuTe (CUTLASS) prefill attention. The QK and PV matmuls use CuTe TiledMMA
-// (Ampere m16n8k16 bf16 atoms, valid on sm_89); the online softmax runs in
-// shared memory per-row, with the S scores and P weights round-tripping through
-// smem so we avoid distributed-accumulator softmax reductions. Mirrors the
-// hand-written AttnPrefillMmaKernel's contract exactly (paged combined-NHD KV,
-// GQA, causal, head_dim==128, page==16) and is numerically equivalent.
 #include <cassert>
 
 #include "attn_cute.h"
 #include "cute/tensor.hpp"
-#include "kernels.cuh"  // kMaxKsplit
-#include "kv_layout.h"  // kKvPlanes
+#include "kernels.cuh"
+#include "kv_layout.h"
+
+namespace fq {
 
 using namespace cute;
 using cbf16 = cutlass::bfloat16_t;
 
 namespace {
-constexpr int HD = 128;  // head_dim
-constexpr int TQ = 64;   // query rows per CTA (4 warps x 16)
-constexpr int TK = 16;   // key tile == page size
-constexpr int G = 4;     // GQA group = n_heads/n_kv (asserted)
-constexpr int DPL = 4;   // head_dim/32: dims held per lane (decode)
-constexpr int NW = 4;    // warps per decode CTA splitting the key range (kMaxKsplit from kernels.cuh)
+constexpr int HD = 128;
+constexpr int TQ = 64;
+constexpr int TK = 16;
+constexpr int G = 4;
+constexpr int DPL = 4;
+constexpr int NW = 4;
 
-// Reshape an m16n8 accumulator fragment (MMA=(2,2), MMA_M, MMA_N) into a
-// (row, col) view per thread, so the online softmax can index rows directly
-// (the FlashAttention helper).
 template <typename Layout>
 __device__ __forceinline__ auto AccRowcol(Layout l) {
   using namespace cute;
-  auto d = logical_divide(l, Shape<_2>{});  // ((2,2), MMA_M, MMA_N)
+  auto d = logical_divide(l, Shape<_2>{});
   return make_layout(make_layout(get<0, 1>(d), get<1>(d)),
                      make_layout(get<0, 0>(d), get<2>(d)));
 }
-}  // namespace
+}
 
-// One CTA per (q-tile of TQ rows, head h, request r). 128 threads = 4 warps.
-// __launch_bounds__(128,4): cap at 128 regs/thread so 4 CTAs fit per SM on the
-// 4090 (65536 regs/SM) -> 33% occupancy vs 25% at the natural 153 regs; ptxas
-// hits 128 with zero spills (recompute, not spill). The hand kernel is stuck at
-// 3 CTAs/SM (156 regs).
 static __global__ void __launch_bounds__(128, 4)
 CutePrefillKernel(const cbf16* __restrict__ q, int q_stride,
                                   const cbf16* __restrict__ cache_kv,
@@ -52,25 +40,19 @@ CutePrefillKernel(const cbf16* __restrict__ q, int q_stride,
   int r = rids[blockIdx.z], h = blockIdx.y, qtile = blockIdx.x;
   int ql = qlen[r], qs = qstart[r];
   int kv_dim = n_kv * HD;
-  int64_t plane = static_cast<int64_t>(TK) * kv_dim;  // K plane -> V plane
+  int64_t plane = static_cast<int64_t>(TK) * kv_dim;
   int kvh = h / (n_heads / n_kv);
   const int* btr = bt + r * max_blocks;
   int q0 = qtile * TQ;
   if (q0 >= ql) return;
   int tid = threadIdx.x;
 
-  // Dynamic smem, aliased: Q (16KB) is loaded, copied to registers, then its
-  // memory is recycled for the K/V/S/P tiles (disjoint in the loop). Keeps
-  // per-CTA smem ~16KB (vs 31KB if Q stayed resident) for occupancy parity
-  // with the hand-written kernel.
   extern __shared__ char smem[];
-  cbf16* sK = reinterpret_cast<cbf16*>(smem);  // [TK*HD]  [0,4K)
-  cbf16* sV = sK + TK * HD;                     // [TK*HD]  [4K,8K)
-  cbf16* sP = sV + TK * HD;                     // [TQ*TK]  [8K,10K)
-  cbf16* sQ = reinterpret_cast<cbf16*>(smem);   // [TQ*HD] aliases sK/sV/sP
+  cbf16* sK = reinterpret_cast<cbf16*>(smem);
+  cbf16* sV = sK + TK * HD;
+  cbf16* sP = sV + TK * HD;
+  cbf16* sQ = reinterpret_cast<cbf16*>(smem);
 
-  // Vectorized (128-bit) Q load; HD is a multiple of 8 so each thread moves 8
-  // contiguous head-dim elements per int4.
   const int4 z4 = {0, 0, 0, 0};
   for (int c = tid; c < TQ * HD / 8; c += blockDim.x) {
     int row = c / (HD / 8), hd8 = (c % (HD / 8)) * 8, grow = q0 + row;
@@ -87,11 +69,8 @@ CutePrefillKernel(const cbf16* __restrict__ q, int q_stride,
   Tensor sQt = make_tensor(make_smem_ptr(sQ), make_layout(Shape<Int<TQ>, Int<HD>>{}, LayoutRight{}));
   Tensor sKt = make_tensor(make_smem_ptr(sK), make_layout(Shape<Int<TK>, Int<HD>>{}, LayoutRight{}));
   Tensor sPt = make_tensor(make_smem_ptr(sP), make_layout(Shape<Int<TQ>, Int<TK>>{}, LayoutRight{}));
-  // V^T view [HD, TK]: element (hd,key) = sV[key*HD + hd] -> stride (1, HD).
   Tensor sVt = make_tensor(make_smem_ptr(sV), make_layout(Shape<Int<HD>, Int<TK>>{}, Stride<_1, Int<HD>>{}));
 
-  // Q -> registers ONCE (A-operand), reused across all key tiles; then recycle
-  // the smem that held Q for the K/V/P tiles.
   Tensor tSrQ = thrQK.partition_fragment_A(sQt);
   copy(thrQK.partition_A(sQt), tSrQ);
   __syncthreads();
@@ -99,8 +78,6 @@ CutePrefillKernel(const cbf16* __restrict__ q, int q_stride,
   Tensor tOrO = partition_fragment_C(mmaPV, Shape<Int<TQ>, Int<HD>>{});
   clear(tOrO);
   Tensor tOcO = thrPV.partition_C(make_identity_tensor(Shape<Int<TQ>, Int<HD>>{}));
-  // (row,col) views for register-resident online softmax: each thread owns NROW
-  // rows; rm/rl track the running max/denominator for those rows.
   Tensor O_rc = make_tensor(tOrO.data(), AccRowcol(tOrO.layout()));
   Tensor cO_rc = make_tensor(tOcO.data(), AccRowcol(tOcO.layout()));
   Tensor tScS = thrQK.partition_C(make_identity_tensor(Shape<Int<TQ>, Int<TK>>{}));
@@ -130,9 +107,6 @@ CutePrefillKernel(const cbf16* __restrict__ q, int q_stride,
     copy(thrQK.partition_B(sKt), tSrK);
     gemm(mmaQK, tSrQ, tSrK, tSrS);
 
-    // Register-resident online softmax on the distributed S accumulator. Each
-    // thread owns NROW rows (NSC of the TK key cols each); the other key cols of
-    // a row live in the other 3 threads of the quad (lane%4), reduced by shfl.
     Tensor S_rc = make_tensor(tSrS.data(), AccRowcol(tSrS.layout()));
     for (int r = 0; r < NROW; ++r) {
       int row = get<0>(cS_rc(r, 0)), grow = q0 + row;
@@ -150,7 +124,7 @@ CutePrefillKernel(const cbf16* __restrict__ q, int q_stride,
       rsum += __shfl_xor_sync(0xffffffff, rsum, 1);
       rsum += __shfl_xor_sync(0xffffffff, rsum, 2);
       rl[r] = rl[r] * corr + rsum; rm[r] = nm;
-      for (int c = 0; c < NOC; ++c) O_rc(r, c) *= corr;  // rescale running O
+      for (int c = 0; c < NOC; ++c) O_rc(r, c) *= corr;
       for (int c = 0; c < NSC; ++c) sP[row * TK + get<1>(cS_rc(r, c))] = cbf16(S_rc(r, c));
     }
     __syncthreads();
@@ -181,23 +155,13 @@ void LaunchAttnPrefillCute(const __nv_bfloat16* q, int q_stride,
   if (R <= 0) return;
   assert(head_dim == HD && block_size == TK);
   dim3 grid((max_qlen + TQ - 1) / TQ, n_heads, R);
-  int smem = TQ * HD * sizeof(cbf16);  // 16KB: Q footprint (recycled for K/V/S/P)
+  int smem = TQ * HD * sizeof(cbf16);
   CutePrefillKernel<<<grid, 128, smem, s>>>(
       reinterpret_cast<const cbf16*>(q), q_stride,
       reinterpret_cast<const cbf16*>(cache_kv), reinterpret_cast<cbf16*>(out),
       n_heads, n_kv, pos, qstart, qlen, rids, bt, max_blocks, scale);
 }
 
-// Decode (q_len==1): FlashDecoding. One CTA per (kv-head, decode request); NW
-// warps split the key range, each runs a partial online softmax, then an in-CTA
-// combine. q_len=1 has no MMA to use, so CuTe wraps the paged K/V tensor views
-// and the compute is warp-shuffle gemv. The G query heads of a group reuse each
-// K/V load. grid.z = ksplit splits the key range FlashDecoding-style so n_kv
-// (< n_heads) blocks still saturate the GPU; CuteDecodeCombine merges the
-// per-split partials written to pm/pl/pa, indexed [(di*n_heads+h)*ksplit + sp].
-// No __launch_bounds__ here: decode is already 6 CTAs/SM (50% occ) at its
-// natural 76 regs and at decode concurrency there are plenty of blocks, so
-// capping regs to force 8/SM only cut per-thread ILP and raised TPOT (measured).
 static __global__ void CuteDecodeSplitKernel(
     const cbf16* __restrict__ q, int q_stride, const cbf16* __restrict__ cache_kv,
     float* __restrict__ pm, float* __restrict__ pl, float* __restrict__ pa,
@@ -258,7 +222,6 @@ static __global__ void CuteDecodeSplitKernel(
   }
 }
 
-// Combine the ksplit partials of each (head, request) -> the final output row.
 static __global__ void CuteDecodeCombineKernel(
     const float* __restrict__ pm, const float* __restrict__ pl,
     const float* __restrict__ pa, cbf16* __restrict__ out, int n_heads,
@@ -287,7 +250,6 @@ void LaunchAttnDecodeCute(const __nv_bfloat16* q, int q_stride,
   if (ksplit < 1) ksplit = 1;
   if (ksplit > kMaxKsplit) ksplit = kMaxKsplit;
 
-  // pm/pl/pa are caller-owned (preallocated to DecodePartialFloats()).
   dim3 g1(n_kv, n_decode, ksplit);
   CuteDecodeSplitKernel<<<g1, NW * 32, 0, s>>>(
       reinterpret_cast<const cbf16*>(q), q_stride,
@@ -296,4 +258,6 @@ void LaunchAttnDecodeCute(const __nv_bfloat16* q, int q_stride,
   dim3 g2(n_heads, n_decode);
   CuteDecodeCombineKernel<<<g2, HD, 0, s>>>(
       pm, pl, pa, reinterpret_cast<cbf16*>(out), n_heads, qstart, decode_rids, ksplit);
+}
+
 }
