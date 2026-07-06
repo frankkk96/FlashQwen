@@ -74,4 +74,4 @@ void KvStore::StoreKV(int layer, const bf16* qkv, const int* bt, int bt_stride,
       bt_row, pos, M);
 }
 
-}
+}  // namespace fq

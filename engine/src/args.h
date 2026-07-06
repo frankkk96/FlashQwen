@@ -20,4 +20,4 @@ struct Args {
 
 int ParseArgs(int argc, char** argv, Args& out);
 
-}
+}  // namespace fq

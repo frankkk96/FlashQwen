@@ -105,7 +105,7 @@ void FillSampling(StepContext& ctx, const ForwardInput& in, std::mt19937& rng,
   ctx.topp.Flush(stream, n);
   ctx.u.Flush(stream, n);
 }
-}
+}  // namespace
 
 void RopeTables::Build(int max_ctx) {
   int half = ModelSpec::kHeadDim / 2, n_pos = max_ctx;
@@ -332,4 +332,4 @@ ModelRuntime::~ModelRuntime() {
   if (stream_) cudaStreamDestroy(stream_);
 }
 
-}
+}  // namespace fq

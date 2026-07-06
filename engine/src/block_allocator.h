@@ -102,4 +102,4 @@ class BlockAllocator {
   int num_blocks_ = 0;
 };
 
-}
+}  // namespace fq

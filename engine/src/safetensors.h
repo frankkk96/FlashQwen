@@ -34,4 +34,4 @@ class SafeTensors {
   std::vector<std::pair<void*, size_t>> mappings_;
 };
 
-}
+}  // namespace fq

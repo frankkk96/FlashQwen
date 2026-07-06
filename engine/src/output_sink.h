@@ -18,4 +18,4 @@ struct OutputSink {
   virtual bool Cancelled() const = 0;
 };
 
-}
+}  // namespace fq

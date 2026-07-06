@@ -39,4 +39,4 @@ class KvStore {
   std::vector<DeviceBuffer<bf16>> kv_;
 };
 
-}
+}  // namespace fq

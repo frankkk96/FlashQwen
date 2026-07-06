@@ -67,4 +67,4 @@ ModelSpec ModelSpec::Load(const std::string& dir) {
   return spec;
 }
 
-}
+}  // namespace fq

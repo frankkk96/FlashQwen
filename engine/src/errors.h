@@ -9,4 +9,4 @@ enum class EngineErrc {
   kInternal,
 };
 
-}
+}  // namespace fq

@@ -17,4 +17,4 @@ void LaunchAttnDecodeCute(const __nv_bfloat16* q,
                           int max_blocks, float* pm, float* pl,
                           float* pa, cudaStream_t s);
 
-}
+}  // namespace fq

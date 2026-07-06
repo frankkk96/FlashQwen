@@ -55,4 +55,4 @@ int ParseArgs(int argc, char** argv, Args& out) {
   return -1;
 }
 
-}
+}  // namespace fq

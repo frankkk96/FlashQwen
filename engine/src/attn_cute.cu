@@ -23,7 +23,7 @@ __device__ __forceinline__ auto AccRowcol(Layout l) {
   return make_layout(make_layout(get<0, 1>(d), get<1>(d)),
                      make_layout(get<0, 0>(d), get<2>(d)));
 }
-}
+}  // namespace
 
 static __global__ void __launch_bounds__(128, 4)
 CutePrefillKernel(const cbf16* __restrict__ q,
@@ -257,4 +257,4 @@ void LaunchAttnDecodeCute(const __nv_bfloat16* q,
       pm, pl, pa, reinterpret_cast<cbf16*>(out), qstart, decode_rids, ksplit);
 }
 
-}
+}  // namespace fq

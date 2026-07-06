@@ -9,4 +9,4 @@ struct SampleParams {
   float top_p;
 };
 
-}
+}  // namespace fq

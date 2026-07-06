@@ -33,4 +33,4 @@ struct ModelSpec {
   static ModelSpec Load(const std::string& dir);
 };
 
-}
+}  // namespace fq

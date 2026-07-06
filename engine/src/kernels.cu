@@ -326,4 +326,4 @@ void LaunchSampleBatch(const float* logits, int B, int N, const float* invT,
   SampleKernel<<<B, kSampleThreads, 0, s>>>(logits, N, invT, topp, u, out);
 }
 
-}
+}  // namespace fq

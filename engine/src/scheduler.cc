@@ -22,7 +22,7 @@ uint64_t HashBlock(uint64_t parent, const Request& r, int start, int n) {
   }
   return h ? h : 1;
 }
-}
+}  // namespace
 
 void Scheduler::AcquirePrefix(Request* r) {
   if (!cfg_.use_prefix_cache) return;
@@ -191,4 +191,4 @@ void Scheduler::Run() {
   }
 }
 
-}
+}  // namespace fq

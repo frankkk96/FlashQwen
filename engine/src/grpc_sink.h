@@ -96,4 +96,4 @@ struct GrpcSink : OutputSink {
   }
 };
 
-}
+}  // namespace fq

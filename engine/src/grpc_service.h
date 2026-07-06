@@ -7,4 +7,4 @@ namespace fq {
 
 int RunEngine(const Args& a, const std::string& model_id);
 
-}
+}  // namespace fq

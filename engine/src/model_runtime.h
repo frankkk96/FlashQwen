@@ -239,4 +239,4 @@ class ModelRuntime {
   GraphCache layers_graph_;
 };
 
-}
+}  // namespace fq

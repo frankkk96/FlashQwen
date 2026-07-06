@@ -88,4 +88,4 @@ void SafeTensors::LoadDir(const std::string& dir) {
   }
 }
 
-}
+}  // namespace fq

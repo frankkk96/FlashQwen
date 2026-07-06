@@ -46,4 +46,4 @@ void LaunchSampleBatch(const float* logits, int B, int N, const float* invT,
                        const float* topp, const float* u, int* out,
                        cudaStream_t s);
 
-}
+}  // namespace fq

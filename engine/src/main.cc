@@ -3,7 +3,9 @@
 #include "args.h"
 #include "grpc_service.h"
 
-using namespace fq;
+using fq::Args;
+using fq::ParseArgs;
+using fq::RunEngine;
 
 int main(int argc, char** argv) {
   Args a;

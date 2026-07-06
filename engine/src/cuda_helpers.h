@@ -77,4 +77,4 @@ class DeviceBuffer {
   T* p_ = nullptr;
 };
 
-}
+}  // namespace fq

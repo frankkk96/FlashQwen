@@ -193,4 +193,4 @@ class Scheduler {
   std::vector<std::unique_ptr<Request>> running_;
 };
 
-}
+}  // namespace fq
