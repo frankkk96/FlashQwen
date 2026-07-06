@@ -20,7 +20,7 @@ namespace fq {
 // that reads Cos()/Sin().
 class RopeTables {
  public:
-  void Build(const ModelSpec& spec, int max_ctx);
+  void Build(int max_ctx);
   const float* Cos() const { return cos_.D(); }
   const float* Sin() const { return sin_.D(); }
 
@@ -114,7 +114,7 @@ class StagedBuffer {
 // decode/prefill request-id lists and packed block tables (bt) are derived;
 // invT/topp/u are the per-row sampling params. The methods fill each group from
 // a ForwardInput and flush it to the device on the caller's stream. The ints describe
-// the buffers (bt_stride = bt's row stride, n_decode = decode_rids' valid
+// the buffers (max_blocks = bt's row stride, n_decode = decode_rids' valid
 // length, ...). The constructor sizes everything to the worst case once.
 struct StepContext {
   DeviceBuffer<int> ids, pos, req;
@@ -125,7 +125,6 @@ struct StepContext {
   StagedBuffer<float> invT, topp, u;
 
   int max_blocks = 0;
-  int bt_stride = 0;
   int n_rows = 0, n_sample = 0;
   int n_decode = 0, n_prefill = 0, prefill_max_qlen = 1;
 
@@ -147,7 +146,7 @@ struct RuntimeBuffers {
   DeviceBuffer<int> sampled;
 
   RuntimeBuffers() = default;
-  RuntimeBuffers(const ModelSpec& spec, int max_rows, int slots);
+  RuntimeBuffers(int max_rows, int slots);
 };
 
 // A small LRU cache of capture-once / replay CUDA graphs, keyed on a (k0, k1)

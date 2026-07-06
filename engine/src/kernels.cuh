@@ -7,7 +7,6 @@
 #include <cstdio>
 #include <cstdlib>
 
-#include "kv_layout.h"
 #include "cuda_helpers.h"
 #include "log.h"
 

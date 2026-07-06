@@ -4,7 +4,7 @@
 #include <unordered_map>
 #include <vector>
 
-#include "kv_layout.h"
+#include "model_spec.h"
 
 namespace fq {
 
@@ -30,10 +30,12 @@ class BlockAllocator {
     }
   }
 
-  int BlockSize() const { return kKvBlock; }
+  int BlockSize() const { return ModelSpec::kKvBlock; }
   int NumBlocks() const { return num_blocks_; }
   int NumFree() const { return static_cast<int>(free_lru_.size()); }
-  int BlocksFor(int n_tok) const { return (n_tok + kKvBlock - 1) / kKvBlock; }
+  int BlocksFor(int n_tok) const {
+    return (n_tok + ModelSpec::kKvBlock - 1) / ModelSpec::kKvBlock;
+  }
 
   bool AllocOne(int& out) {
     if (free_lru_.empty()) return false;

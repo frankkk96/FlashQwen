@@ -54,13 +54,12 @@ void UploadRows(StepContext& ctx, const ForwardInput& in, cudaStream_t stream) {
 void PackBlockTables(StepContext& ctx, const ForwardInput& in,
                      cudaStream_t stream) {
   int n_req = static_cast<int>(in.block_tables.size());
-  ctx.bt_stride = ctx.max_blocks;
   for (int r = 0; r < n_req; ++r) {
-    int* row = ctx.bt.H() + r * ctx.bt_stride;
+    int* row = ctx.bt.H() + r * ctx.max_blocks;
     const auto& blocks = in.block_tables[r];
     for (int g = 0; g < static_cast<int>(blocks.size()); ++g) row[g] = blocks[g];
   }
-  ctx.bt.Flush(stream, static_cast<size_t>(n_req) * ctx.bt_stride);
+  ctx.bt.Flush(stream, static_cast<size_t>(n_req) * ctx.max_blocks);
 }
 
 void SplitDecodePrefill(StepContext& ctx, const ForwardInput& in,
@@ -108,13 +107,13 @@ void FillSampling(StepContext& ctx, const ForwardInput& in, std::mt19937& rng,
 }
 }
 
-void RopeTables::Build(const ModelSpec& spec, int max_ctx) {
-  int half = spec.head_dim / 2, n_pos = max_ctx;
+void RopeTables::Build(int max_ctx) {
+  int half = ModelSpec::kHeadDim / 2, n_pos = max_ctx;
   std::vector<float> cos_tab(static_cast<size_t>(n_pos) * half),
       sin_tab(static_cast<size_t>(n_pos) * half);
   for (int p = 0; p < n_pos; ++p)
     for (int i = 0; i < half; ++i) {
-      float inv = std::pow(spec.rope_theta, -2.0f * i / spec.head_dim);
+      float inv = std::pow(ModelSpec::kRopeTheta, -2.0f * i / ModelSpec::kHeadDim);
       float ang = p * inv;
       cos_tab[p * half + i] = std::cos(ang);
       sin_tab[p * half + i] = std::sin(ang);
@@ -133,10 +132,10 @@ ModelWeights::ModelWeights(const ModelSpec& spec, int max_ctx) {
   embed = UploadTensors<bf16>(st, {"model.embed_tokens.weight"});
   fnorm = UploadTensors<float>(st, {"model.norm.weight"});
   lm_head = UploadTensors<bf16>(st, {"lm_head.weight"});
-  rope.Build(spec, max_ctx);
+  rope.Build(max_ctx);
 
-  layers.resize(spec.num_layers);
-  for (int l = 0; l < spec.num_layers; l++) {
+  layers.resize(ModelSpec::kNumLayers);
+  for (int l = 0; l < ModelSpec::kNumLayers; l++) {
     std::string p = "model.layers." + std::to_string(l) + ".";
     auto attn = [&](const char* n) { return p + "self_attn." + n; };
     auto mlp = [&](const char* n) { return p + "mlp." + n; };
@@ -152,8 +151,8 @@ ModelWeights::ModelWeights(const ModelSpec& spec, int max_ctx) {
     layer.in_norm = UploadTensors<float>(st, {p + "input_layernorm.weight"});
     layer.post_norm =
         UploadTensors<float>(st, {p + "post_attention_layernorm.weight"});
-    if ((l + 1) % 8 == 0 || l + 1 == spec.num_layers)
-      LOG_INFO("[model] uploaded layer %d/%d", l + 1, spec.num_layers);
+    if ((l + 1) % 8 == 0 || l + 1 == ModelSpec::kNumLayers)
+      LOG_INFO("[model] uploaded layer %d/%d", l + 1, ModelSpec::kNumLayers);
   }
 }
 
@@ -166,17 +165,18 @@ StepContext::StepContext(int max_rows, int slots, int max_ctx) {
   qlen = StagedBuffer<int>(slots);
   decode_rids = StagedBuffer<int>(slots);
   prefill_rids = StagedBuffer<int>(slots);
-  max_blocks = (max_ctx + kKvBlock - 1) / kKvBlock;
+  max_blocks = (max_ctx + ModelSpec::kKvBlock - 1) / ModelSpec::kKvBlock;
   bt = StagedBuffer<int>(static_cast<size_t>(slots) * max_blocks);
   invT = StagedBuffer<float>(slots);
   topp = StagedBuffer<float>(slots);
   u = StagedBuffer<float>(slots);
 }
 
-RuntimeBuffers::RuntimeBuffers(const ModelSpec& spec, int max_rows, int slots) {
-  int hidden = spec.hidden_size, q_dim = spec.QDim(), inter = spec.intermediate,
-      vocab = spec.vocab_size;
-  int kv_dim = spec.KvDim();
+RuntimeBuffers::RuntimeBuffers(int max_rows, int slots) {
+  int hidden = ModelSpec::kHiddenSize,
+      q_dim = ModelSpec::kNumHeads * ModelSpec::kHeadDim,
+      inter = ModelSpec::kIntermediate, vocab = ModelSpec::kVocabSize;
+  int kv_dim = ModelSpec::kNumKvHeads * ModelSpec::kHeadDim;
   int qkv_dim = q_dim + 2 * kv_dim;
   size_t rows = static_cast<size_t>(max_rows);
   x = DeviceBuffer<bf16>(rows * hidden);
@@ -191,7 +191,7 @@ RuntimeBuffers::RuntimeBuffers(const ModelSpec& spec, int max_rows, int slots) {
   size_t dec_floats = DecodePartialFloats(slots);
   dec_pm = DeviceBuffer<float>(dec_floats);
   dec_pl = DeviceBuffer<float>(dec_floats);
-  dec_pa = DeviceBuffer<float>(dec_floats * spec.head_dim);
+  dec_pa = DeviceBuffer<float>(dec_floats * ModelSpec::kHeadDim);
   sampled = DeviceBuffer<int>(slots);
 }
 
@@ -212,7 +212,7 @@ ModelRuntime::ModelRuntime(const ModelSpec& spec, int max_ctx, int slots,
   max_rows_ = std::max(1, token_budget) + kRowSlack;
   weights_ = ModelWeights(spec_, max_ctx_);
   InitCudaResources();
-  buf_ = RuntimeBuffers(spec_, max_rows_, slots_);
+  buf_ = RuntimeBuffers(max_rows_, slots_);
   ctx_ = StepContext(max_rows_, slots_, max_ctx_);
 
   size_t freeb, totalb;
@@ -234,21 +234,20 @@ void ModelRuntime::RunLayers() {
 
 void ModelRuntime::RunLayersBody() {
   int n_rows = ctx_.n_rows;
-  const ModelSpec& spec = spec_;
-  int hidden = spec.hidden_size, q_dim = spec.QDim(), kv_dim = spec.KvDim(),
-      inter = spec.intermediate;
+  int hidden = ModelSpec::kHiddenSize,
+      q_dim = ModelSpec::kNumHeads * ModelSpec::kHeadDim,
+      kv_dim = ModelSpec::kNumKvHeads * ModelSpec::kHeadDim,
+      inter = ModelSpec::kIntermediate;
   int qkv_dim = q_dim + 2 * kv_dim;
-  int n_heads = spec.num_heads, n_kv = spec.num_kv_heads,
-      head_dim = spec.head_dim;
-  float eps = spec.rms_eps,
-        scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
+  int n_heads = ModelSpec::kNumHeads, n_kv = ModelSpec::kNumKvHeads,
+      head_dim = ModelSpec::kHeadDim;
+  float eps = ModelSpec::kRmsEps;
   cudaStream_t stream = stream_;
-  int block_size = store_->BlockSize();
 
   LaunchEmbed(ctx_.ids.D(), weights_.embed.D(), buf_.x.D(), n_rows, hidden,
               stream);
 
-  for (int l = 0; l < spec.num_layers; ++l) {
+  for (int l = 0; l < ModelSpec::kNumLayers; ++l) {
     Layer& layer = weights_.layers[l];
 
     if (l == 0)
@@ -264,18 +263,18 @@ void ModelRuntime::RunLayersBody() {
                        weights_.rope.Cos(), weights_.rope.Sin(), ctx_.pos.D(),
                        n_rows, n_heads, n_kv, head_dim, qkv_dim, eps, stream);
 
-    store_->StoreKV(l, buf_.qkv.D(), ctx_.bt.D(), ctx_.bt_stride, ctx_.req.D(),
+    store_->StoreKV(l, buf_.qkv.D(), ctx_.bt.D(), ctx_.max_blocks, ctx_.req.D(),
                     ctx_.pos.D(), n_rows, stream);
-    LaunchAttnDecodeCute(buf_.qkv.D(), qkv_dim, store_->KV(l), buf_.attn.D(),
-                         n_heads, n_kv, head_dim, ctx_.pos.D(), ctx_.qstart.D(),
-                         ctx_.decode_rids.D(), ctx_.n_decode, ctx_.bt.D(),
-                         ctx_.bt_stride, block_size, scale, buf_.dec_pm.D(),
-                         buf_.dec_pl.D(), buf_.dec_pa.D(), stream);
-    LaunchAttnPrefillCute(buf_.qkv.D(), qkv_dim, store_->KV(l), buf_.attn.D(),
-                          n_heads, n_kv, head_dim, ctx_.pos.D(), ctx_.qstart.D(),
-                          ctx_.qlen.D(), ctx_.prefill_rids.D(), ctx_.n_prefill,
-                          ctx_.prefill_max_qlen, ctx_.bt.D(), ctx_.bt_stride,
-                          block_size, scale, stream);
+    LaunchAttnDecodeCute(buf_.qkv.D(), store_->KV(l), buf_.attn.D(),
+                         ctx_.pos.D(), ctx_.qstart.D(), ctx_.decode_rids.D(),
+                         ctx_.n_decode, ctx_.bt.D(), ctx_.max_blocks,
+                         buf_.dec_pm.D(), buf_.dec_pl.D(), buf_.dec_pa.D(),
+                         stream);
+    LaunchAttnPrefillCute(buf_.qkv.D(), store_->KV(l), buf_.attn.D(),
+                          ctx_.pos.D(), ctx_.qstart.D(), ctx_.qlen.D(),
+                          ctx_.prefill_rids.D(), ctx_.n_prefill,
+                          ctx_.prefill_max_qlen, ctx_.bt.D(), ctx_.max_blocks,
+                          stream);
 
     LaunchGemm(cublas_, buf_.attn.D(), layer.o_proj.D(), buf_.xb2.D(), n_rows,
                q_dim, hidden, CUDA_R_16BF);
@@ -313,12 +312,12 @@ void ModelRuntime::RunHeadAndSample(std::vector<int>& out) {
   int n_sample = ctx_.n_sample;
   out.resize(n_sample);
   if (n_sample == 0) return;
-  int hidden = spec_.hidden_size, vocab = spec_.vocab_size;
+  int hidden = ModelSpec::kHiddenSize, vocab = ModelSpec::kVocabSize;
 
   LaunchGatherRows(buf_.x.D(), ctx_.lrows.D(), buf_.xg.D(), n_sample, hidden,
                    stream_);
   LaunchRmsnorm(buf_.xg.D(), weights_.fnorm.D(), buf_.xb.D(), n_sample, hidden,
-                spec_.rms_eps, stream_);
+                ModelSpec::kRmsEps, stream_);
   LaunchGemm(cublas_, buf_.xb.D(), weights_.lm_head.D(), buf_.logits.D(),
              n_sample, hidden, vocab, CUDA_R_32F);
   LaunchSampleBatch(buf_.logits.D(), n_sample, vocab, ctx_.invT.D(),

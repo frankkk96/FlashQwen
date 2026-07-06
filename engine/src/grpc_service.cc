@@ -91,20 +91,9 @@ class ServiceImpl final : public Engine::Service {
 int RunEngine(const Args& a, const std::string& model_id) {
   try {
     ModelSpec spec = ModelSpec::Load(a.model_dir);
-    if (!spec.Supported()) {
-      LOG_ERROR(
-          "[engine] unsupported model at '%s': architecture '%s'. --model must "
-          "point at a "
-          "dir with config.json + *.safetensors; the engine supports "
-          "Qwen3-8B "
-          "(Qwen3ForCausalLM).",
-          a.model_dir.c_str(),
-          spec.arch.empty() ? "unknown" : spec.arch.c_str());
-      return 1;
-    }
     LOG_INFO("[engine] loading model %s ...", model_id.c_str());
     ModelRuntime model(spec, a.max_ctx, a.slots, a.token_budget, a.seed);
-    KvStore store(spec, a.max_ctx, a.gpu_mem_fraction);
+    KvStore store(a.max_ctx, a.gpu_mem_fraction);
     model.AttachKvStore(store);
 
     SchedulerConfig scfg{
@@ -118,7 +107,7 @@ int RunEngine(const Args& a, const std::string& model_id) {
     BlockAllocator alloc(store.NumBlocks());
     Scheduler sched(model, alloc, scfg);
 
-    ServiceImpl service(sched, model_id, a.max_ctx, spec.vocab_size);
+    ServiceImpl service(sched, model_id, a.max_ctx, ModelSpec::kVocabSize);
     grpc::ServerBuilder builder;
     builder.AddListeningPort(a.address, grpc::InsecureServerCredentials());
     builder.RegisterService(&service);
