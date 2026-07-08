@@ -1,5 +1,3 @@
-#include <cuda_pipeline.h>  // cp.async 内建函数（__pipeline_memcpy_async 等）
-
 #include "attn_cute.h"
 #include "cute/tensor.hpp"
 #include "kernels.cuh"
@@ -61,14 +59,12 @@ CutePrefillKernel(const cbf16* __restrict__ qkv,
   int tid = threadIdx.x;
 
   // ========== 阶段 2：把 Q 搬进 shared memory ==========
-  // smem 复用：Q 用完后同一块空间被 K/V/P 覆盖（sQ 和 sKb[0] 都从 smem 起点开始）。
-  // K/V 各开两份（双缓冲）：一份供当前 tile 计算，另一份被 cp.async 后台预取下一 tile。
+  // smem 复用：Q 用完后同一块空间被 K/V/P 覆盖（sQ 和 sK 都从 smem 起点开始）。
   extern __shared__ char smem[];
-  constexpr int kKvTile = S::kKvBlock * S::kHeadDim;   // 一份 K（或 V）的元素数
-  cbf16* sKb[2] = {reinterpret_cast<cbf16*>(smem), reinterpret_cast<cbf16*>(smem) + kKvTile};
-  cbf16* sVb[2] = {sKb[1] + kKvTile, sKb[1] + 2 * kKvTile};
-  cbf16* sP = sVb[1] + kKvTile;                        // P 排在两份 K/V 之后
-  cbf16* sQ = reinterpret_cast<cbf16*>(smem);          // Q 只在 KV 循环前用，与 K/V buffer 复用
+  cbf16* sK = reinterpret_cast<cbf16*>(smem);
+  cbf16* sV = sK + S::kKvBlock * S::kHeadDim;
+  cbf16* sP = sV + S::kKvBlock * S::kHeadDim;
+  cbf16* sQ = reinterpret_cast<cbf16*>(smem);
 
   // 128 线程协作，用 int4（一次 8 个 bf16）向量化把 Q-tile 拷进 smem；越界行填 0。
   const int4 kZero4 = {0, 0, 0, 0};
@@ -100,8 +96,9 @@ CutePrefillKernel(const cbf16* __restrict__ qkv,
   // 给 smem 缓冲区套上逻辑 (shape, stride)，CuTe 才知道每个 (i,j) 落在哪。
   // 注意 sVt 用列主序 Stride<_1, kHeadDim>：V 需要转置布局才能当 PV 的 B 矩阵。
   Tensor sQt = make_tensor(make_smem_ptr(sQ), make_layout(Shape<Int<kQTile>, Int<S::kHeadDim>>{}, LayoutRight{}));
+  Tensor sKt = make_tensor(make_smem_ptr(sK), make_layout(Shape<Int<S::kKvBlock>, Int<S::kHeadDim>>{}, LayoutRight{}));
   Tensor sPt = make_tensor(make_smem_ptr(sP), make_layout(Shape<Int<kQTile>, Int<S::kKvBlock>>{}, LayoutRight{}));
-  // sKt/sVt 依赖「当前 buffer」，在 KV 循环内按 sKb[cur]/sVb[cur] 构建。
+  Tensor sVt = make_tensor(make_smem_ptr(sV), make_layout(Shape<Int<S::kHeadDim>, Int<S::kKvBlock>>{}, Stride<_1, Int<S::kHeadDim>>{}));
 
   // Q 在整个 KV 循环里不变，只需一次性加载进寄存器碎片 tSrQ。
   Tensor tSrQ = thrQK.partition_fragment_A(sQt);   // 开出「本线程」的 Q 寄存器碎片
@@ -126,40 +123,20 @@ CutePrefillKernel(const cbf16* __restrict__ qkv,
   int qlast = min(q0 + kQTile - 1, ql - 1);
   int ntiles = pos[qs + qlast] / S::kKvBlock + 1;
 
-  // 用 int4（16B）cp.async 把逻辑第 kt 个 KV 块异步预取进 buffer b（直接 global→smem，不经寄存器）。
-  // 块表把「逻辑第 kt 块」翻译成物理 page 地址；同一 page 内 K 在前、V 在 +plane 处。
-  auto prefetch_kv = [&](int kt, int b) {
+  // ========== 阶段 5：逐个 KV tile 做 flash attention ==========
+  for (int kt = 0; kt < ntiles; ++kt) {
+    // --- 5a. 加载 K、V 到 smem（分页寻址）---
+    // 用块表把「逻辑第 kt 块」翻译成物理 page 地址；同一 page 内 K 在前、V 在 +plane 处。
     int64_t kvbase = static_cast<int64_t>(btr[kt]) * KvStore::kKvPlanes * plane +
                      static_cast<int64_t>(kvh) * S::kHeadDim;
     for (int c = tid; c < S::kKvBlock * S::kHeadDim / 8; c += blockDim.x) {
       int key = c / (S::kHeadDim / 8), hd8 = (c % (S::kHeadDim / 8)) * 8;
-      __pipeline_memcpy_async(&sKb[b][key * S::kHeadDim + hd8],
-                              &cache_kv[kvbase + static_cast<int64_t>(key) * kv_dim + hd8], 16);
-      __pipeline_memcpy_async(&sVb[b][key * S::kHeadDim + hd8],
-                              &cache_kv[kvbase + plane + static_cast<int64_t>(key) * kv_dim + hd8], 16);
-    }
-    __pipeline_commit();
-  };
-
-  // ========== 阶段 5：逐个 KV tile 做 flash attention（cp.async 双缓冲流水）==========
-  // prologue：先发起第 0 块预取；之后每轮在计算当前块的同时后台预取下一块，藏住访存延迟。
-  if (ntiles > 0) prefetch_kv(0, 0);
-  for (int kt = 0; kt < ntiles; ++kt) {
-    int cur = kt & 1;
-    // --- 5a. 后台预取下一块 + 等待当前块到齐 ---
-    if (kt + 1 < ntiles) {
-      prefetch_kv(kt + 1, (kt + 1) & 1);  // 下一块的拷贝在后台飞行，与本轮计算重叠
-      __pipeline_wait_prior(1);           // 仍留 1 组（下一块）在飞 → 当前块 kt 必已到齐
-    } else {
-      __pipeline_wait_prior(0);           // 最后一块：等全部 cp.async 完成
+      *reinterpret_cast<int4*>(&sK[key * S::kHeadDim + hd8]) = *reinterpret_cast<const int4*>(
+          &cache_kv[kvbase + static_cast<int64_t>(key) * kv_dim + hd8]);
+      *reinterpret_cast<int4*>(&sV[key * S::kHeadDim + hd8]) = *reinterpret_cast<const int4*>(
+          &cache_kv[kvbase + plane + static_cast<int64_t>(key) * kv_dim + hd8]);
     }
     __syncthreads();
-
-    // 当前 buffer 的 K/V 逻辑视图（sVt 用列主序，转置后当 PV 的 B 矩阵）。
-    Tensor sKt = make_tensor(make_smem_ptr(sKb[cur]),
-        make_layout(Shape<Int<S::kKvBlock>, Int<S::kHeadDim>>{}, LayoutRight{}));
-    Tensor sVt = make_tensor(make_smem_ptr(sVb[cur]),
-        make_layout(Shape<Int<S::kHeadDim>, Int<S::kKvBlock>>{}, Stride<_1, Int<S::kHeadDim>>{}));
 
     // --- 5b. QKᵀ：S = Q · Kᵀ，结果在寄存器累加器 tSrS ---
     Tensor tSrK = thrQK.partition_fragment_B(sKt);
@@ -225,9 +202,7 @@ void LaunchAttnPrefillCute(const __nv_bfloat16* q,
                            int max_blocks, cudaStream_t s) {
   if (R <= 0) return;
   dim3 grid((max_qlen + kQTile - 1) / kQTile, S::kNumHeads, R);
-  // smem 布局：K/V 各两份（双缓冲）+ P。共 4*kKvBlock*kHeadDim + kQTile*kKvBlock 个 bf16，
-  // 已 ≥ Q-tile（kQTile*kHeadDim），Q 与前两份 buffer 复用同一块空间。
-  int smem = (4 * S::kKvBlock * S::kHeadDim + kQTile * S::kKvBlock) * sizeof(cbf16);
+  int smem = kQTile * S::kHeadDim * sizeof(cbf16);  // smem 大小：Q-tile（K/V/P 复用同一块）
   CutePrefillKernel<<<grid, 128, smem, s>>>(
       reinterpret_cast<const cbf16*>(q),
       reinterpret_cast<const cbf16*>(cache_kv), reinterpret_cast<cbf16*>(out),
