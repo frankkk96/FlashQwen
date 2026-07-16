@@ -12,6 +12,10 @@
 
 namespace fq {
 
+// softmax/归约用的「数值安全负无穷」哨兵：exp(kNegInf-x) 干净下溢为 0，又是有限值不产生 NaN。
+// 既当 max 归约的初值，也当因果 mask 的填充值。
+constexpr float kNegInf = -1e30f;
+
 void LaunchGemm(cublasHandle_t handle, const bf16* x, const bf16* W, void* y,
                 int M, int IN, int OUT, cudaDataType_t y_type);
 

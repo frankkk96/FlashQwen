@@ -17,8 +17,9 @@ constexpr int kGqaGroup = S::kNumHeads / S::kNumKvHeads;
 constexpr int kDimPerLane = S::kHeadDim / 32;
 // prefill 每个 block 一次处理的 query 行数（一个 Q-tile 的高度）。
 constexpr int kQTile = 64;
-// 每个 block 的 warp 数（128 线程 = 4 warp）。
-constexpr int kWarps = 4;
+// 每个 block 的线程数（prefill 与 decode 共用）；warp 是按 32 分组的派生量。
+constexpr int kThreads = 128;
+constexpr int kWarps = kThreads / 32;
 
 // 把 Tensor Core 累加器的碎片 layout ((2,2), MMA_M, MMA_N)
 // 重排成逻辑上的二维 (行, 列) 视图 ((行2,MMA_M),(列2,MMA_N))，
@@ -86,10 +87,12 @@ CutePrefillKernel(const cbf16* __restrict__ qkv,
   __syncthreads();
 
   // ========== 阶段 3：建立 MMA 与张量分区 ==========
-  // 用 m16n8k16 atom（bf16 输入 / f32 累加），Layout<_4,_1,_1> 表示 4 个 warp 在 M 方向叠 → 一步覆盖 64 行。
+  // 1个atom吃一个warp
+  // 用 m16n8k16 atom（bf16 输入 / f32 累加），Layout<kWarps,1,1> 表示全部 warp 在 M 方向叠 → 一步覆盖 kWarps*16 行。
+  // N/K 方向的 1 是有意设计：K=1 躲开跨 warp 归约，warp 全给 M 让 online softmax 逐行归约留在 warp 内。
   // mmaQK 算 QKᵀ，mmaPV 算 P·V；get_thread_slice 取得「当前线程」的碎片视角。
-  TiledMMA mmaQK = make_tiled_mma(SM80_16x8x16_F32BF16BF16F32_TN{}, Layout<Shape<_4, _1, _1>>{});
-  TiledMMA mmaPV = make_tiled_mma(SM80_16x8x16_F32BF16BF16F32_TN{}, Layout<Shape<_4, _1, _1>>{});
+  TiledMMA mmaQK = make_tiled_mma(SM80_16x8x16_F32BF16BF16F32_TN{}, Layout<Shape<Int<kWarps>, _1, _1>>{});
+  TiledMMA mmaPV = make_tiled_mma(SM80_16x8x16_F32BF16BF16F32_TN{}, Layout<Shape<Int<kWarps>, _1, _1>>{});
   auto thrQK = mmaQK.get_thread_slice(tid);
   auto thrPV = mmaPV.get_thread_slice(tid);
 
@@ -114,10 +117,13 @@ CutePrefillKernel(const cbf16* __restrict__ qkv,
   Tensor cO_rc = make_tensor(tOcO.data(), AccRowcol(tOcO.layout()));  // O 坐标的 (行,列) 视图
   Tensor tScS = thrQK.partition_C(make_identity_tensor(Shape<Int<kQTile>, Int<S::kKvBlock>>{}));
   Tensor cS_rc = make_tensor(tScS.data(), AccRowcol(tScS.layout()));  // S 坐标的 (行,列) 视图
-  // NROW=每线程负责的行数(2), NSC=S 每行的列数, NOC=O 每行的列数。
-  constexpr int NROW = 2, NSC = decltype(size<1>(cS_rc))::value, NOC = decltype(size<1>(O_rc))::value;
+  // 每线程在自己的寄存器碎片里负责的 (行 × 列) 数量，作为下面 online softmax 各循环的上界。
+  constexpr int NROW = decltype(size<0>(O_rc))::value;  // 每线程负责的 query 行数（由碎片行轴推出）
+  constexpr int NSC = decltype(size<1>(cS_rc))::value;  // 每行里本线程持有的 S(=QKᵀ 分数) 列数
+  constexpr int NOC = decltype(size<1>(O_rc))::value;   // 每行里本线程持有的 O(输出) 列数
+  static_assert(NROW == decltype(size<0>(cS_rc))::value, "S/O 行划分不一致");
   float rm[NROW], rl[NROW];                            // online softmax 每行的运行最大值 / 运行分母
-  for (int r = 0; r < NROW; ++r) { rm[r] = -1e30f; rl[r] = 0.f; }
+  for (int r = 0; r < NROW; ++r) { rm[r] = kNegInf; rl[r] = 0.f; }
 
   // 因果掩码下，本 tile 最后一个 query 的位置决定最多要看多少个 KV 块（之后的块全被 mask）。
   int qlast = min(q0 + kQTile - 1, ql - 1);
@@ -151,10 +157,10 @@ CutePrefillKernel(const cbf16* __restrict__ qkv,
       int row = get<0>(cS_rc(r, 0)), grow = q0 + row;   // 本行的局部/全局行号
       int qp = grow < ql ? pos[qs + grow] : -1;         // 该 query 的位置（用于因果掩码）
       // ① 因果掩码 + 缩放：key 位置 > query 位置的置 -inf，其余乘 scale；顺带求本块行最大值。
-      float rmax = -1e30f;
+      float rmax = kNegInf;
       for (int c = 0; c < NSC; ++c) {
         int kpos = kt * S::kKvBlock + get<1>(cS_rc(r, c));  // 该列对应的 key 全局位置
-        float v = (kpos <= qp) ? S_rc(r, c) * scale : -1e30f;
+        float v = (kpos <= qp) ? S_rc(r, c) * scale : kNegInf;
         S_rc(r, c) = v; rmax = fmaxf(rmax, v);
       }
       // ② warp 内跨 lane 归约行最大：同一逻辑行的列分散在相邻 4 个 lane 上，xor 1、xor 2 合并它们。
@@ -203,7 +209,7 @@ void LaunchAttnPrefillCute(const __nv_bfloat16* q,
   if (R <= 0) return;
   dim3 grid((max_qlen + kQTile - 1) / kQTile, S::kNumHeads, R);
   int smem = kQTile * S::kHeadDim * sizeof(cbf16);  // smem 大小：Q-tile（K/V/P 复用同一块）
-  CutePrefillKernel<<<grid, 128, smem, s>>>(
+  CutePrefillKernel<<<grid, kThreads, smem, s>>>(
       reinterpret_cast<const cbf16*>(q),
       reinterpret_cast<const cbf16*>(cache_kv), reinterpret_cast<cbf16*>(out),
       pos, qstart, qlen, rids, bt, max_blocks);
@@ -243,7 +249,7 @@ static __global__ void CuteDecodeSplitKernel(
   }
   // 每个 Q head 的局部 online-softmax 状态：运行最大 m、运行分母 l、加权和 acc。
   float m[kGqaGroup], l[kGqaGroup], acc[kGqaGroup][kDimPerLane];
-  for (int g = 0; g < kGqaGroup; ++g) { m[g] = -1e30f; l[g] = 0.f;
+  for (int g = 0; g < kGqaGroup; ++g) { m[g] = kNegInf; l[g] = 0.f;
     for (int i = 0; i < kDimPerLane; ++i) acc[g][i] = 0.f; }
 
   // 遍历本 split 分到的 KV 位置：步长 kWarps*ksplit，让 (split, warp) 交错覆盖整个序列。
@@ -278,7 +284,7 @@ static __global__ void CuteDecodeSplitKernel(
   // 由 warp 0 把 kWarps 个 warp 的局部结果合并成「本 split 的局部结果」，写入 pm/pl/pa。
   if (w == 0) {
     for (int g = 0; g < kGqaGroup; ++g) {
-      float gm = -1e30f; for (int t = 0; t < kWarps; ++t) gm = fmaxf(gm, sm[g][t]);   // 全局最大
+      float gm = kNegInf; for (int t = 0; t < kWarps; ++t) gm = fmaxf(gm, sm[g][t]);   // 全局最大
       float gl = 0.f, gacc[kDimPerLane]; for (int i = 0; i < kDimPerLane; ++i) gacc[i] = 0.f;
       // 用统一最大 gm 重缩放各 warp 的 sum 和加权和，再相加。
       for (int t = 0; t < kWarps; ++t) { float c = __expf(sm[g][t] - gm); gl += sl[g][t] * c;
@@ -302,7 +308,7 @@ static __global__ void CuteDecodeCombineKernel(
   int r = decode_rids[di], flat = qstart[r];
   int64_t base = (static_cast<int64_t>(di) * S::kNumHeads + h) * ksplit;
   // ① 先求跨所有 split 的全局最大。
-  float gm = -1e30f; for (int s = 0; s < ksplit; ++s) gm = fmaxf(gm, pm[base + s]);
+  float gm = kNegInf; for (int s = 0; s < ksplit; ++s) gm = fmaxf(gm, pm[base + s]);
   // ② 用 gm 重缩放各 split 的分母和加权和，再累加（标准的 log-sum-exp 合并）。
   float gl = 0.f, gacc = 0.f;
   for (int s = 0; s < ksplit; ++s) { float c = __expf(pm[base + s] - gm);
@@ -326,7 +332,7 @@ void LaunchAttnDecodeCute(const __nv_bfloat16* q,
 
   // 阶段一：split-KV，产出局部 (max,sum,加权和) 到 pm/pl/pa。
   dim3 g1(S::kNumKvHeads, n_decode, ksplit);
-  CuteDecodeSplitKernel<<<g1, kWarps * 32, 0, s>>>(
+  CuteDecodeSplitKernel<<<g1, kThreads, 0, s>>>(
       reinterpret_cast<const cbf16*>(q),
       reinterpret_cast<const cbf16*>(cache_kv), pm, pl, pa, pos, qstart,
       decode_rids, bt, max_blocks, ksplit);
