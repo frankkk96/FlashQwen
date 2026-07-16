@@ -191,7 +191,7 @@ __global__ void ArgmaxKernel(const float* __restrict__ logits, int N,
 
   __shared__ float sval[kSampleThreads];
   __shared__ int sidx[kSampleThreads];
-  float best = -1e30f;
+  float best = kNegInf;
   int bi = 0;
   for (int i = tid; i < N; i += nt) {
     float v = lg[i];
@@ -228,7 +228,7 @@ __global__ void SampleKernel(const float* __restrict__ logits, int N,
   int chunk = (N + nt - 1) / nt;
   int lo = min(tid * chunk, N), hi = min(lo + chunk, N);
 
-  float lmax = -1e30f;
+  float lmax = kNegInf;
   for (int i = lo; i < hi; ++i) lmax = fmaxf(lmax, lg[i]);
   sval[tid] = lmax;
   __syncthreads();
