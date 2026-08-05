@@ -5,7 +5,7 @@
 #include <cstring>
 #include <type_traits>
 
-#include "attn_cute.h"
+#include "attn.h"
 #include "log.h"
 #include "model_runtime.h"
 
@@ -265,16 +265,14 @@ void ModelRuntime::RunLayersBody() {
 
     store_->StoreKV(l, buf_.qkv.D(), ctx_.bt.D(), ctx_.max_blocks, ctx_.req.D(),
                     ctx_.pos.D(), n_rows, stream);
-    LaunchAttnDecodeCute(buf_.qkv.D(), store_->KV(l), buf_.attn.D(),
-                         ctx_.pos.D(), ctx_.qstart.D(), ctx_.decode_rids.D(),
-                         ctx_.n_decode, ctx_.bt.D(), ctx_.max_blocks,
-                         buf_.dec_pm.D(), buf_.dec_pl.D(), buf_.dec_pa.D(),
-                         stream);
-    LaunchAttnPrefillCute(buf_.qkv.D(), store_->KV(l), buf_.attn.D(),
-                          ctx_.pos.D(), ctx_.qstart.D(), ctx_.qlen.D(),
-                          ctx_.prefill_rids.D(), ctx_.n_prefill,
-                          ctx_.prefill_max_qlen, ctx_.bt.D(), ctx_.max_blocks,
-                          stream);
+    LaunchAttnDecode(buf_.qkv.D(), store_->KV(l), buf_.attn.D(), ctx_.pos.D(),
+                     ctx_.qstart.D(), ctx_.decode_rids.D(), ctx_.n_decode,
+                     ctx_.bt.D(), ctx_.max_blocks, buf_.dec_pm.D(),
+                     buf_.dec_pl.D(), buf_.dec_pa.D(), stream);
+    LaunchAttnPrefill(buf_.qkv.D(), store_->KV(l), buf_.attn.D(), ctx_.pos.D(),
+                      ctx_.qstart.D(), ctx_.qlen.D(), ctx_.prefill_rids.D(),
+                      ctx_.n_prefill, ctx_.prefill_max_qlen, ctx_.bt.D(),
+                      ctx_.max_blocks, stream);
 
     LaunchGemm(cublas_, buf_.attn.D(), layer.o_proj.D(), buf_.xb2.D(), n_rows,
                q_dim, hidden, CUDA_R_16BF);

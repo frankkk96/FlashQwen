@@ -11,17 +11,17 @@ MODEL      ?= ./models/qwen3-8b
 ENGINE_BIN := internal/supervisor/bin/flashqwen-engine
 GOBIN      := $(shell go env GOPATH)/bin
 
-.PHONY: all go embed engine proto test run clean
+.PHONY: all go engine proto test run clean
 
 all: go
 
-go: embed
-	go build -o flashqwen ./cmd/flashqwen
-
-embed: engine
+# Embed the freshly built engine binary into the Go embed dir, then build the Go binary.
+go: engine
 	@mkdir -p $(dir $(ENGINE_BIN))
 	cp engine/build/flashqwen-engine $(ENGINE_BIN)
+	go build -o flashqwen ./cmd/flashqwen
 
+# C++ build, including fetching the pinned CUTLASS submodule, is owned by CMake (see engine/CMakeLists.txt).
 engine:
 	cmake -S engine -B engine/build -DCMAKE_BUILD_TYPE=Release
 	cmake --build engine/build -j

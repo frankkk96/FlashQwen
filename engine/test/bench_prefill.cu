@@ -1,6 +1,6 @@
-// 独立微基准 + 正确性 A/B：喂同一份随机输入给 LaunchAttnPrefillCute，
+// 独立微基准 + 正确性 A/B：喂同一份随机输入给 LaunchAttnPrefill，
 // 打印输出 checksum（跨版本应一致）和 kernel 平均耗时。
-// 两个版本各自编译成独立二进制（链接不同的 attn_cute.cu），对拍 checksum、对比耗时。
+// 用于对拍不同 attn_sm80.cu 版本（例如同步 vs cp.async 多级流水）的 checksum、对比耗时。
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
@@ -8,7 +8,7 @@
 #include <cstdlib>
 #include <vector>
 
-#include "attn_cute.h"
+#include "attn.h"
 #include "model_spec.h"
 
 using S = fq::ModelSpec;
@@ -68,7 +68,7 @@ int main(int argc, char** argv) {
   CK(cudaMemcpy(dr, hr.data(), 4, cudaMemcpyHostToDevice));
 
   auto run = [&]() {
-    fq::LaunchAttnPrefillCute(dq, dkv, dout, dpos, dqs, dql, dr, /*R=*/1,
+    fq::LaunchAttnPrefill(dq, dkv, dout, dpos, dqs, dql, dr, /*R=*/1,
                               /*max_qlen=*/L, dbt, /*max_blocks=*/npages, 0);
   };
 

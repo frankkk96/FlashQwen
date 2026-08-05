@@ -11,8 +11,11 @@ type ChatRequest struct {
 	Stream        bool           `json:"stream"`
 	StreamOptions *StreamOptions `json:"stream_options"`
 	MaxTokens     int            `json:"max_tokens"`
-	Temperature   *float64       `json:"temperature"`
-	TopP          *float64       `json:"top_p"`
+	// OpenAI's newer name for the chat output cap (max_tokens is deprecated there);
+	// vllm bench serve sends only this field. Preferred over max_tokens when set.
+	MaxCompletionTokens int      `json:"max_completion_tokens"`
+	Temperature         *float64 `json:"temperature"`
+	TopP                *float64 `json:"top_p"`
 	// vLLM extension: generate exactly max_tokens, ignoring EOS / stop tokens (benchmarking).
 	IgnoreEOS bool `json:"ignore_eos"`
 	// FlashQwen extension: Qwen3 thinking mode (default off).

@@ -73,10 +73,12 @@ safetensors directly — no offline conversion or repacking.
 ### Build
 
 ```bash
-make            # build C++ engine → embed into Go → go build, producing ./flashqwen
+git submodule update --init   # fetch CUTLASS 4.2.0 (engine/third_party/cutlass)
+make                          # build C++ engine → embed into Go → go build, producing ./flashqwen
 ```
 
-`make` runs three steps: cmake builds the C++ engine, the engine binary is copied into
+CUTLASS/CuTe is pulled in as a pinned git submodule (`v4.2.0`), so a fresh clone must init
+submodules first (`make deps`, or clone with `--recursive`). `make` runs three steps: cmake builds the C++ engine, the engine binary is copied into
 `internal/supervisor/bin/` (for `//go:embed`), and `go build` produces the final binary. Needs a CUDA
 toolkit (12.x), Go 1.26+, gRPC/protobuf, **cuBLAS**, and an NVIDIA GPU with ≥20 GB. Targets `sm_89`
 (RTX 4090 / Ada) by default; for other cards set `-DCMAKE_CUDA_ARCHITECTURES=<arch>` before

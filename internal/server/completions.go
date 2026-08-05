@@ -44,11 +44,15 @@ func decode(req ChatRequest) engine.Request {
 			Name: t.Function.Name, Description: t.Function.Description,
 			ParametersJSON: string(t.Function.Parameters)})
 	}
+	maxTokens := req.MaxTokens
+	if req.MaxCompletionTokens > 0 {
+		maxTokens = req.MaxCompletionTokens
+	}
 	return engine.Request{
 		Messages:       msgs,
 		Tools:          tools,
 		EnableThinking: req.EnableThinking != nil && *req.EnableThinking,
-		MaxTokens:      req.MaxTokens,
+		MaxTokens:      maxTokens,
 		Temperature:    req.Temperature,
 		TopP:           req.TopP,
 		IgnoreEOS:      req.IgnoreEOS,

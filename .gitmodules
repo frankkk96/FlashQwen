@@ -1,0 +1,4 @@
+[submodule "engine/third_party/cutlass"]
+	path = engine/third_party/cutlass
+	url = https://github.com/NVIDIA/cutlass.git
+	shallow = true

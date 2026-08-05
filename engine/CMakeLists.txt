@@ -8,6 +8,21 @@ endif()
 
 project(FlashQwen LANGUAGES CXX CUDA)
 
+# C++ deps are owned by CMake, not the Makefile: a bare `cmake` build self-heals a fresh or
+# partial checkout by initializing the pinned CUTLASS submodule (v4.2.0, shallow per .gitmodules).
+set(CUTLASS_DIR ${CMAKE_CURRENT_SOURCE_DIR}/third_party/cutlass)
+if(NOT EXISTS ${CUTLASS_DIR}/include/cutlass/cutlass.h)
+  find_package(Git REQUIRED)
+  message(STATUS "CUTLASS submodule missing; fetching (shallow)...")
+  execute_process(
+    COMMAND ${GIT_EXECUTABLE} submodule update --init --recursive engine/third_party/cutlass
+    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/..
+    RESULT_VARIABLE _cutlass_rc)
+  if(NOT _cutlass_rc EQUAL 0)
+    message(FATAL_ERROR "CUTLASS submodule fetch failed (git rc=${_cutlass_rc})")
+  endif()
+endif()
+
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CUDA_STANDARD 17)
@@ -21,7 +36,7 @@ endif()
 
 set(CMAKE_CXX_FLAGS_RELEASE "-O3")
 set(CMAKE_CUDA_FLAGS_RELEASE "-O3 --use_fast_math")
-# CUTLASS/CuTe headers (attn_cute.cu) need relaxed constexpr in device code.
+# CUTLASS/CuTe headers (attn_sm80.cu) need relaxed constexpr in device code.
 set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} --expt-relaxed-constexpr")
 
 # gRPC + Protobuf for the `serve` mode (the Go OpenAI gateway is the client). Prefer a CMake
@@ -73,7 +88,7 @@ add_executable(flashqwen-engine
   src/kernels.cu
   src/kv_store.cu
   src/model_runtime.cu
-  src/attn_cute.cu
+  src/attn_sm80.cu
   ${PROTO_SRCS}
 )
 find_package(CUDAToolkit REQUIRED)   # cuBLAS for the matmuls
